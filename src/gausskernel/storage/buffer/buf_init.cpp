@@ -67,6 +67,19 @@ const int PAGE_QUEUE_SLOT_MULTI_NBUFFERS = 5;
  * This is called once during shared-memory initialization (either in the
  * postmaster, or in a standalone backend).
  */
+void InitMultiTenantBufferPool(void){
+    bool found_descs = false;
+    pthread_mutex_init(&g_tenant_info.tenant_map_lock, NULL);
+    HASHCTL hctl;
+    int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
+    securec_check(ret, "\0", "\0");
+    hctl.keysize = sizeof(uint32);
+    hctl.entrysize = sizeof(tenant_buffer_cxt*);
+    hctl.hash = string_hash;
+    g_tenant_info.tenant_map = ShmemInitHash("tenant info hash", 
+    64, 64, &hctl, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
+}
+
 void InitBufferPool(void)
 {
     bool found_bufs = false;
@@ -75,7 +88,7 @@ void InitBufferPool(void)
     bool found_buf_extra = false;
     uint64 buffer_size;
     BufferDescExtra *extra = NULL;
-
+    InitMultiTenantBufferPool();
     t_thrd.storage_cxt.BufferDescriptors = (BufferDescPadded *)CACHELINEALIGN(
         ShmemInitStruct("Buffer Descriptors",
                         TOTAL_BUFFER_NUM * sizeof(BufferDescPadded) + PG_CACHE_LINE_SIZE,

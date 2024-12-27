@@ -22,6 +22,42 @@
 #include "utils/relcache.h"
 #include "postmaster/pagerepair.h"
 
+#include <string>
+#include <pthread.h>
+
+typedef struct lru_node {
+    uint32t hash_key;
+    int buffer_id;
+    struct lru_node* prev;
+    struct lru_node* next;
+} lru_node;
+
+typedef struct lru_buffer {
+    pthread_mutex_t lock;
+    lru_node dummy_head(0, 0, NULL, NULL);
+    lru_node dummy_tail(0, 0, NULL, NULL);
+    uint32t capacity;
+    struct HTAB* buffer_map;// tag hash -> lru_node
+} lru_buffer;
+//
+
+typedef struct tenant_buffer_cxt{
+    pthread_mutex_t tenant_buffer_lock;
+    lru_buffer ref_buffer;
+    lru_buffer real_buffer;
+    size_t capacity;
+    uint64 total_access{0};
+} tenant_buffer_cxt;
+
+typedef struct tenant_info{
+    pthread_mutex_t tenant_map_lock;
+    struct HTAB* tenant_map;// tenant name -> tenant_buffer_cxt
+} tenant_info;
+extern tenant_info g_tenant_info;
+
+
+
+
 /* [ dram buffer | nvm buffer | segment buffer] */
 #define NVM_BUFFER_NUM (g_instance.attr.attr_storage.NNvmBuffers)
 #define SEGMENT_BUFFER_NUM (g_instance.attr.attr_storage.NSegBuffers) // 1GB

@@ -2670,7 +2670,7 @@ void PageCheckWhenChosedElimination(const BufferDesc *buf, uint32 oldFlags)
  *
  * No locks are held either at entry or exit.
  */
-static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
+static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
                                BufferAccessStrategy strategy, bool *found, const XLogPhyBlock *pblk)
 {
     if (g_instance.attr.attr_storage.nvm_attr.enable_nvm) {
@@ -3063,7 +3063,28 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
 
     return buf;
 }
-
+tenant_info g_tenant_info;
+static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
+                               BufferAccessStrategy strategy, bool *found, const XLogPhyBlock *pblk){
+    // BufferTag new_tag;                 /* identity of requested block */
+    // uint32 new_hash;                   /* hash value for newTag */
+    // /* create a tag so we can lookup the buffer */
+    // INIT_BUFFERTAG(new_tag, smgr->smgr_rnode.node, fork_num, block_num);
+    // /* determine its hash code and partition lock ID */
+    // new_hash = BufTableHashCode(&new_tag);
+    if(u_sess && u_sess->proc_cxt.MyProcPort && u_sess->proc_cxt.MyProcPort->user_name){
+        const char* name = u_sess->proc_cxt.MyProcPort->user_name;
+        bool tenant_found = false;
+        tenant_buffer_cxt* entry = (tenant_buffer_cxt*)hash_search(g_tenant_info.tenant_map, 
+        name, HASH_ENTER, &tenant_found);
+        /* init entry */
+        if (!tenant_found) {
+            ereport(WARNING,
+                (errmsg("Tenant %s added", name)));
+        }
+    }
+    return BufferAllocInternal(smgr, relpersistence, fork_num, block_num, strategy, found, pblk);
+}
 /*
  * InvalidateBuffer -- mark a shared buffer invalid and return it to the
  * freelist.

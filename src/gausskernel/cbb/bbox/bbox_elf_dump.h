@@ -34,7 +34,7 @@
 #if (defined WITH_OPENEULER_OS) || (defined OPENEULER_MAJOR)
 #include <linux/sysctl.h>
 #else
-#include <sys/sysctl.h>
+//#include <sys/sysctl.h>
 #endif
 #include <sys/ptrace.h>
 #include <asm/ptrace.h>
