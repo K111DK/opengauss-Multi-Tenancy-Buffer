@@ -68,16 +68,27 @@ const int PAGE_QUEUE_SLOT_MULTI_NBUFFERS = 5;
  * postmaster, or in a standalone backend).
  */
 void InitMultiTenantBufferPool(void){
-    bool found_descs = false;
+
     pthread_mutex_init(&g_tenant_info.tenant_map_lock, NULL);
     HASHCTL hctl;
     int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
     securec_check(ret, "\0", "\0");
     hctl.keysize = sizeof(uint32);
-    hctl.entrysize = sizeof(tenant_buffer_cxt*);
+    hctl.entrysize = sizeof(tenant_buffer_cxt);
     hctl.hash = string_hash;
     g_tenant_info.tenant_map = ShmemInitHash("tenant info hash", 
     64, 64, &hctl, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
+    
+
+    bool found_descs = false;    
+    g_tenant_info.non_tenant_buffer_cxt = (tenant_buffer_cxt*)hash_search(g_tenant_info.tenant_map, 
+    "Non Tenant Buffer", HASH_ENTER, &found_descs);
+    if (!found_descs) {
+        pthread_mutex_init(&g_tenant_info.non_tenant_buffer_cxt->tenant_buffer_lock, NULL);
+        // lru_buffer_init(&g_tenant_info.non_tenant_buffer_cxt->ref_buffer, 1024);
+        // lru_buffer_init(&g_tenant_info.non_tenant_buffer_cxt->real_buffer, 1024);
+        g_tenant_info.non_tenant_buffer_cxt->capacity = 1024;
+    }
 }
 
 void InitBufferPool(void)

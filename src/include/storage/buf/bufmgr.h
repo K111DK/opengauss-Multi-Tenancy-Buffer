@@ -40,6 +40,7 @@ typedef struct lru_buffer {
     struct HTAB* buffer_map;// tag hash -> lru_node
 } lru_buffer;
 //
+void lru_buffer_init(lru_buffer* buffer, uint32 capacity);
 
 typedef struct tenant_buffer_cxt{
     pthread_mutex_t tenant_buffer_lock;
@@ -47,11 +48,13 @@ typedef struct tenant_buffer_cxt{
     lru_buffer real_buffer;
     size_t capacity;
     uint64 total_access{0};
+    uint64 total_clean_buf_taken{0};
 } tenant_buffer_cxt;
 
 typedef struct tenant_info{
     pthread_mutex_t tenant_map_lock;
     struct HTAB* tenant_map;// tenant name -> tenant_buffer_cxt
+    tenant_buffer_cxt* non_tenant_buffer_cxt;
 } tenant_info;
 extern tenant_info g_tenant_info;
 

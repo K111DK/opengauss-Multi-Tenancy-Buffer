@@ -3064,25 +3064,51 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
     return buf;
 }
 tenant_info g_tenant_info;
-static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
-                               BufferAccessStrategy strategy, bool *found, const XLogPhyBlock *pblk){
-    // BufferTag new_tag;                 /* identity of requested block */
-    // uint32 new_hash;                   /* hash value for newTag */
-    // /* create a tag so we can lookup the buffer */
-    // INIT_BUFFERTAG(new_tag, smgr->smgr_rnode.node, fork_num, block_num);
-    // /* determine its hash code and partition lock ID */
-    // new_hash = BufTableHashCode(&new_tag);
-    if(u_sess && u_sess->proc_cxt.MyProcPort && u_sess->proc_cxt.MyProcPort->user_name){
-        const char* name = u_sess->proc_cxt.MyProcPort->user_name;
-        bool tenant_found = false;
-        tenant_buffer_cxt* entry = (tenant_buffer_cxt*)hash_search(g_tenant_info.tenant_map, 
-        name, HASH_ENTER, &tenant_found);
-        /* init entry */
-        if (!tenant_found) {
+#define NORMAL_BUFFER_SIZE 1024
+void lru_buffer_init(lru_buffer* buffer, uint32 capacity, const char* name, int type){
+    char index_name[32];
+    index_name[31] = '\0';
+    strcpy_s(index_name + 1, 31, name);
+    index_name[0] = type == 0 ? 'F':'R';
+    HASHCTL hctl;
+    int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
+    securec_check(ret, "\0", "\0");
+    hctl.keysize = sizeof(uint32);
+    hctl.entrysize = sizeof(int);//buff id
+    hctl.hash = tag_hash;
+    buffer->buffer_map = ShmemInitHash(index_name, 
+        capacity, capacity, 
+        &hctl, 
+        HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
+}
+
+tenant_buffer_cxt* get_tenant_by_name(const char* name){
+    bool tenant_found = false;
+    tenant_buffer_cxt* entry = (tenant_buffer_cxt*)hash_search(g_tenant_info.tenant_map, 
+    name, HASH_ENTER, &tenant_found);
+    /* init entry */
+    if (!tenant_found) {
             ereport(WARNING,
                 (errmsg("Tenant %s added", name)));
-        }
+            entry->capacity = NORMAL_BUFFER_SIZE;
+            lru_buffer_init(&entry->real_buffer, NORMAL_BUFFER_SIZE, name, 1);
+            lru_buffer_init(&entry->ref_buffer, NORMAL_BUFFER_SIZE, name, 0);
+            pthread_mutex_init(&entry->tenant_buffer_lock, NULL);
     }
+    Assert(entry!=NULL);
+    return entry;
+}
+
+tenant_buffer_cxt* get_thrd_tenant_buffer_cxt(){
+    if(u_sess && u_sess->proc_cxt.MyProcPort 
+                && u_sess->proc_cxt.MyProcPort->user_name
+                    && u_sess->proc_cxt.MyProcPort->user_name[0] == 'T'){
+        return get_tenant_by_name(u_sess->proc_cxt.MyProcPort->user_name);
+    }
+    return g_tenant_info.non_tenant_buffer_cxt;
+}
+static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
+                               BufferAccessStrategy strategy, bool *found, const XLogPhyBlock *pblk){
     return BufferAllocInternal(smgr, relpersistence, fork_num, block_num, strategy, found, pblk);
 }
 /*
