@@ -26,7 +26,7 @@
 #include <pthread.h>
 
 typedef struct lru_node {
-    uint32t hash_key;
+    uint32 hash_key;
     int buffer_id;
     struct lru_node* prev;
     struct lru_node* next;
@@ -34,9 +34,9 @@ typedef struct lru_node {
 
 typedef struct lru_buffer {
     pthread_mutex_t lock;
-    lru_node dummy_head(0, 0, NULL, NULL);
-    lru_node dummy_tail(0, 0, NULL, NULL);
-    uint32t capacity;
+    lru_node dummy_head;
+    lru_node dummy_tail;
+    uint32 capacity;
     struct HTAB* buffer_map;// tag hash -> lru_node
 } lru_buffer;
 //

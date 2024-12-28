@@ -1,7 +1,7 @@
 #!/bin/bash
 export CODE_BASE=/home/hx/work/openGauss-server
 export BINARYLIBS=/home/hx/work/binarylibs
-export GAUSSHOME=$CODE_BASE/mppdb_temp_install/
+export GAUSSHOME=$CODE_BASE/dest/
 export GCC_PATH=$BINARYLIBS/buildtools/gcc7.3
 export CC=$GCC_PATH/gcc/bin/gcc
 export CXX=$GCC_PATH/gcc/bin/g++
