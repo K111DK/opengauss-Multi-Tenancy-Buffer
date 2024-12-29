@@ -334,6 +334,7 @@ extern void ScheduleBufferTagForWriteback(WritebackContext* context, BufferTag* 
 
 /* freelist.c */
 extern BufferDesc *StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state);
+extern BufferDesc *TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state);
 
 extern void StrategyFreeBuffer(volatile BufferDesc* buf);
 extern bool StrategyRejectBuffer(BufferAccessStrategy strategy, BufferDesc* buf);
@@ -363,4 +364,45 @@ extern void update_wait_lockid(LWLock* lock);
 extern char* PageDataEncryptForBuffer(Page page, BufferDesc *bufdesc, bool is_segbuf = false);
 extern void FlushBuffer(void* buf, SMgrRelation reln, ReadBufferMethod flushmethod = WITH_NORMAL_CACHE, bool skipFsync = false);
 extern void LocalBufferFlushAllBuffer();
+
+
+
+typedef struct lru_node {
+    BufferTag key;
+    int buffer_id;
+    struct lru_node* prev;
+    struct lru_node* next;
+} lru_node;
+
+typedef struct lru_buffer {
+    pthread_mutex_t lock;
+    lru_node dummy_head;
+    lru_node dummy_tail;
+    uint32 capacity;
+    struct HTAB* buffer_map;// tag hash -> lru_node
+} lru_buffer;
+//
+void lru_buffer_init(lru_buffer* buffer, uint32 capacity, const char* name, int type);
+
+typedef struct tenant_buffer_cxt{
+    pthread_mutex_t tenant_buffer_lock;
+    bool need_ref_buffer{true};
+    lru_buffer ref_buffer;
+    lru_buffer real_buffer;
+    size_t capacity;
+    uint64 total_access{0};
+    uint64 total_clean_buf_taken{0};
+} tenant_buffer_cxt;
+
+typedef struct tenant_info{
+    uint64 total_clean_buf_taken{0};
+    pthread_mutex_t tenant_map_lock;
+    struct HTAB* tenant_map;// tenant name -> tenant_buffer_cxt
+    tenant_buffer_cxt* non_tenant_buffer_cxt;
+} tenant_info;
+extern tenant_info g_tenant_info;
+tenant_buffer_cxt* get_thrd_tenant_buffer_cxt();
+
+
+
 #endif /* BUFMGR_INTERNALS_H */

@@ -85,9 +85,9 @@ void InitMultiTenantBufferPool(void){
     "Non Tenant Buffer", HASH_ENTER, &found_descs);
     if (!found_descs) {
         pthread_mutex_init(&g_tenant_info.non_tenant_buffer_cxt->tenant_buffer_lock, NULL);
-        // lru_buffer_init(&g_tenant_info.non_tenant_buffer_cxt->ref_buffer, 1024);
-        // lru_buffer_init(&g_tenant_info.non_tenant_buffer_cxt->real_buffer, 1024);
-        g_tenant_info.non_tenant_buffer_cxt->capacity = 1024;
+        //lru_buffer_init(&g_tenant_info.non_tenant_buffer_cxt->ref_buffer, 1024);
+        lru_buffer_init(&g_tenant_info.non_tenant_buffer_cxt->real_buffer, 10240, "Non Tenant Buffer", 0);
+        g_tenant_info.non_tenant_buffer_cxt->capacity = 10240;
     }
 }
 

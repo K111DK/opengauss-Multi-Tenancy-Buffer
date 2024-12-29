@@ -910,7 +910,7 @@ void* hash_search_with_hash_value(HTAB* hashp, const void* keyPtr, uint32 hashva
             }
 
             /* disallow inserts if frozen */
-            if (hashp->frozen) {
+            if (hashp->frozen) { 
                 if (hashp->alloc == DynaHashAllocNoExcept) {
                     write_stderr("cannot insert into frozen hashtable \"%s\"", hashp->tabname);
                     return NULL;
@@ -1581,6 +1581,25 @@ void* buf_hash_operate(HTAB* hashp, const BufferTag* keyPtr, uint32 hashvalue, b
      * Follow collision chain looking for matching key
      */
     while (currBucket != NULL) {
+        if (currBucket->hashvalue == hashvalue) {
+            BufferTag* ele = (BufferTag*)(ELEMENTKEY(currBucket));
+            // ereport(WARNING, (errmsg("Find:[%u] RelFile:[%s] Folk:[%s] Blk:[%s]"
+            // , hashvalue
+            // , RelFileNodeEquals(ele->rnode, keyPtr->rnode) ? "Yes":"False"
+            // , ele->forkNum == keyPtr->forkNum ? "Yes":"False"
+            // , ele->blockNum == keyPtr->blockNum ? "Yes":"False"
+            // )));
+            ereport(WARNING, (errmsg("HTAB rel[%u,%u,%u,%u] Find rel[%u,%u,%u,%u]"
+                                                , ele->rnode.spcNode
+                                                , ele->rnode.dbNode
+                                                , ele->rnode.relNode
+                                                , ele->rnode.bucketNode
+                                                , keyPtr->rnode.spcNode
+                                                , keyPtr->rnode.dbNode
+                                                , keyPtr->rnode.relNode
+                                                , keyPtr->rnode.bucketNode                                                
+                                                ))); 
+        }
         if (currBucket->hashvalue == hashvalue && BUFFERTAGS_PTR_EQUAL((BufferTag*)(ELEMENTKEY(currBucket)), keyPtr)) {
             break;
         }

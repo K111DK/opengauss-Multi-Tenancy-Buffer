@@ -13,7 +13,6 @@
  */
 #ifndef BUFMGR_H
 #define BUFMGR_H
-
 #include "knl/knl_variable.h"
 #include "storage/buf/block.h"
 #include "storage/buf/buf.h"
@@ -21,43 +20,8 @@
 #include "storage/smgr/relfilenode.h"
 #include "utils/relcache.h"
 #include "postmaster/pagerepair.h"
-
 #include <string>
 #include <pthread.h>
-
-typedef struct lru_node {
-    uint32 hash_key;
-    int buffer_id;
-    struct lru_node* prev;
-    struct lru_node* next;
-} lru_node;
-
-typedef struct lru_buffer {
-    pthread_mutex_t lock;
-    lru_node dummy_head;
-    lru_node dummy_tail;
-    uint32 capacity;
-    struct HTAB* buffer_map;// tag hash -> lru_node
-} lru_buffer;
-//
-void lru_buffer_init(lru_buffer* buffer, uint32 capacity);
-
-typedef struct tenant_buffer_cxt{
-    pthread_mutex_t tenant_buffer_lock;
-    lru_buffer ref_buffer;
-    lru_buffer real_buffer;
-    size_t capacity;
-    uint64 total_access{0};
-    uint64 total_clean_buf_taken{0};
-} tenant_buffer_cxt;
-
-typedef struct tenant_info{
-    pthread_mutex_t tenant_map_lock;
-    struct HTAB* tenant_map;// tenant name -> tenant_buffer_cxt
-    tenant_buffer_cxt* non_tenant_buffer_cxt;
-} tenant_info;
-extern tenant_info g_tenant_info;
-
 
 
 

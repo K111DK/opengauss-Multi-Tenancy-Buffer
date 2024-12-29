@@ -1,4 +1,4 @@
-set(CMAKE_C_COMPILER "/usr/bin/cc")
+set(CMAKE_C_COMPILER "/usr/bin/clang")
 set(CMAKE_C_COMPILER_ARG1 "")
 set(CMAKE_C_COMPILER_ID "Clang")
 set(CMAKE_C_COMPILER_VERSION "14.0.0")
@@ -21,9 +21,9 @@ set(CMAKE_C_SIMULATE_VERSION "")
 
 
 
-set(CMAKE_AR "/usr/bin/ar")
+set(CMAKE_AR "/usr/bin/llvm-ar")
 set(CMAKE_C_COMPILER_AR "/usr/bin/llvm-ar-14")
-set(CMAKE_RANLIB "/usr/bin/ranlib")
+set(CMAKE_RANLIB "/usr/bin/llvm-ranlib")
 set(CMAKE_C_COMPILER_RANLIB "/usr/bin/llvm-ranlib-14")
 set(CMAKE_LINKER "/usr/bin/ld")
 set(CMAKE_MT "")
@@ -68,5 +68,5 @@ endif()
 
 set(CMAKE_C_IMPLICIT_INCLUDE_DIRECTORIES "/usr/lib/llvm-14/lib/clang/14.0.0/include;/usr/local/include;/usr/include/x86_64-linux-gnu;/usr/include")
 set(CMAKE_C_IMPLICIT_LINK_LIBRARIES "gcc;gcc_s;c;gcc;gcc_s")
-set(CMAKE_C_IMPLICIT_LINK_DIRECTORIES "/usr/lib/gcc/x86_64-linux-gnu/11;/usr/lib64;/lib/x86_64-linux-gnu;/lib64;/usr/lib/x86_64-linux-gnu;/usr/lib/llvm-14/lib;/lib;/usr/lib")
+set(CMAKE_C_IMPLICIT_LINK_DIRECTORIES "/usr/lib/gcc/x86_64-linux-gnu/12;/usr/lib64;/lib/x86_64-linux-gnu;/lib64;/usr/lib/x86_64-linux-gnu;/usr/lib/llvm-14/lib;/lib;/usr/lib")
 set(CMAKE_C_IMPLICIT_LINK_FRAMEWORK_DIRECTORIES "")

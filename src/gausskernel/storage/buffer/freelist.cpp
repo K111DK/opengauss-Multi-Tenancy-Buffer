@@ -325,6 +325,106 @@ retry:
     /* not reached */
     return NULL;
 }
+BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state)
+{
+    BufferDesc *buf = NULL;
+    int bgwproc_no;
+    int try_counter;
+    uint32 local_buf_state = 0; /* to avoid repeated (de-)referencing */
+    int max_buffer_can_use;
+    bool am_standby = RecoveryInProgress();
+    StrategyDelayStatus retry_lock_status = { 0, 0 };
+    StrategyDelayStatus retry_buf_status = { 0, 0 };
+
+    // We don't consider the strategy object in the tenant mode.
+    bgwproc_no = INT_ACCESS_ONCE(t_thrd.storage_cxt.StrategyControl->bgwprocno);
+    if (bgwproc_no != -1) {
+        t_thrd.storage_cxt.StrategyControl->bgwprocno = -1;
+        SetLatch(&g_instance.proc_base_all_procs[bgwproc_no]->procLatch);
+    }
+    /*
+     * We count buffer allocation requests so that the bgwriter can estimate
+     * the rate of buffer consumption.	Note that buffers recycled by a
+     * strategy object are intentionally not counted here.
+     */
+    (void)pg_atomic_fetch_add_u32(&t_thrd.storage_cxt.StrategyControl->numBufferAllocs, 1);
+
+    /* We don't consider usage count here .Check the Candidate list */
+    if (ENABLE_INCRE_CKPT && pg_atomic_read_u32(&g_instance.ckpt_cxt_ctl->current_page_writer_count) > 1) {
+        buf = get_buf_from_candidate_list(strategy, buf_state);
+        if (buf != NULL) {
+            (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->get_buf_num_candidate_list, 1);
+            return buf;
+        }
+    }
+
+retry:
+    /* Nothing on the freelist, so run the "clock sweep" algorithm */
+    if (am_standby)
+        max_buffer_can_use = int(NORMAL_SHARED_BUFFER_NUM * u_sess->attr.attr_storage.shared_buffers_fraction);
+    else
+        max_buffer_can_use = NORMAL_SHARED_BUFFER_NUM;
+    try_counter = max_buffer_can_use;
+    int try_get_loc_times = max_buffer_can_use;
+    for (;;) {
+        buf = GetBufferDescriptor(ClockSweepTick(max_buffer_can_use));
+        /*
+         * If the buffer is pinned, we cannot use it.
+         */
+        if (!retryLockBufHdr(buf, &local_buf_state)) {
+            if (--try_get_loc_times == 0) {
+                ereport(WARNING,
+                        (errmsg("try get buf headr lock times equal to maxNBufferCanUse when StrategyGetBuffer")));
+                try_get_loc_times = max_buffer_can_use;
+            }
+            perform_delay(&retry_lock_status);
+            continue;
+        }
+
+        retry_lock_status.retry_times = 0;
+        if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0 && !(local_buf_state & BM_IS_META) &&
+            (backend_can_flush_dirty_page() || !(local_buf_state & BM_DIRTY))) {
+            /* Found a usable buffer */
+            if (strategy != NULL)
+                AddBufferToRing(strategy, buf);
+            *buf_state = local_buf_state;
+            (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->get_buf_num_clock_sweep, 1);
+            return buf;
+        } else if (--try_counter == 0) {
+            /*
+             * We've scanned all the buffers without making any state changes,
+             * so all the buffers are pinned (or were when we looked at them).
+             * We could hope that someone will free one eventually, but it's
+             * probably better to fail than to risk getting stuck in an
+             * infinite loop.
+             */
+            UnlockBufHdr(buf, local_buf_state);
+
+            if (am_standby && u_sess->attr.attr_storage.shared_buffers_fraction < 1.0) {
+                ereport(WARNING, (errmsg("no unpinned buffers available")));
+                u_sess->attr.attr_storage.shared_buffers_fraction =
+                    Min(u_sess->attr.attr_storage.shared_buffers_fraction + 0.1, 1.0);
+                goto retry;
+            } else if (dw_page_writer_running()) {
+                ereport(LOG, (errmsg("double writer is on, no buffer available, this buffer dirty is %u, "
+                                     "this buffer refcount is %u, now dirty page num is %ld",
+                                     (local_buf_state & BM_DIRTY), BUF_STATE_GET_REFCOUNT(local_buf_state),
+                                     get_dirty_page_num())));
+                perform_delay(&retry_buf_status);
+                goto retry;
+            } else if (t_thrd.storage_cxt.is_btree_split) {
+                ereport(WARNING, (errmsg("no unpinned buffers available when btree insert parent")));
+                goto retry;
+            } else
+                ereport(ERROR, (errcode(ERRCODE_INVALID_BUFFER), (errmsg("no unpinned buffers available"))));
+        }
+        UnlockBufHdr(buf, local_buf_state);
+        perform_delay(&retry_buf_status);
+    }
+
+    /* not reached */
+    return NULL;
+}
 
 /*
  * StrategySyncStart -- tell BufferSync where to start syncing
@@ -705,6 +805,7 @@ void wakeup_pagewriter_thread()
 
 const int CANDIDATE_DIRTY_LIST_LEN = 100;
 const float HIGH_WATER = 0.75;
+//Buffer return from which will be locked(Hdr)
 static BufferDesc* get_buf_from_candidate_list(BufferAccessStrategy strategy, uint32* buf_state)
 {
     BufferDesc* buf = NULL;
