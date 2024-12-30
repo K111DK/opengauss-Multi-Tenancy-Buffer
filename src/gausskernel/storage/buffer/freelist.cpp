@@ -325,52 +325,34 @@ retry:
     /* not reached */
     return NULL;
 }
-BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state)
-{
-    BufferDesc *buf = NULL;
-    int bgwproc_no;
-    int try_counter;
+/* Nothing on the freelist, so run the "clock sweep" algorithm */
+BufferDesc* ClockSweepBufferEvict(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt){
     uint32 local_buf_state = 0; /* to avoid repeated (de-)referencing */
-    int max_buffer_can_use;
-    bool am_standby = RecoveryInProgress();
+    BufferDesc *buf = NULL;
+retry:
     StrategyDelayStatus retry_lock_status = { 0, 0 };
     StrategyDelayStatus retry_buf_status = { 0, 0 };
-
-    // We don't consider the strategy object in the tenant mode.
-    bgwproc_no = INT_ACCESS_ONCE(t_thrd.storage_cxt.StrategyControl->bgwprocno);
-    if (bgwproc_no != -1) {
-        t_thrd.storage_cxt.StrategyControl->bgwprocno = -1;
-        SetLatch(&g_instance.proc_base_all_procs[bgwproc_no]->procLatch);
-    }
-    /*
-     * We count buffer allocation requests so that the bgwriter can estimate
-     * the rate of buffer consumption.	Note that buffers recycled by a
-     * strategy object are intentionally not counted here.
-     */
-    (void)pg_atomic_fetch_add_u32(&t_thrd.storage_cxt.StrategyControl->numBufferAllocs, 1);
-
-    /* We don't consider usage count here .Check the Candidate list */
-    if (ENABLE_INCRE_CKPT && pg_atomic_read_u32(&g_instance.ckpt_cxt_ctl->current_page_writer_count) > 1) {
-        buf = get_buf_from_candidate_list(strategy, buf_state);
-        if (buf != NULL) {
-            (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->get_buf_num_candidate_list, 1);
-            return buf;
-        }
-    }
-
-retry:
-    /* Nothing on the freelist, so run the "clock sweep" algorithm */
+    int try_counter;
+    int max_buffer_can_use;
+    bool am_standby = RecoveryInProgress();
     if (am_standby)
-        max_buffer_can_use = int(NORMAL_SHARED_BUFFER_NUM * u_sess->attr.attr_storage.shared_buffers_fraction);
+        max_buffer_can_use = int(buffer_cxt->real_buffer.max_capacity * u_sess->attr.attr_storage.shared_buffers_fraction);
     else
-        max_buffer_can_use = NORMAL_SHARED_BUFFER_NUM;
+        max_buffer_can_use = buffer_cxt->real_buffer.max_capacity;
     try_counter = max_buffer_can_use;
     int try_get_loc_times = max_buffer_can_use;
-    for (;;) {
-        buf = GetBufferDescriptor(ClockSweepTick(max_buffer_can_use));
-        /*
-         * If the buffer is pinned, we cannot use it.
-         */
+    for(;;){        
+        if(buffer_cxt->real_buffer.dummy_head.next == &buffer_cxt->real_buffer.dummy_tail){
+            ereport(WARNING, ((errmsg("no unpinned buffers available"))));
+            Assert(0);
+        }
+        if(buffer_cxt->real_buffer.sweep_hand == NULL){
+            buffer_cxt->real_buffer.sweep_hand = buffer_cxt->real_buffer.dummy_head.next;
+        }
+        if(buffer_cxt->real_buffer.sweep_hand == &buffer_cxt->real_buffer.dummy_tail){
+            buffer_cxt->real_buffer.sweep_hand = buffer_cxt->real_buffer.dummy_head.next;
+        }
+        buf = GetBufferDescriptor(buffer_cxt->real_buffer.sweep_hand->buffer_id);
         if (!retryLockBufHdr(buf, &local_buf_state)) {
             if (--try_get_loc_times == 0) {
                 ereport(WARNING,
@@ -381,16 +363,16 @@ retry:
             continue;
         }
 
-        retry_lock_status.retry_times = 0;
         if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0 && !(local_buf_state & BM_IS_META) &&
             (backend_can_flush_dirty_page() || !(local_buf_state & BM_DIRTY))) {
             /* Found a usable buffer */
-            if (strategy != NULL)
-                AddBufferToRing(strategy, buf);
+            // if (strategy != NULL)
+            //     AddBufferToRing(strategy, buf);
             *buf_state = local_buf_state;
-            (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->get_buf_num_clock_sweep, 1);
+            (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->get_buf_num_clock_sweep, 1);//? need it?
             return buf;
-        } else if (--try_counter == 0) {
+        } 
+        else if (--try_counter == 0) {
             /*
              * We've scanned all the buffers without making any state changes,
              * so all the buffers are pinned (or were when we looked at them).
@@ -421,9 +403,49 @@ retry:
         UnlockBufHdr(buf, local_buf_state);
         perform_delay(&retry_buf_status);
     }
+}
 
-    /* not reached */
-    return NULL;
+BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt)
+{
+    BufferDesc *buf = NULL;
+    int bgwproc_no;
+    uint32 local_buf_state = 0; /* to avoid repeated (de-)referencing */
+
+    // We don't consider the strategy object in the tenant mode.
+    bgwproc_no = INT_ACCESS_ONCE(t_thrd.storage_cxt.StrategyControl->bgwprocno);
+    if (bgwproc_no != -1) {
+        t_thrd.storage_cxt.StrategyControl->bgwprocno = -1;
+        SetLatch(&g_instance.proc_base_all_procs[bgwproc_no]->procLatch);
+    }
+    /*
+     * We count buffer allocation requests so that the bgwriter can estimate
+     * the rate of buffer consumption.	Note that buffers recycled by a
+     * strategy object are intentionally not counted here.
+     */
+    (void)pg_atomic_fetch_add_u32(&t_thrd.storage_cxt.StrategyControl->numBufferAllocs, 1);
+
+
+    if(buffer_cxt->real_buffer.curr_size < buffer_cxt->real_buffer.max_capacity){
+        buffer_cxt->real_buffer.curr_size++;
+        /* Fetch from global free buffer pool */
+        int buf_id;
+        while(candidate_buf_pop(&g_tenant_info.buffer_list, &buf_id)){
+            Assert(buf_id < SegmentBufferStartID);
+            buf = GetBufferDescriptor(buf_id);
+            local_buf_state = LockBufHdr(buf);
+            bool available = BUF_STATE_GET_REFCOUNT(local_buf_state) == 0 
+                && !(local_buf_state & BM_IS_META) 
+                && !(local_buf_state & BM_DIRTY);
+            Assert(available);
+            if (available) {
+                *buf_state = local_buf_state;
+                return buf;
+            }
+        }
+        /* Fetch from other tenant's buffer pool */
+    }
+
+    return ClockSweepBufferEvict(strategy, buf_state, buffer_cxt);
 }
 
 /*

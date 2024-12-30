@@ -67,13 +67,31 @@ const int PAGE_QUEUE_SLOT_MULTI_NBUFFERS = 5;
  * This is called once during shared-memory initialization (either in the
  * postmaster, or in a standalone backend).
  */
+static void buf_push(CandidateList *list, int buf_id)
+{
+    uint32 list_size = list->cand_list_size;
+    uint32 tail_loc;
+
+    pg_memory_barrier();
+    volatile uint64 head = pg_atomic_read_u64(&list->head);
+    pg_memory_barrier();
+    volatile uint64 tail = pg_atomic_read_u64(&list->tail);
+
+    if (unlikely(tail - head >= list_size)) {
+        return;
+    }
+    tail_loc = tail % list_size;
+    list->cand_buf_list[tail_loc] = buf_id;
+    (void)pg_atomic_fetch_add_u64(&list->tail, 1);
+}
+
 void InitMultiTenantBufferPool(void){
 
     pthread_mutex_init(&g_tenant_info.tenant_map_lock, NULL);
     HASHCTL hctl;
     int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
     securec_check(ret, "\0", "\0");
-    hctl.keysize = sizeof(uint32);
+    hctl.keysize = TENANT_NAME_LEN;
     hctl.entrysize = sizeof(tenant_buffer_cxt);
     hctl.hash = string_hash;
     g_tenant_info.tenant_map = ShmemInitHash("tenant info hash", 
@@ -88,6 +106,14 @@ void InitMultiTenantBufferPool(void){
         //lru_buffer_init(&g_tenant_info.non_tenant_buffer_cxt->ref_buffer, 1024);
         lru_buffer_init(&g_tenant_info.non_tenant_buffer_cxt->real_buffer, 10240, "Non Tenant Buffer", 0);
         g_tenant_info.non_tenant_buffer_cxt->capacity = 10240;
+        g_tenant_info.buffer_pool = (Buffer *)
+        ShmemInitStruct("MultiTenantBuffers", NORMAL_SHARED_BUFFER_NUM * sizeof(Buffer), &found_descs);
+        MemSet((char*)g_tenant_info.buffer_pool, 0, NORMAL_SHARED_BUFFER_NUM * sizeof(Buffer));
+        INIT_CANDIDATE_LIST(g_tenant_info.buffer_list, g_tenant_info.buffer_pool, NORMAL_SHARED_BUFFER_NUM ,0 ,0);
+        g_tenant_info.buffer_list.buf_id_start = 0;
+        for(int buf_id = 0; buf_id < NvmBufferStartID; buf_id++){
+            buf_push(&g_tenant_info.buffer_list, buf_id);
+        }
     }
 }
 

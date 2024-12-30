@@ -334,7 +334,6 @@ extern void ScheduleBufferTagForWriteback(WritebackContext* context, BufferTag* 
 
 /* freelist.c */
 extern BufferDesc *StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state);
-extern BufferDesc *TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state);
 
 extern void StrategyFreeBuffer(volatile BufferDesc* buf);
 extern bool StrategyRejectBuffer(BufferAccessStrategy strategy, BufferDesc* buf);
@@ -378,30 +377,45 @@ typedef struct lru_buffer {
     pthread_mutex_t lock;
     lru_node dummy_head;
     lru_node dummy_tail;
-    uint32 capacity;
+    lru_node* sweep_hand;
+    uint32 max_capacity;
+    uint32 curr_size;
     struct HTAB* buffer_map;// tag hash -> lru_node
 } lru_buffer;
 //
 void lru_buffer_init(lru_buffer* buffer, uint32 capacity, const char* name, int type);
-
+#define TENANT_NAME_LEN 32
 typedef struct tenant_buffer_cxt{
-    pthread_mutex_t tenant_buffer_lock;
+    //key
+    char tenant_name[TENANT_NAME_LEN];
+    
+    //buffer cxt
     bool need_ref_buffer{true};
     lru_buffer ref_buffer;
     lru_buffer real_buffer;
-    size_t capacity;
+    
     uint64 total_access{0};
+    size_t capacity;
     uint64 total_clean_buf_taken{0};
+    
+    pthread_mutex_t tenant_buffer_lock;
 } tenant_buffer_cxt;
 
 typedef struct tenant_info{
+    uint64 current_alloc_clean_buf{0};
     uint64 total_clean_buf_taken{0};
     pthread_mutex_t tenant_map_lock;
     struct HTAB* tenant_map;// tenant name -> tenant_buffer_cxt
+    
     tenant_buffer_cxt* non_tenant_buffer_cxt;
+    Buffer* buffer_pool;
+    CandidateList buffer_list;
+
+
 } tenant_info;
 extern tenant_info g_tenant_info;
 tenant_buffer_cxt* get_thrd_tenant_buffer_cxt();
+extern BufferDesc *TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt);
 
 
 

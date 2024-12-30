@@ -3089,6 +3089,8 @@ void lru_buffer_init(lru_buffer* buffer, uint32 capacity, const char* name, int 
     buffer->dummy_head.prev = &buffer->dummy_tail;
     buffer->dummy_tail.prev = &buffer->dummy_head;
     buffer->dummy_tail.next = NULL;
+    buffer->max_capacity = capacity;
+    buffer->curr_size = 0;
 }
 
 tenant_buffer_cxt* get_tenant_by_name(const char* name){
@@ -3192,7 +3194,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
          * entry.
          */
         ReservePrivateRefCountEntry();
-        buf = (BufferDesc *)StrategyGetBuffer(strategy, &buf_state);
+        buf = (BufferDesc *)TenantStrategyGetBuffer(strategy, &buf_state, buffer_cxt);
         Assert(BUF_STATE_GET_REFCOUNT(buf_state) == 0);
         old_flags = buf_state & BUF_FLAG_MASK;
         /* Pin the buffer and then release the buffer spinlock */
