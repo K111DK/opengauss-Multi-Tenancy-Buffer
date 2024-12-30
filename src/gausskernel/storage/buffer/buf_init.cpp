@@ -104,8 +104,8 @@ void InitMultiTenantBufferPool(void){
     if (!found_descs) {
         pthread_mutex_init(&g_tenant_info.non_tenant_buffer_cxt->tenant_buffer_lock, NULL);
         //lru_buffer_init(&g_tenant_info.non_tenant_buffer_cxt->ref_buffer, 1024);
-        lru_buffer_init(&g_tenant_info.non_tenant_buffer_cxt->real_buffer, 10240, "Non Tenant Buffer", 0);
-        g_tenant_info.non_tenant_buffer_cxt->capacity = 10240;
+        lru_buffer_init(&g_tenant_info.non_tenant_buffer_cxt->real_buffer, 256, "Non Tenant Buffer", 0);
+        g_tenant_info.non_tenant_buffer_cxt->capacity = 256;
         g_tenant_info.buffer_pool = (Buffer *)
         ShmemInitStruct("MultiTenantBuffers", NORMAL_SHARED_BUFFER_NUM * sizeof(Buffer), &found_descs);
         MemSet((char*)g_tenant_info.buffer_pool, 0, NORMAL_SHARED_BUFFER_NUM * sizeof(Buffer));

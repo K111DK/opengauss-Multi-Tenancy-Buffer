@@ -3085,8 +3085,8 @@ void lru_buffer_init(lru_buffer* buffer, uint32 capacity, const char* name, int 
         capacity, capacity, 
         &hctl, 
         HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
-    buffer->dummy_head.next = NULL;
-    buffer->dummy_head.prev = &buffer->dummy_tail;
+    buffer->dummy_head.next = &buffer->dummy_tail;
+    buffer->dummy_head.prev = NULL;
     buffer->dummy_tail.prev = &buffer->dummy_head;
     buffer->dummy_tail.next = NULL;
     buffer->max_capacity = capacity;
@@ -3121,6 +3121,10 @@ tenant_buffer_cxt* get_thrd_tenant_buffer_cxt(){
 #include "utils/dynahash.h"
 static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
                                BufferAccessStrategy strategy, bool *found, const XLogPhyBlock *pblk){
+    
+    if(strategy && strategy->btype == 3){
+        ereport(WARNING, ((errmsg("Vaccuming"))));
+    }
 
     /* We will hold a big damn lock here */
     pthread_mutex_lock(&g_tenant_info.tenant_map_lock);
@@ -3150,15 +3154,14 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
 
     bool found_descs = false;   
     lru_node* entry = 
-    (lru_node*)buf_hash_operate<HASH_ENTER>(buffer_cxt->real_buffer.buffer_map, &new_tag, new_hash, &found_descs);
-    buf_id = entry->buffer_id;
-    // ereport(WARNING, (errmsg("Find hash:[%u] result:[%s] buf_id:[%d] entryAddr:[%x]"
-    // ,   new_hash 
-    // ,   found_descs ? "found":"Not found"
-    // ,   buf_id
-    // ,   (void *)entry)));
+    (lru_node*)buf_hash_operate<HASH_FIND>(buffer_cxt->real_buffer.buffer_map, &new_tag, new_hash, &found_descs);
+    ereport(WARNING, (errmsg("Find hash:[%u] result:[%s] buf_id:[%d]"
+    ,   new_hash 
+    ,   found_descs ? "found":"Not found"
+    ,   buf_id)));
 
-    if (found_descs && buf_id >= 0) {
+    if (found_descs) {
+        buf_id = entry->buffer_id;
         /*
          * Found it.  Now, pin the buffer so no one can steal it from the
          * buffer pool, and check to see if the correct data has been loaded
@@ -3208,6 +3211,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
          * after re-locking the buffer header.
          */
         if (old_flags & BM_DIRTY) {
+            ereport(WARNING, ((errmsg("Try flushing dirty %u", buf->buf_id))));
             /* backend should not flush dirty pages if working version less than DW_SUPPORT_NEW_SINGLE_FLUSH */
             if (!backend_can_flush_dirty_page()) {
                 UnpinBuffer(buf, true);
@@ -3318,7 +3322,6 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
         buf_state = LockBufHdr(buf);
 
 
-        entry->buffer_id = buf->buf_id;
         break;
     }
     
@@ -3352,9 +3355,30 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     UnlockBufHdr(buf, buf_state);
 
     if (old_flags & BM_TAG_VALID) {
-        buf_hash_operate<HASH_REMOVE>(buffer_cxt->real_buffer.buffer_map, &old_tag, 
+        lru_node* old_entry = (lru_node*)buf_hash_operate<HASH_FIND>(buffer_cxt->real_buffer.buffer_map, &old_tag, 
         old_hash,  &found_descs);
+        Assert(found_descs);
+        old_entry->prev->next = old_entry->next;
+        old_entry->next->prev = old_entry->prev;
+        buf_hash_operate<HASH_REMOVE>(buffer_cxt->real_buffer.buffer_map, &old_tag, old_hash, &found_descs);
+        Assert(found_descs);
+        ereport(WARNING, (errmsg("Remove old buf:[%u]", old_entry->buffer_id)));
     }
+
+    found_descs = false;
+    entry = (lru_node*)buf_hash_operate<HASH_ENTER>(buffer_cxt->real_buffer.buffer_map, &new_tag, 
+        new_hash,  &found_descs);
+    ereport(WARNING, (errmsg("Insert hash:[%u] result[found?]:[%s] buf_id:[%d]"
+    ,   new_hash 
+    ,   found_descs ? "found":"Not found"
+    ,   buf_id)));
+    Assert(!found_descs);
+    entry->buffer_id = buf->buf_id;
+    buffer_cxt->real_buffer.dummy_tail.prev->next = entry;
+    entry->prev = buffer_cxt->real_buffer.dummy_tail.prev;
+    entry->next = &buffer_cxt->real_buffer.dummy_tail;
+    buffer_cxt->real_buffer.dummy_tail.prev = entry;
+    Assert(buffer_cxt->real_buffer.dummy_head.next != &buffer_cxt->real_buffer.dummy_tail);
 
     /* set Physical segment file. */
     if (pblk != NULL) {

@@ -342,6 +342,7 @@ retry:
     try_counter = max_buffer_can_use;
     int try_get_loc_times = max_buffer_can_use;
     for(;;){        
+        ereport(WARNING, ((errmsg("Try clock sweep, hand:%x", buffer_cxt->real_buffer.sweep_hand))));
         if(buffer_cxt->real_buffer.dummy_head.next == &buffer_cxt->real_buffer.dummy_tail){
             ereport(WARNING, ((errmsg("no unpinned buffers available"))));
             Assert(0);
@@ -351,6 +352,8 @@ retry:
         }
         if(buffer_cxt->real_buffer.sweep_hand == &buffer_cxt->real_buffer.dummy_tail){
             buffer_cxt->real_buffer.sweep_hand = buffer_cxt->real_buffer.dummy_head.next;
+        }else{
+            buffer_cxt->real_buffer.sweep_hand = buffer_cxt->real_buffer.sweep_hand->next;
         }
         buf = GetBufferDescriptor(buffer_cxt->real_buffer.sweep_hand->buffer_id);
         if (!retryLockBufHdr(buf, &local_buf_state)) {
@@ -370,6 +373,7 @@ retry:
             //     AddBufferToRing(strategy, buf);
             *buf_state = local_buf_state;
             (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->get_buf_num_clock_sweep, 1);//? need it?
+            ereport(WARNING, (errmsg("Buf %d is evicted by clock sweep", buf->buf_id)));
             return buf;
         } 
         else if (--try_counter == 0) {
@@ -439,6 +443,7 @@ BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_s
             Assert(available);
             if (available) {
                 *buf_state = local_buf_state;
+                ereport(WARNING, (errmsg("New Buf %d is fetched from global free buffer pool", buf->buf_id)));
                 return buf;
             }
         }
