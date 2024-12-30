@@ -8,4 +8,4 @@ export CXX=$GCC_PATH/gcc/bin/g++
 export LD_LIBRARY_PATH=$GAUSSHOME/lib:$GCC_PATH/gcc/lib64:$GCC_PATH/isl/lib:$GCC_PATH/mpc/lib/:$GCC_PATH/mpfr/lib/:$GCC_PATH/gmp/lib/:$LD_LIBRARY_PATH
 export PATH=$GAUSSHOME/bin:$GCC_PATH/gcc/bin:$PATH
 
-sh build.sh -m debug -3rd /home/hx/work/binarylibs
+bash build.sh -m debug -3rd /home/hx/work/binarylibs

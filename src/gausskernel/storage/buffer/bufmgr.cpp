@@ -3155,10 +3155,10 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     bool found_descs = false;   
     lru_node* entry = 
     (lru_node*)buf_hash_operate<HASH_FIND>(buffer_cxt->real_buffer.buffer_map, &new_tag, new_hash, &found_descs);
-    ereport(WARNING, (errmsg("Find hash:[%u] result:[%s] buf_id:[%d]"
-    ,   new_hash 
-    ,   found_descs ? "found":"Not found"
-    ,   buf_id)));
+    // ereport(WARNING, (errmsg("Find hash:[%u] result:[%s] buf_id:[%d]"
+    // ,   new_hash 
+    // ,   found_descs ? "found":"Not found"
+    // ,   buf_id)));
 
     if (found_descs) {
         buf_id = entry->buffer_id;
@@ -3203,13 +3203,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
         /* Pin the buffer and then release the buffer spinlock */
         PinBuffer_Locked(buf);
         PageCheckIfCanEliminate(buf, &old_flags, &needGetLock);
-        /*
-         * If the buffer was dirty, try to write it out.  There is a race
-         * condition here, in that someone might dirty it after we released it
-         * above, or even while we are writing it out (since our share-lock
-         * won't prevent hint-bit updates).  We will recheck the dirty bit
-         * after re-locking the buffer header.
-         */
+
         if (old_flags & BM_DIRTY) {
             ereport(WARNING, ((errmsg("Try flushing dirty %u", buf->buf_id))));
             /* backend should not flush dirty pages if working version less than DW_SUPPORT_NEW_SINGLE_FLUSH */
@@ -3301,16 +3295,8 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
                 continue;
             }
         }
-        /*
-         * To change the association of a valid buffer, we'll need to have
-         * exclusive lock on both the old and new mapping partitions.
-         */
+
         if (old_flags & BM_TAG_VALID) {
-            /*
-             * Need to compute the old tag's hashcode and partition lock ID.
-             * XXX is it worth storing the hashcode in BufferDesc so we need
-             * not recompute it here?  Probably not.
-             */
             old_tag = ((BufferDesc *)buf)->tag;
             old_hash = BufTableHashCode(&old_tag);
         } else {
@@ -3329,19 +3315,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     PageCheckWhenChosedElimination(buf, old_flags);
 #endif
 
-    /*
-     * Okay, it's finally safe to rename the buffer.
-     *
-     * Clearing BM_VALID here is necessary, clearing the dirtybits is just
-     * paranoia.  We also reset the usage_count since any recency of use of
-     * the old content is no longer relevant.  (The usage_count starts out at
-     * 1 so that the buffer can survive one clock-sweep pass.)
-     *
-     * Make sure BM_PERMANENT is set for buffers that must be written at every
-     * checkpoint.  Unlogged buffers only need to be written at shutdown
-     * checkpoints, except for their "init" forks, which need to be treated
-     * just like permanent relations.
-     */
+
     ((BufferDesc *)buf)->tag = new_tag;
     buf_state &= ~(BM_VALID | BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR | BM_PERMANENT |
                    BUF_USAGECOUNT_MASK);
@@ -3353,11 +3327,21 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     }
 
     UnlockBufHdr(buf, buf_state);
+    bool in_place_replace = false;
+    lru_node* pre = NULL;
+    lru_node* next = NULL;
 
     if (old_flags & BM_TAG_VALID) {
+        in_place_replace = true;
+        
         lru_node* old_entry = (lru_node*)buf_hash_operate<HASH_FIND>(buffer_cxt->real_buffer.buffer_map, &old_tag, 
         old_hash,  &found_descs);
+        
         Assert(found_descs);
+        pre = old_entry->prev;
+        next = old_entry->next;
+        Assert(pre && next);
+
         old_entry->prev->next = old_entry->next;
         old_entry->next->prev = old_entry->prev;
         buf_hash_operate<HASH_REMOVE>(buffer_cxt->real_buffer.buffer_map, &old_tag, old_hash, &found_descs);
@@ -3368,17 +3352,21 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     found_descs = false;
     entry = (lru_node*)buf_hash_operate<HASH_ENTER>(buffer_cxt->real_buffer.buffer_map, &new_tag, 
         new_hash,  &found_descs);
-    ereport(WARNING, (errmsg("Insert hash:[%u] result[found?]:[%s] buf_id:[%d]"
-    ,   new_hash 
-    ,   found_descs ? "found":"Not found"
-    ,   buf_id)));
+    Assert(BufTableHashCode(&entry->key) == BufTableHashCode(&new_tag));
     Assert(!found_descs);
     entry->buffer_id = buf->buf_id;
-    buffer_cxt->real_buffer.dummy_tail.prev->next = entry;
-    entry->prev = buffer_cxt->real_buffer.dummy_tail.prev;
-    entry->next = &buffer_cxt->real_buffer.dummy_tail;
-    buffer_cxt->real_buffer.dummy_tail.prev = entry;
-    Assert(buffer_cxt->real_buffer.dummy_head.next != &buffer_cxt->real_buffer.dummy_tail);
+    if(in_place_replace){
+        entry->prev = pre;
+        entry->next = next;
+        pre->next = entry;
+        next->prev = entry;
+    }else{
+        buffer_cxt->real_buffer.dummy_tail.prev->next = entry;
+        entry->prev = buffer_cxt->real_buffer.dummy_tail.prev;
+        entry->next = &buffer_cxt->real_buffer.dummy_tail;
+        buffer_cxt->real_buffer.dummy_tail.prev = entry;
+        Assert(buffer_cxt->real_buffer.dummy_head.next != &buffer_cxt->real_buffer.dummy_tail);
+    }
 
     /* set Physical segment file. */
     if (pblk != NULL) {

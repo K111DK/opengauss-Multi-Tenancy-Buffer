@@ -1581,9 +1581,21 @@ void* buf_hash_operate(HTAB* hashp, const BufferTag* keyPtr, uint32 hashvalue, b
      * Follow collision chain looking for matching key
      */
     while (currBucket != NULL) {
-        if (currBucket->hashvalue == hashvalue) {
-            BufferTag* ele = (BufferTag*)(ELEMENTKEY(currBucket));
-        }
+        // BufferTag* ele = (BufferTag*)(ELEMENTKEY(currBucket));
+        // ereport(WARNING, (errmsg("Target: [%u/%u/%u/%u/%u] Bucket: [%u/%u/%u/%u/%u] Hash Match:[%s] Val Match:[%s]",
+        //                 keyPtr->rnode.spcNode,
+        //                 keyPtr->rnode.dbNode,
+        //                 keyPtr->rnode.relNode,
+        //                 keyPtr->forkNum,
+        //                 keyPtr->blockNum,
+        //                 ele->rnode.spcNode,
+        //                 ele->rnode.dbNode,
+        //                 ele->rnode.relNode,
+        //                 ele->forkNum,
+        //                 ele->blockNum,
+        //                 currBucket->hashvalue == hashvalue ? "true" : "false",
+        //                 BUFFERTAGS_PTR_EQUAL((BufferTag*)(ELEMENTKEY(currBucket)), keyPtr) ? "true" : "false"
+        //                 )));
         if (currBucket->hashvalue == hashvalue && BUFFERTAGS_PTR_EQUAL((BufferTag*)(ELEMENTKEY(currBucket)), keyPtr)) {
             break;
         }
@@ -1595,9 +1607,9 @@ void* buf_hash_operate(HTAB* hashp, const BufferTag* keyPtr, uint32 hashvalue, b
 #endif
     }
 
-    if (action == HASH_ENTER)
+    if (action == HASH_ENTER || action == HASH_FIND) {
         *foundPtr = (bool)(currBucket != NULL);
-
+    }
     /*
      * OK, now what?
      */
