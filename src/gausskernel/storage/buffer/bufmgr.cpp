@@ -3205,7 +3205,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
         PageCheckIfCanEliminate(buf, &old_flags, &needGetLock);
 
         if (old_flags & BM_DIRTY) {
-            ereport(WARNING, ((errmsg("Try flushing dirty %u", buf->buf_id))));
+            // ereport(WARNING, ((errmsg("Try flushing dirty %u", buf->buf_id))));
             /* backend should not flush dirty pages if working version less than DW_SUPPORT_NEW_SINGLE_FLUSH */
             if (!backend_can_flush_dirty_page()) {
                 UnpinBuffer(buf, true);
@@ -3346,7 +3346,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
         old_entry->next->prev = old_entry->prev;
         buf_hash_operate<HASH_REMOVE>(buffer_cxt->real_buffer.buffer_map, &old_tag, old_hash, &found_descs);
         Assert(found_descs);
-        ereport(WARNING, (errmsg("Remove old buf:[%u]", old_entry->buffer_id)));
+        //ereport(WARNING, (errmsg("Remove old buf:[%u]", old_entry->buffer_id)));
     }
 
     found_descs = false;
