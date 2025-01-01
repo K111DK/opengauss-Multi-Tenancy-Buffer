@@ -366,7 +366,7 @@ extern void LocalBufferFlushAllBuffer();
 
 
 #define NORMAL_BUFFER_SIZE 1024
-#define ENABLE_MULTI_TENANTCY 0
+#define ENABLE_MULTI_TENANTCY 1
 enum BufferType{
     LRU = 0,
     CLOCK,

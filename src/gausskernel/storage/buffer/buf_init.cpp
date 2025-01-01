@@ -103,7 +103,7 @@ void InitMultiTenantBufferPool(void){
     "Non Tenant Buffer", HASH_ENTER, &found_descs);
     if (!found_descs) {
         /* Backup buffer */
-        tenant_buffer_init(g_tenant_info.non_tenant_buffer_cxt, CLOCK, 1024, CLOCK, 1024);
+        tenant_buffer_init(g_tenant_info.non_tenant_buffer_cxt, CLOCK, NORMAL_SHARED_BUFFER_NUM, CLOCK, NORMAL_SHARED_BUFFER_NUM);
 
         /* Free pool init */
         g_tenant_info.buffer_pool = (Buffer *)
@@ -125,10 +125,6 @@ void InitBufferPool(void)
     bool found_buf_extra = false;
     uint64 buffer_size;
     BufferDescExtra *extra = NULL;
-    ereport(WARNING, (errmsg("Total shared buffer num: %d", NORMAL_SHARED_BUFFER_NUM)));
-#if ENABLE_MULTI_TENANTCY
-        InitMultiTenantBufferPool();
-#endif
 
     t_thrd.storage_cxt.BufferDescriptors = (BufferDescPadded *)CACHELINEALIGN(
         ShmemInitStruct("Buffer Descriptors",
@@ -211,6 +207,12 @@ void InitBufferPool(void)
         Assert(found_descs && found_bufs && found_buf_ckpt && found_buf_extra);
         /* note: this path is only taken in EXEC_BACKEND case */
     } else {
+
+#if ENABLE_MULTI_TENANTCY
+        ereport(WARNING, (errmsg("Total shared buffer num: %d", NORMAL_SHARED_BUFFER_NUM)));
+        InitMultiTenantBufferPool();
+#endif
+
         int i;
 
         /*
