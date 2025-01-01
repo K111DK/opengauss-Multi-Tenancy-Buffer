@@ -3122,9 +3122,9 @@ tenant_buffer_cxt* get_thrd_tenant_buffer_cxt(){
 static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
                                BufferAccessStrategy strategy, bool *found, const XLogPhyBlock *pblk){
     
-    if(strategy && strategy->btype == 3){
-        ereport(WARNING, ((errmsg("Vaccuming"))));
-    }
+    // if(strategy && strategy->btype == 3){
+    //     ereport(WARNING, ((errmsg("Vaccuming"))));
+    // }
 
     /* We will hold a big damn lock here */
     pthread_mutex_lock(&g_tenant_info.tenant_map_lock);
