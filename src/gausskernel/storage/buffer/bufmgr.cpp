@@ -3243,21 +3243,21 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
                  * victim.	We need lock to inspect the page LSN, so this
                  * can't be done inside StrategyGetBuffer.
                  */
-                if (strategy != NULL) {
-                    XLogRecPtr lsn;
+                // if (strategy != NULL) {
+                //     XLogRecPtr lsn;
 
-                    /* Read the LSN while holding buffer header lock */
-                    buf_state = LockBufHdr(buf);
-                    lsn = BufferGetLSN(buf);
-                    UnlockBufHdr(buf, buf_state);
+                //     /* Read the LSN while holding buffer header lock */
+                //     buf_state = LockBufHdr(buf);
+                //     lsn = BufferGetLSN(buf);
+                //     UnlockBufHdr(buf, buf_state);
 
-                    if (XLogNeedsFlush(lsn) && StrategyRejectBuffer(strategy, buf)) {
-                        /* Drop lock/pin and loop around for another buffer */
-                        LWLockRelease(buf->content_lock);
-                        UnpinBuffer(buf, true);
-                        continue;
-                    }
-                }
+                //     if (XLogNeedsFlush(lsn) && StrategyRejectBuffer(strategy, buf)) {
+                //         /* Drop lock/pin and loop around for another buffer */
+                //         LWLockRelease(buf->content_lock);
+                //         UnpinBuffer(buf, true);
+                //         continue;
+                //     }
+                // }
 
                 /* OK, do the I/O */
                 TRACE_POSTGRESQL_BUFFER_WRITE_DIRTY_START(fork_num, block_num, smgr->smgr_rnode.node.spcNode,
@@ -3306,9 +3306,13 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
          * Need to lock the buffer header too in order to change its tag.
          */
         buf_state = LockBufHdr(buf);
-
-
-        break;
+        old_flags = buf_state & BUF_FLAG_MASK;
+        if(BUF_STATE_GET_REFCOUNT(buf_state) == 1 && !(old_flags & BM_DIRTY) 
+            && !(old_flags & BM_IS_META)){
+                break;
+        }
+        UnlockBufHdr(buf, buf_state);
+        UnpinBuffer(buf, true);
     }
     
 #ifdef USE_ASSERT_CHECKING
@@ -3326,7 +3330,6 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
         buf_state |= BM_TAG_VALID | BUF_USAGECOUNT_ONE;
     }
 
-    UnlockBufHdr(buf, buf_state);
     bool in_place_replace = false;
     lru_node* pre = NULL;
     lru_node* next = NULL;
@@ -3367,6 +3370,8 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
         buffer_cxt->real_buffer.dummy_tail.prev = entry;
         Assert(buffer_cxt->real_buffer.dummy_head.next != &buffer_cxt->real_buffer.dummy_tail);
     }
+
+    UnlockBufHdr(buf, buf_state);
 
     /* set Physical segment file. */
     if (pblk != NULL) {
