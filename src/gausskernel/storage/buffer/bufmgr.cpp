@@ -3064,35 +3064,43 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
     return buf;
 }
 tenant_info g_tenant_info;
-#define NORMAL_BUFFER_SIZE 1024
-#define ENABLE_MULTI_TENANTCY 1
-void lru_buffer_init(lru_buffer* buffer, uint32 capacity, const char* name, int type){
-    Assert(buffer!=NULL);
+void buffer_init(buffer* buffer_cxt, uint32 capacity, const char* name, BufferType type){
+    Assert(buffer_cxt!=NULL);
     Assert(name!=NULL);
-    // hash index name -> F/R + tenant name
-    char index_name[32];
-    index_name[31] = '\0';
-    strcpy_s(index_name + 1, 20, name);
-    index_name[0] = type == 0 ? 'F':'R';
-    
+    Assert(type == LRU || type == CLOCK);
+    Assert(capacity > 0);
     HASHCTL hctl;
     int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
     securec_check(ret, "\0", "\0");
     hctl.keysize = sizeof(BufferTag);//tag hash
-    hctl.entrysize = sizeof(lru_node);//lru node
+    hctl.entrysize = sizeof(buffer_node);//lru node
     hctl.hash = tag_hash;
-    buffer->buffer_map = ShmemInitHash(index_name, 
+    buffer_cxt->buffer_map = ShmemInitHash(name, 
         capacity, capacity, 
         &hctl, 
         HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
-    buffer->dummy_head.next = &buffer->dummy_tail;
-    buffer->dummy_head.prev = NULL;
-    buffer->dummy_tail.prev = &buffer->dummy_head;
-    buffer->dummy_tail.next = NULL;
-    buffer->max_capacity = capacity;
-    buffer->curr_size = 0;
+    buffer_cxt->dummy_head.next = &buffer_cxt->dummy_tail;
+    buffer_cxt->dummy_head.prev = NULL;
+    buffer_cxt->dummy_tail.prev = &buffer_cxt->dummy_head;
+    buffer_cxt->dummy_tail.next = NULL;
+    buffer_cxt->max_capacity = capacity;
+    buffer_cxt->curr_size = 0;
+    buffer_cxt->type = type;
 }
-
+void tenant_buffer_init(tenant_buffer_cxt* tenant_buffer, BufferType real_buffer_type, uint32 real_capacity,
+BufferType ref_buffer_type, uint32 ref_capacity){
+    char index_name[TENANT_NAME_LEN];
+    strcpy_s(index_name + 1, TENANT_NAME_LEN - 1, tenant_buffer->tenant_name);
+    index_name[TENANT_NAME_LEN - 1] = '\0';
+    index_name[0] = 'A';
+    buffer_init(&tenant_buffer->real_buffer, real_capacity, index_name, real_buffer_type);
+    ereport(WARNING, (errmsg("Tenant:%s create index: %s", tenant_buffer->tenant_name, index_name)));
+    index_name[0] = 'B';
+    buffer_init(&tenant_buffer->ref_buffer, ref_capacity, index_name, ref_buffer_type);
+    ereport(WARNING, (errmsg("Tenant:%s create index: %s", tenant_buffer->tenant_name, index_name)));
+    pthread_mutex_init(&tenant_buffer->tenant_buffer_lock, NULL);
+    tenant_buffer->capacity = real_capacity;
+}
 tenant_buffer_cxt* get_tenant_by_name(const char* name){
     bool tenant_found = false;
     tenant_buffer_cxt* entry = (tenant_buffer_cxt*)hash_search(g_tenant_info.tenant_map, 
@@ -3101,10 +3109,7 @@ tenant_buffer_cxt* get_tenant_by_name(const char* name){
     if (!tenant_found) {
             ereport(WARNING,
                 (errmsg("Tenant %s added", name)));
-            entry->capacity = NORMAL_BUFFER_SIZE;
-            lru_buffer_init(&entry->real_buffer, NORMAL_BUFFER_SIZE, name, 1);
-            lru_buffer_init(&entry->ref_buffer, NORMAL_BUFFER_SIZE, name, 0);
-            pthread_mutex_init(&entry->tenant_buffer_lock, NULL);
+            tenant_buffer_init(entry, CLOCK, 1024, CLOCK, 1024);
     }
     Assert(entry!=NULL);
     return entry;
@@ -3153,8 +3158,8 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     uint32 buf_state;
 
     bool found_descs = false;   
-    lru_node* entry = 
-    (lru_node*)buf_hash_operate<HASH_FIND>(buffer_cxt->real_buffer.buffer_map, &new_tag, new_hash, &found_descs);
+    buffer_node* entry = 
+    (buffer_node*)buf_hash_operate<HASH_FIND>(buffer_cxt->real_buffer.buffer_map, &new_tag, new_hash, &found_descs);
     // ereport(WARNING, (errmsg("Find hash:[%u] result:[%s] buf_id:[%d]"
     // ,   new_hash 
     // ,   found_descs ? "found":"Not found"
@@ -3331,13 +3336,13 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     }
 
     bool in_place_replace = false;
-    lru_node* pre = NULL;
-    lru_node* next = NULL;
+    buffer_node* pre = NULL;
+    buffer_node* next = NULL;
 
     if (old_flags & BM_TAG_VALID) {
         in_place_replace = true;
         
-        lru_node* old_entry = (lru_node*)buf_hash_operate<HASH_FIND>(buffer_cxt->real_buffer.buffer_map, &old_tag, 
+        buffer_node* old_entry = (buffer_node*)buf_hash_operate<HASH_FIND>(buffer_cxt->real_buffer.buffer_map, &old_tag, 
         old_hash,  &found_descs);
         
         Assert(found_descs);
@@ -3353,7 +3358,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     }
 
     found_descs = false;
-    entry = (lru_node*)buf_hash_operate<HASH_ENTER>(buffer_cxt->real_buffer.buffer_map, &new_tag, 
+    entry = (buffer_node*)buf_hash_operate<HASH_ENTER>(buffer_cxt->real_buffer.buffer_map, &new_tag, 
         new_hash,  &found_descs);
     Assert(BufTableHashCode(&entry->key) == BufTableHashCode(&new_tag));
     Assert(!found_descs);

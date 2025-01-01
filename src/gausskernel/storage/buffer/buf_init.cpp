@@ -102,10 +102,10 @@ void InitMultiTenantBufferPool(void){
     g_tenant_info.non_tenant_buffer_cxt = (tenant_buffer_cxt*)hash_search(g_tenant_info.tenant_map, 
     "Non Tenant Buffer", HASH_ENTER, &found_descs);
     if (!found_descs) {
-        pthread_mutex_init(&g_tenant_info.non_tenant_buffer_cxt->tenant_buffer_lock, NULL);
-        //lru_buffer_init(&g_tenant_info.non_tenant_buffer_cxt->ref_buffer, 1024);
-        lru_buffer_init(&g_tenant_info.non_tenant_buffer_cxt->real_buffer, 1024, "Non Tenant Buffer", 0);
-        g_tenant_info.non_tenant_buffer_cxt->capacity = 1024;
+        /* Backup buffer */
+        tenant_buffer_init(g_tenant_info.non_tenant_buffer_cxt, CLOCK, 1024, CLOCK, 1024);
+
+        /* Free pool init */
         g_tenant_info.buffer_pool = (Buffer *)
         ShmemInitStruct("MultiTenantBuffers", NORMAL_SHARED_BUFFER_NUM * sizeof(Buffer), &found_descs);
         MemSet((char*)g_tenant_info.buffer_pool, 0, NORMAL_SHARED_BUFFER_NUM * sizeof(Buffer));
@@ -125,7 +125,11 @@ void InitBufferPool(void)
     bool found_buf_extra = false;
     uint64 buffer_size;
     BufferDescExtra *extra = NULL;
-    InitMultiTenantBufferPool();
+    ereport(WARNING, (errmsg("Total shared buffer num: %d", NORMAL_SHARED_BUFFER_NUM)));
+#if ENABLE_MULTI_TENANTCY
+        InitMultiTenantBufferPool();
+#endif
+
     t_thrd.storage_cxt.BufferDescriptors = (BufferDescPadded *)CACHELINEALIGN(
         ShmemInitStruct("Buffer Descriptors",
                         TOTAL_BUFFER_NUM * sizeof(BufferDescPadded) + PG_CACHE_LINE_SIZE,

@@ -365,25 +365,31 @@ extern void FlushBuffer(void* buf, SMgrRelation reln, ReadBufferMethod flushmeth
 extern void LocalBufferFlushAllBuffer();
 
 
+#define NORMAL_BUFFER_SIZE 1024
+#define ENABLE_MULTI_TENANTCY 0
+enum BufferType{
+    LRU = 0,
+    CLOCK,
+};
 
-typedef struct lru_node {
+typedef struct buffer_node {
     BufferTag key;
     int buffer_id;
-    struct lru_node* prev;
-    struct lru_node* next;
-} lru_node;
+    struct buffer_node* prev;
+    struct buffer_node* next;
+} buffer_node;
 
-typedef struct lru_buffer {
+typedef struct buffer {
     pthread_mutex_t lock;
-    lru_node dummy_head;
-    lru_node dummy_tail;
-    lru_node* sweep_hand;
+    buffer_node dummy_head;
+    buffer_node dummy_tail;
+    buffer_node* sweep_hand;
     uint32 max_capacity;
     uint32 curr_size;
-    struct HTAB* buffer_map;// tag hash -> lru_node
-} lru_buffer;
+    struct HTAB* buffer_map;// tag hash -> buffer_node
+    BufferType type;
+} buffer;
 //
-void lru_buffer_init(lru_buffer* buffer, uint32 capacity, const char* name, int type);
 #define TENANT_NAME_LEN 32
 typedef struct tenant_buffer_cxt{
     //key
@@ -391,8 +397,8 @@ typedef struct tenant_buffer_cxt{
     
     //buffer cxt
     bool need_ref_buffer{true};
-    lru_buffer ref_buffer;
-    lru_buffer real_buffer;
+    buffer ref_buffer;
+    buffer real_buffer;
     
     uint64 total_access{0};
     size_t capacity;
@@ -414,6 +420,9 @@ typedef struct tenant_info{
 
 } tenant_info;
 extern tenant_info g_tenant_info;
+void buffer_init(buffer* buffer_cxt, uint32 capacity, const char* name, int type);
+void tenant_buffer_init(tenant_buffer_cxt* tenant_buffer, BufferType real_buffer_type, uint32 real_capacity,
+BufferType ref_buffer_type, uint32 ref_capacity);
 tenant_buffer_cxt* get_thrd_tenant_buffer_cxt();
 extern BufferDesc *TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt);
 
