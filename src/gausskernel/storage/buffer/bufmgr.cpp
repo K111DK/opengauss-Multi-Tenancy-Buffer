@@ -3087,38 +3087,57 @@ void buffer_init(buffer* buffer_cxt, uint32 capacity, const char* name, BufferTy
     buffer_cxt->curr_size = 0;
     buffer_cxt->type = type;
 }
-void tenant_buffer_init(tenant_buffer_cxt* tenant_buffer, BufferType real_buffer_type, uint32 real_capacity,
+void tenant_buffer_init(tenant_buffer_cxt* tenant_buffer, BufferType real_buffer_type,
 BufferType ref_buffer_type, uint32 ref_capacity){
     char index_name[TENANT_NAME_LEN];
     strcpy_s(index_name + 1, TENANT_NAME_LEN - 1, tenant_buffer->tenant_name);
     index_name[TENANT_NAME_LEN - 1] = '\0';
-    index_name[0] = 'A';
-    buffer_init(&tenant_buffer->real_buffer, real_capacity, index_name, real_buffer_type);
+    index_name[0] = 'R';
+    buffer_init(&tenant_buffer->real_buffer, ref_capacity, index_name, real_buffer_type);
     ereport(WARNING, (errmsg("Tenant:%s create index: %s", tenant_buffer->tenant_name, index_name)));
-    index_name[0] = 'B';
+    index_name[0] = 'F';
     buffer_init(&tenant_buffer->ref_buffer, ref_capacity, index_name, ref_buffer_type);
     ereport(WARNING, (errmsg("Tenant:%s create index: %s", tenant_buffer->tenant_name, index_name)));
     pthread_mutex_init(&tenant_buffer->tenant_buffer_lock, NULL);
-    tenant_buffer->capacity = real_capacity;
+    tenant_buffer->capacity = ref_capacity;
 }
 tenant_buffer_cxt* get_tenant_by_name(const char* name){
     bool tenant_found = false;
     tenant_buffer_cxt* entry = (tenant_buffer_cxt*)hash_search(g_tenant_info.tenant_map, 
     name, HASH_ENTER, &tenant_found);
+    
     /* init entry */
     if (!tenant_found) {
+
+            //Tenant oid
+            entry->tenant_oid = g_tenant_info.tenant_buffer_cxt_array_size;
+            g_tenant_info.tenant_buffer_cxt_array[g_tenant_info.tenant_buffer_cxt_array_size++] = entry;
+            
+            //Tenant name format: T[0-9][0-9](tenant_id) + _ + [0-9][0-9][0-9][0-9](promised_memory in MB) + _ + [0-9][0-9](SLA)
+            uint32 tenant_id = (name[1] - '0') * 10 + (name[2] - '0');
+            uint32 promised_memory = (name[4] - '0') * 1000 + (name[5] - '0') * 100 + (name[6] - '0') * 10 + (name[7] - '0');
+            uint32 sla = (name[9] - '0') * 10 + (name[10] - '0');
+            uint32 ref_capacity = promised_memory / BLCKSZ;
+            Assert(ref_capacity > 0 && ref_capacity < NORMAL_BUFFER_SIZE);
+            Assert(sla > 0);
             ereport(WARNING,
-                (errmsg("Tenant %s added", name)));
-            tenant_buffer_init(entry, CLOCK, 1024, CLOCK, 1024);
+                (errmsg("Tenant [%s] added, Id: [%u], Promised mem: [%u mb][%u blk] , SLA: [%u]", name, tenant_id, promised_memory, ref_capacity, sla)));
+            
+            //Init pool
+            tenant_buffer_init(entry, CLOCK, CLOCK, ref_capacity);
+            entry->sla = sla;
+    
     }
     Assert(entry!=NULL);
     return entry;
 }
 
 tenant_buffer_cxt* get_thrd_tenant_buffer_cxt(){
+    //Tenant name format: T[0-9][0-9](tenant_id) + _ + [0-9][0-9][0-9][0-9](promised_memory in MB) + _ + [0-9][0-9](SLA)
     if(u_sess && u_sess->proc_cxt.MyProcPort 
                 && u_sess->proc_cxt.MyProcPort->user_name
                     && u_sess->proc_cxt.MyProcPort->user_name[0] == 'T'){
+        Assert(strlen(u_sess->proc_cxt.MyProcPort->user_name) >= 3 + 1 + 4 + 1 + 2);
         return get_tenant_by_name(u_sess->proc_cxt.MyProcPort->user_name);
     }
     return g_tenant_info.non_tenant_buffer_cxt;
@@ -3135,8 +3154,8 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     pthread_mutex_lock(&g_tenant_info.tenant_map_lock);
     Assert(!IsSegmentPhysicalRelNode(smgr->smgr_rnode.node));
     
-    //tenant_buffer_cxt * buffer_cxt = get_thrd_tenant_buffer_cxt();
-    tenant_buffer_cxt * buffer_cxt = g_tenant_info.non_tenant_buffer_cxt;
+    tenant_buffer_cxt * buffer_cxt = get_thrd_tenant_buffer_cxt();
+    //tenant_buffer_cxt * buffer_cxt = g_tenant_info.non_tenant_buffer_cxt;
 
     BufferTag old_tag;
     uint32 old_hash = 0;

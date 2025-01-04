@@ -87,7 +87,6 @@ static void buf_push(CandidateList *list, int buf_id)
 
 void InitMultiTenantBufferPool(void){
 
-    pthread_mutex_init(&g_tenant_info.tenant_map_lock, NULL);
     HASHCTL hctl;
     int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
     securec_check(ret, "\0", "\0");
@@ -102,8 +101,11 @@ void InitMultiTenantBufferPool(void){
     g_tenant_info.non_tenant_buffer_cxt = (tenant_buffer_cxt*)hash_search(g_tenant_info.tenant_map, 
     "Non Tenant Buffer", HASH_ENTER, &found_descs);
     if (!found_descs) {
+
+        pthread_mutex_init(&g_tenant_info.tenant_map_lock, NULL);
+
         /* Backup buffer */
-        tenant_buffer_init(g_tenant_info.non_tenant_buffer_cxt, CLOCK, NORMAL_SHARED_BUFFER_NUM, CLOCK, NORMAL_SHARED_BUFFER_NUM);
+        tenant_buffer_init(g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE);
 
         /* Free pool init */
         g_tenant_info.buffer_pool = (Buffer *)
@@ -113,6 +115,7 @@ void InitMultiTenantBufferPool(void){
         g_tenant_info.buffer_list.buf_id_start = 0;
         for(int buf_id = 0; buf_id < NvmBufferStartID; buf_id++){
             buf_push(&g_tenant_info.buffer_list, buf_id);
+        
         }
     }
 }
@@ -209,6 +212,7 @@ void InitBufferPool(void)
     } else {
 
 #if ENABLE_MULTI_TENANTCY
+        /* We make sure this won't exec twice */
         ereport(WARNING, (errmsg("Total shared buffer num: %d", NORMAL_SHARED_BUFFER_NUM)));
         InitMultiTenantBufferPool();
 #endif
