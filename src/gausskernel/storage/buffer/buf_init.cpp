@@ -84,7 +84,29 @@ static void buf_push(CandidateList *list, int buf_id)
     list->cand_buf_list[tail_loc] = buf_id;
     (void)pg_atomic_fetch_add_u64(&list->tail, 1);
 }
-
+static void hlist_buffer_init(buffer* buffer_cxt, uint32 capacity, const char* name, BufferType type){
+    Assert(buffer_cxt!=NULL);
+    Assert(name!=NULL);
+    Assert(type == LRU || type == CLOCK);
+    Assert(capacity > 0);
+    HASHCTL hctl;
+    int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
+    securec_check(ret, "\0", "\0");
+    hctl.keysize = sizeof(BufferTag);//tag hash
+    hctl.entrysize = sizeof(buffer_node);//lru node
+    hctl.hash = tag_hash;
+    buffer_cxt->buffer_map = ShmemInitHash(name, 
+        capacity, capacity, 
+        &hctl, 
+        HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
+    buffer_cxt->dummy_head.next = &buffer_cxt->dummy_tail;
+    buffer_cxt->dummy_head.prev = NULL;
+    buffer_cxt->dummy_tail.prev = &buffer_cxt->dummy_head;
+    buffer_cxt->dummy_tail.next = NULL;
+    buffer_cxt->max_capacity = capacity;
+    buffer_cxt->curr_size = 0;
+    buffer_cxt->type = type;
+}
 void InitMultiTenantBufferPool(void){
 
     HASHCTL hctl;
@@ -106,6 +128,9 @@ void InitMultiTenantBufferPool(void){
 
         /* Backup buffer */
         tenant_buffer_init(g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE);
+
+        /* Evict history list should be fifo */
+        hlist_buffer_init(&g_tenant_info.history_buffer, NORMAL_SHARED_BUFFER_NUM, "History Buffer", LRU);
 
         /* Free pool init */
         g_tenant_info.buffer_pool = (Buffer *)

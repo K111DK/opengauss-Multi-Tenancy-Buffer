@@ -410,6 +410,25 @@ retry:
     }
 }
 
+BufferDesc* TenantStrategyGetBufferFromOther(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt){
+    BufferDesc *buf = NULL;
+    int bgwproc_no;
+    uint32 local_buf_state = 0; /* to avoid repeated (de-)referencing */
+    // We don't consider the strategy object in the tenant mode.
+    bgwproc_no = INT_ACCESS_ONCE(t_thrd.storage_cxt.StrategyControl->bgwprocno);
+    if (bgwproc_no != -1) {
+        t_thrd.storage_cxt.StrategyControl->bgwprocno = -1;
+        SetLatch(&g_instance.proc_base_all_procs[bgwproc_no]->procLatch);
+    }
+    /*
+     * We count buffer allocation requests so that the bgwriter can estimate
+     * the rate of buffer consumption.	Note that buffers recycled by a
+     * strategy object are intentionally not counted here.
+     */
+    (void)pg_atomic_fetch_add_u32(&t_thrd.storage_cxt.StrategyControl->numBufferAllocs, 1);
+    /* Fetch from tenant's buffer pool */
+    return ClockSweepBufferEvict(strategy, buf_state, buffer_cxt);
+}
 BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt)
 {
     BufferDesc *buf = NULL;
@@ -449,8 +468,9 @@ BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_s
             }
         }
         /* Fetch from other tenant's buffer pool */
+        g_tenant_info.free_list_empty = true;
     }
-
+    /* Fetch from tenant's buffer pool */
     return ClockSweepBufferEvict(strategy, buf_state, buffer_cxt);
 }
 

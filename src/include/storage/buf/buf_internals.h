@@ -367,6 +367,7 @@ extern void LocalBufferFlushAllBuffer();
 
 #define MINIMAL_BUFFER_SIZE 1024
 #define ENABLE_MULTI_TENANTCY 1
+#define ENABLE_BUFFER_ADJUST 1
 enum BufferType{
     LRU = 0,
     CLOCK,
@@ -377,6 +378,9 @@ typedef struct buffer_node {
     int buffer_id;
     struct buffer_node* prev;
     struct buffer_node* next;
+    
+    /* To which tenant this buffer belongs */
+    int tenant_id{-1};
 } buffer_node;
 
 typedef struct buffer {
@@ -388,6 +392,10 @@ typedef struct buffer {
     uint32 curr_size;
     struct HTAB* buffer_map;// tag hash -> buffer_node
     BufferType type;
+
+    uint64 hits{0};
+    uint64 misses{0};
+
 } buffer;
 //
 #define TENANT_NAME_LEN 32
@@ -409,6 +417,7 @@ typedef struct tenant_buffer_cxt{
 
     uint32 sla;
     uint32 tenant_oid;
+    double weight{10.0};
 } tenant_buffer_cxt;
 
 typedef struct tenant_info{
@@ -421,6 +430,10 @@ typedef struct tenant_info{
     /* Free list */
     Buffer* buffer_pool;
     CandidateList buffer_list;
+    bool free_list_empty{false};
+
+    /* History list */
+    buffer history_buffer;
 
 
     pthread_mutex_t tenant_map_lock;
@@ -430,11 +443,11 @@ typedef struct tenant_info{
 
 } tenant_info;
 extern tenant_info g_tenant_info;
-void buffer_init(buffer* buffer_cxt, uint32 capacity, const char* name, int type);
-void tenant_buffer_init(tenant_buffer_cxt* tenant_buffer, BufferType real_buffer_type, BufferType ref_buffer_type, uint32 ref_capacity);
-tenant_buffer_cxt* get_thrd_tenant_buffer_cxt();
+extern void buffer_init(buffer* buffer_cxt, uint32 capacity, const char* name, int type);
+extern void tenant_buffer_init(tenant_buffer_cxt* tenant_buffer, BufferType real_buffer_type, BufferType ref_buffer_type, uint32 ref_capacity);
+extern tenant_buffer_cxt* get_thrd_tenant_buffer_cxt();
 extern BufferDesc *TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt);
-
+extern BufferDesc* TenantStrategyGetBufferFromOther(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt);
 
 
 #endif /* BUFMGR_INTERNALS_H */

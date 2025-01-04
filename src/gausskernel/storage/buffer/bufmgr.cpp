@@ -3110,15 +3110,15 @@ tenant_buffer_cxt* get_tenant_by_name(const char* name){
     if (!tenant_found) {
 
             //Tenant oid
-            entry->tenant_oid = g_tenant_info.tenant_buffer_cxt_array_size;
-            g_tenant_info.tenant_buffer_cxt_array[g_tenant_info.tenant_buffer_cxt_array_size++] = entry;
+            entry->tenant_oid = g_tenant_info.tenant_num;
+            g_tenant_info.tenant_buffer_cxt_array[g_tenant_info.tenant_num++] = entry;
             
             //Tenant name format: T[0-9][0-9](tenant_id) + _ + [0-9][0-9][0-9][0-9](promised_memory in MB) + _ + [0-9][0-9](SLA)
             uint32 tenant_id = (name[1] - '0') * 10 + (name[2] - '0');
             uint32 promised_memory = (name[4] - '0') * 1000 + (name[5] - '0') * 100 + (name[6] - '0') * 10 + (name[7] - '0');
             uint32 sla = (name[9] - '0') * 10 + (name[10] - '0');
             uint32 ref_capacity = promised_memory / BLCKSZ;
-            Assert(ref_capacity > 0 && ref_capacity < NORMAL_BUFFER_SIZE);
+            Assert(ref_capacity > 0 && ref_capacity < NORMAL_SHARED_BUFFER_NUM);
             Assert(sla > 0);
             ereport(WARNING,
                 (errmsg("Tenant [%s] added, Id: [%u], Promised mem: [%u mb][%u blk] , SLA: [%u]", name, tenant_id, promised_memory, ref_capacity, sla)));
@@ -3143,6 +3143,134 @@ tenant_buffer_cxt* get_thrd_tenant_buffer_cxt(){
     return g_tenant_info.non_tenant_buffer_cxt;
 }
 #include "utils/dynahash.h"
+
+
+double GetTenantHRD(tenant_buffer_cxt* buffer_cxt){
+
+    uint32 ref_hits = buffer_cxt->ref_buffer.hits;
+    uint32 ref_misses = buffer_cxt->ref_buffer.misses;
+    uint32 real_hits = buffer_cxt->real_buffer.hits;
+    uint32 real_misses = buffer_cxt->real_buffer.misses;
+    
+    if((ref_hits + ref_misses) == 0 || (real_hits + real_misses) == 0){
+        return 0;
+    }
+    
+    double hrd = (double)ref_hits / (ref_hits + ref_misses) * 100 - (float)real_hits / (real_hits + real_misses) * 100;
+    //ereport(WARNING, (errmsg("Tenant [%s] HRD: %u", buffer_cxt->tenant_name, hrd)));
+    return hrd < 0 ? 0 : hrd;
+
+}
+
+/* Currently we do it in LRU manner */
+void UpdateRefBuffer(uint32 access_hash, BufferTag *access_tag, tenant_buffer_cxt* buffer_cxt){
+    
+    BufferType type = buffer_cxt->ref_buffer.type;
+    buffer *ref = &buffer_cxt->ref_buffer;
+    bool found_descs = false;   
+    
+    buffer_node* entry = (buffer_node*)buf_hash_operate<HASH_FIND>(ref->buffer_map, access_tag, access_hash, &found_descs);
+    
+    if(found_descs){
+        ref->hits++;
+        
+        /* Update buffer struct */
+        
+        /* Remove */
+        entry->next->prev = entry->prev;
+        entry->prev->next = entry->next;
+
+        /* Insert to head */
+        entry->next = ref->dummy_head.next;
+        ref->dummy_head.next->prev = entry;
+        ref->dummy_head.next = entry;
+        entry->prev = &ref->dummy_head;
+    }
+
+    ref->misses++;
+
+    
+    /* Enter new hash */
+    entry = (buffer_node*)buf_hash_operate<HASH_ENTER>(ref->buffer_map, access_tag, access_hash, &found_descs);
+    Assert(!found_descs);
+
+    
+    /* Insert to head */
+    entry->next = ref->dummy_head.next;
+    ref->dummy_head.next->prev = entry;
+    ref->dummy_head.next = entry;
+    entry->prev = &ref->dummy_head;
+    ref->curr_size++;
+    
+    
+    /* Evict if needed */
+    if(ref->curr_size > ref->max_capacity){
+        buffer_node* tail = ref->dummy_tail.prev;
+        Assert(tail != &ref->dummy_head);
+        buffer_node* prev = tail->prev;
+        prev->next = &ref->dummy_tail;
+        ref->dummy_tail.prev = prev;
+        buf_hash_operate<HASH_REMOVE>(ref->buffer_map, &tail->key, access_hash, &found_descs);
+        Assert(found_descs);
+        ref->curr_size--;
+    }
+}
+
+void UpdateWeight(bool hrd_reweight, uint32 tenant_oid){
+    double total_w = 0;
+    uint32 max_sla = 0;
+    tenant_buffer_cxt* buffer_cxt;
+    
+    /* Get max sla and max weight */
+    for(int i = 0; i < g_tenant_info.tenant_num; i++){
+        buffer_cxt = g_tenant_info.tenant_buffer_cxt_array[i];
+        max_sla = max_sla > buffer_cxt->sla ? max_sla : buffer_cxt->sla;
+        total_w += buffer_cxt->weight;
+    }
+
+    /* Do reweight by hrd */
+    Assert(tenant_oid < g_tenant_info.tenant_num);
+    buffer_cxt = g_tenant_info.tenant_buffer_cxt_array[tenant_oid];
+    double hrd = GetTenantHRD(buffer_cxt);
+    double sla_factor = (double)buffer_cxt->sla / max_sla;
+    total_w -= buffer_cxt->weight;
+    buffer_cxt->weight = buffer_cxt->weight * exp(-1.0 * hrd * sla_factor);
+    total_w += buffer_cxt->weight;
+
+    /* global reweight */
+    for(int i = 0; i < g_tenant_info.tenant_num; i++){
+        buffer_cxt = g_tenant_info.tenant_buffer_cxt_array[i];
+        buffer_cxt->weight = buffer_cxt->weight / total_w;
+    }
+}
+
+tenant_buffer_cxt* GetVictimTenant(){
+    const double zero = 0.0000001;
+    tenant_buffer_cxt* victim_buffer_cxt = NULL;
+    double random=double(rand()) / double(RAND_MAX);
+    uint32 victim = -1;
+    while( victim == -1 ){
+        for(int i = 0; i < g_tenant_info.tenant_num; i++){
+            victim_buffer_cxt = g_tenant_info.tenant_buffer_cxt_array[i];
+            random = random - victim_buffer_cxt->weight;
+            if ( random < zero ){
+                victim = i;
+                break;
+            }
+        }
+        random=double(rand()) / double(RAND_MAX);
+    }
+
+    /* If victim buffer is too small. Do those reset bs */
+    uint32 active_tenant = g_tenant_info.tenant_num == 0 ? 1 : g_tenant_info.tenant_num; //Active tenant
+    uint32 lower_bound = NORMAL_SHARED_BUFFER_NUM / ( active_tenant * active_tenant );
+    if(victim_buffer_cxt->real_buffer.curr_size < lower_bound){
+        //TODO   
+    }
+    return victim_buffer_cxt;
+}
+
+
 static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
                                BufferAccessStrategy strategy, bool *found, const XLogPhyBlock *pblk){
     
@@ -3150,6 +3278,8 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     //     ereport(WARNING, ((errmsg("Vaccuming"))));
     // }
 
+    Assert(found);
+    
     /* We will hold a big damn lock here */
     pthread_mutex_lock(&g_tenant_info.tenant_map_lock);
     Assert(!IsSegmentPhysicalRelNode(smgr->smgr_rnode.node));
@@ -3206,6 +3336,14 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
             buf->extra->seg_blockno = pblk->block;
             MarkReadPblk(buf->buf_id, pblk);
         }
+
+        if(*found)
+            buffer_cxt->real_buffer.hits++;
+        else
+            buffer_cxt->real_buffer.misses++;
+        /* Update ref buffer cxt */
+        UpdateRefBuffer(new_hash, &new_tag, buffer_cxt);
+
         pthread_mutex_unlock(&g_tenant_info.tenant_map_lock);
         return buf;
     }
@@ -3214,6 +3352,25 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
      * Didn't find it in the buffer pool.  We'll have to initialize a new
      * buffer.	Remember to unlock the mapping lock while doing the work.
      */
+
+    tenant_buffer_cxt* victim_buffer_cxt = NULL;
+#if ENABLE_BUFFER_ADJUST
+    if( !(buffer_cxt->real_buffer.curr_size >= buffer_cxt->real_buffer.max_capacity) || g_tenant_info.free_list_empty ){
+        double hrd = GetTenantHRD(buffer_cxt);
+        if(hrd > 0){
+            // /* Find if insert buf is in Hlist */
+            bool found_descs = true;
+            // buf_hash_operate<HASH_REMOVE>(&g_tenant_info.history_buffer, &new_tag, new_hash, &found_descs);
+            
+            /* Update weight */
+            UpdateWeight(found_descs, buffer_cxt->tenant_oid);//We should find ? in Hlist?
+            
+            /* Sampling tenant and pick a victim from which to evict */
+            victim_buffer_cxt = GetVictimTenant();
+        }
+    }
+#endif
+
     for (;;) {
         bool needGetLock = false;
         /*
@@ -3221,7 +3378,13 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
          * entry.
          */
         ReservePrivateRefCountEntry();
-        buf = (BufferDesc *)TenantStrategyGetBuffer(strategy, &buf_state, buffer_cxt);
+        
+        if(victim_buffer_cxt){
+            buf = (BufferDesc *)TenantStrategyGetBufferFromOther(strategy, &buf_state, victim_buffer_cxt);
+        }else{
+            buf = (BufferDesc *)TenantStrategyGetBuffer(strategy, &buf_state, buffer_cxt);
+        }
+
         Assert(BUF_STATE_GET_REFCOUNT(buf_state) == 0);
         old_flags = buf_state & BUF_FLAG_MASK;
         /* Pin the buffer and then release the buffer spinlock */
@@ -3355,6 +3518,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     }
 
     bool in_place_replace = false;
+    int pre_owner = -1;
     buffer_node* pre = NULL;
     buffer_node* next = NULL;
 
@@ -3364,16 +3528,33 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
         buffer_node* old_entry = (buffer_node*)buf_hash_operate<HASH_FIND>(buffer_cxt->real_buffer.buffer_map, &old_tag, 
         old_hash,  &found_descs);
         
+        /* Record where old entry evict from */
         Assert(found_descs);
         pre = old_entry->prev;
         next = old_entry->next;
         Assert(pre && next);
 
+        pre_owner = old_entry->tenant_id;
+        /* Remove old entry from list */
         old_entry->prev->next = old_entry->next;
         old_entry->next->prev = old_entry->prev;
         buf_hash_operate<HASH_REMOVE>(buffer_cxt->real_buffer.buffer_map, &old_tag, old_hash, &found_descs);
         Assert(found_descs);
         //ereport(WARNING, (errmsg("Remove old buf:[%u]", old_entry->buffer_id)));
+        // /* Insert old buf into Hlist */
+        // buffer_node* old_entry = buf_hash_operate<HASH_ENTER>(g_tenant_info.history_buffer.buffer_map, &old_tag, old_hash,  &found_descs);
+        // if(!found_descs){
+        //     if(g_tenant_info.history_buffer.curr_size++ >= g_tenant_info.history_buffer.max_capacity){
+        //         buffer_node* tail = g_tenant_info.history_buffer.dummy_tail.prev;
+        //         Assert(tail != &g_tenant_info.history_buffer.dummy_head);
+        //         buffer_node* prev = tail->prev;
+        //         prev->next = &g_tenant_info.history_buffer.dummy_tail;
+        //         g_tenant_info.history_buffer.dummy_tail.prev = prev;
+        //         buf_hash_operate<HASH_REMOVE>(g_tenant_info.history_buffer.buffer_map, &tail->tag, old_hash, &found_descs);
+        //         g_tenant_info.history_buffer.curr_size--;
+        //     }
+        // }
+
     }
 
     found_descs = false;
@@ -3382,12 +3563,15 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     Assert(BufTableHashCode(&entry->key) == BufTableHashCode(&new_tag));
     Assert(!found_descs);
     entry->buffer_id = buf->buf_id;
-    if(in_place_replace){
+    entry->tenant_id = buffer_cxt->tenant_oid;
+    if(in_place_replace && (pre_owner == -1 || pre_owner == buffer_cxt->tenant_oid)){
+        /* Old buf is our buffer, push back to it's original pos */
         entry->prev = pre;
         entry->next = next;
         pre->next = entry;
         next->prev = entry;
     }else{
+        /* It's from freelist / other tenant's buffer */
         buffer_cxt->real_buffer.dummy_tail.prev->next = entry;
         entry->prev = buffer_cxt->real_buffer.dummy_tail.prev;
         entry->next = &buffer_cxt->real_buffer.dummy_tail;
@@ -3420,6 +3604,14 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     } else {
         *found = TRUE;
     }
+
+    if(*found)
+        buffer_cxt->real_buffer.hits++;
+    else
+        buffer_cxt->real_buffer.misses++;
+    
+    /* Update ref buffer cxt */
+    UpdateRefBuffer(new_hash, &new_tag, buffer_cxt);
 
     pthread_mutex_unlock(&g_tenant_info.tenant_map_lock);
     return buf;
