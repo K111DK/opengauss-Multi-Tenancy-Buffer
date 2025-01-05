@@ -3513,6 +3513,8 @@ typedef struct knl_thrd_context {
     knl_t_dms_context dms_cxt;
     knl_t_ondemand_xlog_copy_context ondemand_xlog_copy_cxt;
     knl_t_rc_context rc_cxt;
+
+    uint32 tenant_id;
 } knl_thrd_context;
 
 #ifdef ENABLE_MOT

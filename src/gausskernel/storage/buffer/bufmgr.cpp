@@ -3117,12 +3117,12 @@ tenant_buffer_cxt* get_tenant_by_name(const char* name){
             uint32 tenant_id = (name[1] - '0') * 10 + (name[2] - '0');
             uint32 promised_memory = (name[4] - '0') * 1000 + (name[5] - '0') * 100 + (name[6] - '0') * 10 + (name[7] - '0');
             uint32 sla = (name[9] - '0') * 10 + (name[10] - '0');
-            uint32 ref_capacity = promised_memory / BLCKSZ;
-            Assert(ref_capacity > 0 && ref_capacity < NORMAL_SHARED_BUFFER_NUM);
-            Assert(sla > 0);
+            uint32 ref_capacity = ( promised_memory * 1024 * 1024) / BLCKSZ;
             ereport(WARNING,
                 (errmsg("Tenant [%s] added, Id: [%u], Promised mem: [%u mb][%u blk] , SLA: [%u]", name, tenant_id, promised_memory, ref_capacity, sla)));
-            
+      
+            Assert(ref_capacity > 0 && ref_capacity < NORMAL_SHARED_BUFFER_NUM);
+            Assert(sla > 0);      
             //Init pool
             tenant_buffer_init(entry, CLOCK, CLOCK, ref_capacity);
             entry->sla = sla;
@@ -3134,12 +3134,27 @@ tenant_buffer_cxt* get_tenant_by_name(const char* name){
 
 tenant_buffer_cxt* get_thrd_tenant_buffer_cxt(){
     //Tenant name format: T[0-9][0-9](tenant_id) + _ + [0-9][0-9][0-9][0-9](promised_memory in MB) + _ + [0-9][0-9](SLA)
+    // if(t_thrd.tenant_id != UINT32_MAX - 1){
+    //     if(t_thrd.tenant_id == UINT32_MAX){
+    //         return g_tenant_info.non_tenant_buffer_cxt;
+    //     }
+    //     Assert(t_thrd.tenant_id < g_tenant_info.tenant_num);
+    //     return g_tenant_info.tenant_buffer_cxt_array[t_thrd.tenant_id];
+    // }
+    // if(u_sess && u_sess->proc_cxt.MyProcPort 
+    //             && u_sess->proc_cxt.MyProcPort->user_name)
+    //     ereport(WARNING, (errmsg("User name: %s", u_sess->proc_cxt.MyProcPort->user_name)));
     if(u_sess && u_sess->proc_cxt.MyProcPort 
                 && u_sess->proc_cxt.MyProcPort->user_name
-                    && u_sess->proc_cxt.MyProcPort->user_name[0] == 'T'){
+                    && u_sess->proc_cxt.MyProcPort->user_name[1] == '0'){
+        //ereport(WARNING, (errmsg("User name: %s is new Tenant", u_sess->proc_cxt.MyProcPort->user_name)));                
         Assert(strlen(u_sess->proc_cxt.MyProcPort->user_name) >= 3 + 1 + 4 + 1 + 2);
-        return get_tenant_by_name(u_sess->proc_cxt.MyProcPort->user_name);
+        tenant_buffer_cxt* ret = get_tenant_by_name(u_sess->proc_cxt.MyProcPort->user_name);
+        t_thrd.tenant_id = ret->tenant_oid;
+        return ret;
     }
+
+    t_thrd.tenant_id = UINT32_MAX;
     return g_tenant_info.non_tenant_buffer_cxt;
 }
 #include "utils/dynahash.h"
@@ -3185,6 +3200,7 @@ void UpdateRefBuffer(uint32 access_hash, BufferTag *access_tag, tenant_buffer_cx
         ref->dummy_head.next->prev = entry;
         ref->dummy_head.next = entry;
         entry->prev = &ref->dummy_head;
+        return;
     }
 
     ref->misses++;
@@ -3355,6 +3371,9 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
 
     tenant_buffer_cxt* victim_buffer_cxt = NULL;
 #if ENABLE_BUFFER_ADJUST
+    if( buffer_cxt->tenant_oid == UINT32_MAX){
+        goto GET_BUF;
+    }
     if( !(buffer_cxt->real_buffer.curr_size >= buffer_cxt->real_buffer.max_capacity) || g_tenant_info.free_list_empty ){
         double hrd = GetTenantHRD(buffer_cxt);
         if(hrd > 0){
@@ -3370,7 +3389,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
         }
     }
 #endif
-
+GET_BUF:
     for (;;) {
         bool needGetLock = false;
         /*

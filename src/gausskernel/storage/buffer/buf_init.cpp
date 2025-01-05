@@ -127,7 +127,8 @@ void InitMultiTenantBufferPool(void){
         pthread_mutex_init(&g_tenant_info.tenant_map_lock, NULL);
 
         /* Backup buffer */
-        tenant_buffer_init(g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE);
+        tenant_buffer_init(g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE * 10);
+        g_tenant_info.non_tenant_buffer_cxt->tenant_oid = UINT32_MAX;
 
         /* Evict history list should be fifo */
         hlist_buffer_init(&g_tenant_info.history_buffer, NORMAL_SHARED_BUFFER_NUM, "History Buffer", LRU);
@@ -153,6 +154,7 @@ void InitBufferPool(void)
     bool found_buf_extra = false;
     uint64 buffer_size;
     BufferDescExtra *extra = NULL;
+    t_thrd.tenant_id = UINT32_MAX-1;
 
     t_thrd.storage_cxt.BufferDescriptors = (BufferDescPadded *)CACHELINEALIGN(
         ShmemInitStruct("Buffer Descriptors",
