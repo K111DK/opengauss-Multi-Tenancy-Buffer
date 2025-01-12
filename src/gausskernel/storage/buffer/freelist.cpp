@@ -29,6 +29,7 @@
 #include "gstrace/gstrace_infra.h"
 #include "gstrace/storage_gstrace.h"
 #include "pgstat.h"
+#include "utils/dynahash.h"
 
 #define INT_ACCESS_ONCE(var) ((int)(*((volatile int *)&(var))))
 
@@ -352,8 +353,6 @@ retry:
         }
         if(buffer_cxt->real_buffer.sweep_hand == &buffer_cxt->real_buffer.dummy_tail){
             buffer_cxt->real_buffer.sweep_hand = buffer_cxt->real_buffer.dummy_head.next;
-        }else{
-            buffer_cxt->real_buffer.sweep_hand = buffer_cxt->real_buffer.sweep_hand->next;
         }
         buf = GetBufferDescriptor(buffer_cxt->real_buffer.sweep_hand->buffer_id);
         if (!retryLockBufHdr(buf, &local_buf_state)) {
@@ -363,6 +362,7 @@ retry:
                 try_get_loc_times = max_buffer_can_use;
             }
             perform_delay(&retry_lock_status);
+            buffer_cxt->real_buffer.sweep_hand = buffer_cxt->real_buffer.sweep_hand->next;
             continue;
         }
 
@@ -374,6 +374,7 @@ retry:
             *buf_state = local_buf_state;
             (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->get_buf_num_clock_sweep, 1);//? need it?
             //ereport(WARNING, (errmsg("Buf %d is evicted by clock sweep", buf->buf_id)));
+            buffer_cxt->real_buffer.sweep_hand = buffer_cxt->real_buffer.sweep_hand->next;
             return buf;
         } 
         else if (--try_counter == 0) {
@@ -407,6 +408,7 @@ retry:
         }
         UnlockBufHdr(buf, local_buf_state);
         perform_delay(&retry_buf_status);
+        buffer_cxt->real_buffer.sweep_hand = buffer_cxt->real_buffer.sweep_hand->next;
     }
 }
 
@@ -427,9 +429,17 @@ BufferDesc* TenantStrategyGetBufferFromOther(BufferAccessStrategy strategy, uint
      */
     (void)pg_atomic_fetch_add_u32(&t_thrd.storage_cxt.StrategyControl->numBufferAllocs, 1);
     /* Fetch from tenant's buffer pool */
-    return ClockSweepBufferEvict(strategy, buf_state, buffer_cxt);
+    BufferDesc* ans =  ClockSweepBufferEvict(strategy, buf_state, buffer_cxt);
+    bool found = false;
+    buf_hash_operate<HASH_FIND>(buffer_cxt->real_buffer.buffer_map, &ans->tag, BufTableHashCode(&ans->tag),  &found);
+    if(!found){
+        ereport(WARNING, (errmsg("Buffer %d is not found in tenant%s's buffer pool"
+                , ans->buf_id
+                ,buffer_cxt->tenant_name)));
+    }
+    return ans;
 }
-BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt)
+BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt, bool* from_free_list)
 {
     BufferDesc *buf = NULL;
     int bgwproc_no;
@@ -450,7 +460,6 @@ BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_s
 
 
     if(buffer_cxt->real_buffer.curr_size < buffer_cxt->real_buffer.max_capacity){
-        buffer_cxt->real_buffer.curr_size++;
         /* Fetch from global free buffer pool */
         int buf_id;
         while(candidate_buf_pop(&g_tenant_info.buffer_list, &buf_id)){
@@ -463,7 +472,9 @@ BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_s
             Assert(available);
             if (available) {
                 *buf_state = local_buf_state;
+                Assert(!( (local_buf_state & BUF_FLAG_MASK) & BM_TAG_VALID ));
                 //ereport(WARNING, (errmsg("New Buf %d is fetched from global free buffer pool", buf->buf_id)));
+                *from_free_list = true;
                 return buf;
             }
         }
@@ -471,7 +482,15 @@ BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_s
         g_tenant_info.free_list_empty = true;
     }
     /* Fetch from tenant's buffer pool */
-    return ClockSweepBufferEvict(strategy, buf_state, buffer_cxt);
+    BufferDesc* ans =  ClockSweepBufferEvict(strategy, buf_state, buffer_cxt);
+    bool found = false;
+    buf_hash_operate<HASH_FIND>(buffer_cxt->real_buffer.buffer_map, &ans->tag, BufTableHashCode(&ans->tag),  &found);
+    if(!found){
+        ereport(WARNING, (errmsg("Buffer %u is not found in tenant%s's buffer pool"
+                ,BufTableHashCode(&ans->tag)
+                ,buffer_cxt->tenant_name)));
+    }
+    return ans;
 }
 
 /*

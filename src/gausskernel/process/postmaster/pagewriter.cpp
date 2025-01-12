@@ -343,6 +343,7 @@ void candidate_buf_init(void)
      * Each thread manages a part of the buffer. Several slots are reserved to
      * prevent the thread first and last slots equals.
      */
+    
     g_instance.ckpt_cxt_ctl->candidate_buffers = (Buffer *)
         ShmemInitStruct("CandidateBuffers", buffer_num * sizeof(Buffer), &found_candidate_buf);
     g_instance.ckpt_cxt_ctl->candidate_free_map = (bool *)

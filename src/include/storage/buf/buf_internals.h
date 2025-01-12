@@ -381,6 +381,8 @@ typedef struct buffer_node {
     
     /* To which tenant this buffer belongs */
     int tenant_id{-1};
+    struct tenant_buffer_cxt* tenant_info{NULL};
+
 } buffer_node;
 
 typedef struct buffer {
@@ -435,7 +437,6 @@ typedef struct tenant_info{
     /* History list */
     buffer history_buffer;
 
-
     pthread_mutex_t tenant_map_lock;
     struct HTAB* tenant_map;// tenant name -> tenant_buffer_cxt
     tenant_buffer_cxt* tenant_buffer_cxt_array[MAX_TENANT];
@@ -446,7 +447,7 @@ extern tenant_info g_tenant_info;
 extern void buffer_init(buffer* buffer_cxt, uint32 capacity, const char* name, int type);
 extern void tenant_buffer_init(tenant_buffer_cxt* tenant_buffer, BufferType real_buffer_type, BufferType ref_buffer_type, uint32 ref_capacity);
 extern tenant_buffer_cxt* get_thrd_tenant_buffer_cxt();
-extern BufferDesc *TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt);
+extern BufferDesc *TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt, bool* from_free_list);
 extern BufferDesc* TenantStrategyGetBufferFromOther(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt);
 
 
