@@ -128,7 +128,7 @@ void InitMultiTenantBufferPool(void){
 
         /* Backup buffer */
         tenant_buffer_init(g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE * 10);
-        g_tenant_info.non_tenant_buffer_cxt->tenant_oid = UINT32_MAX - 114514;
+        g_tenant_info.non_tenant_buffer_cxt->tenant_oid = UINT32_MAX;
 
         /* Evict history list should be fifo */
         hlist_buffer_init(&g_tenant_info.history_buffer, NORMAL_SHARED_BUFFER_NUM, "History Buffer", LRU);

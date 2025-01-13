@@ -368,6 +368,7 @@ extern void LocalBufferFlushAllBuffer();
 #define MINIMAL_BUFFER_SIZE 1024
 #define ENABLE_MULTI_TENANTCY 1
 #define ENABLE_BUFFER_ADJUST 1
+#define MULTITENANT_RESET_ENABLE 1
 enum BufferType{
     LRU = 0,
     CLOCK,
@@ -441,6 +442,10 @@ typedef struct tenant_info{
     struct HTAB* tenant_map;// tenant name -> tenant_buffer_cxt
     tenant_buffer_cxt* tenant_buffer_cxt_array[MAX_TENANT];
     uint32 tenant_num{0};
+
+
+    /* Update count */
+    uint64 update_count{0};
 
 } tenant_info;
 extern tenant_info g_tenant_info;

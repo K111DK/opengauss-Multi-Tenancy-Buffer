@@ -3117,7 +3117,8 @@ tenant_buffer_cxt* get_tenant_by_name(const char* name){
 
             //Tenant oid
             entry->tenant_oid = g_tenant_info.tenant_num;
-            g_tenant_info.tenant_buffer_cxt_array[g_tenant_info.tenant_num++] = entry;
+            g_tenant_info.tenant_buffer_cxt_array[g_tenant_info.tenant_num] = entry;
+            g_tenant_info.tenant_num++;
             
             //Tenant name format: T[0-9][0-9](tenant_id) + _ + [0-9][0-9][0-9][0-9](promised_memory in MB) + _ + [0-9][0-9](SLA)
             uint32 tenant_id = (name[1] - '0') * 10 + (name[2] - '0');
@@ -3236,30 +3237,50 @@ void UpdateWeight(bool hrd_reweight, uint32 tenant_oid){
     double total_w = 0;
     uint32 max_sla = 0;
     tenant_buffer_cxt* buffer_cxt;
+    g_tenant_info.update_count++;
     
     /* Get max sla and max weight */
     for(int i = 0; i < g_tenant_info.tenant_num; i++){
         buffer_cxt = g_tenant_info.tenant_buffer_cxt_array[i];
         max_sla = max_sla > buffer_cxt->sla ? max_sla : buffer_cxt->sla;
-        total_w += buffer_cxt->weight * amplified_factor;
+        total_w += buffer_cxt->weight;
     }
-
-    /* Do reweight by hrd */
-    Assert(tenant_oid < g_tenant_info.tenant_num);
-    buffer_cxt = g_tenant_info.tenant_buffer_cxt_array[tenant_oid];
-    double hrd = GetTenantHRD(buffer_cxt);
-    if(hrd <= zero)
-        return;
-    double sla_factor = (double)buffer_cxt->sla / max_sla;
-    total_w -= buffer_cxt->weight * amplified_factor;
-    buffer_cxt->weight = buffer_cxt->weight * exp(-1.0 * hrd * sla_factor);
-    total_w += buffer_cxt->weight * amplified_factor;
-
+    if(hrd_reweight){
+        /* Do reweight by hrd */
+        if(tenant_oid >= g_tenant_info.tenant_num){
+            ereport(WARNING, (errmsg("Oid err: %u. Current num: %u", tenant_oid, g_tenant_info.tenant_num)));
+        }
+        Assert(tenant_oid < g_tenant_info.tenant_num);
+        buffer_cxt = g_tenant_info.tenant_buffer_cxt_array[tenant_oid];
+        double hrd = GetTenantHRD(buffer_cxt);
+        double sla_factor = (double)buffer_cxt->sla / max_sla;
+        total_w -= buffer_cxt->weight;
+        buffer_cxt->weight = zero + buffer_cxt->weight * exp(-1.0 * hrd * sla_factor);
+        total_w += buffer_cxt->weight;
+    }
     /* global reweight */
     for(int i = 0; i < g_tenant_info.tenant_num; i++){
         buffer_cxt = g_tenant_info.tenant_buffer_cxt_array[i];
         buffer_cxt->weight = buffer_cxt->weight * amplified_factor / total_w;
     }
+
+    // if(g_tenant_info.update_count % 10000 == 0){
+    //     ereport(WARNING, (errmsg("==============Tenant Weight Info[Update time:%u]==============", g_tenant_info.update_count)));
+    //     for(uint32 i = 0; i < g_tenant_info.tenant_num; i++){
+    //         buffer_cxt = g_tenant_info.tenant_buffer_cxt_array[i];
+    //         ereport(WARNING, (errmsg("Tenant:[%s], weight:[%f], sla:[%u], Real[H/M:%u/%u] Ref[H/M:%u/%u] HRD:[%f] Curr size:[%u]", 
+    //         buffer_cxt->tenant_name, 
+    //         buffer_cxt->weight,
+    //         buffer_cxt->sla,
+    //         buffer_cxt->real_buffer.hits,
+    //         buffer_cxt->real_buffer.misses,
+    //         buffer_cxt->ref_buffer.hits,
+    //         buffer_cxt->ref_buffer.misses,
+    //         GetTenantHRD(buffer_cxt),
+    //         buffer_cxt->real_buffer.curr_size
+    //         )));
+    //     }
+    // }
 }
 
 tenant_buffer_cxt* GetVictimTenant(){
@@ -3304,26 +3325,31 @@ tenant_buffer_cxt* GetVictimTenant(){
     uint32 lower_bound = NORMAL_SHARED_BUFFER_NUM / ( active_tenant * active_tenant );
     if(victim_buffer_cxt->real_buffer.curr_size < lower_bound){
         /* Sampling among tenant has buf more than lower bound */
+        return NULL;
         random=double(rand()) / double(RAND_MAX);
-        double weight_sum=0;
+        double weight_sum = 0;
+        double amplify_factor = 10000;
         double zone_weights[ MAX_TENANT + 1 ];
-        for(int i=1;i<=g_tenant_info.tenant_num;i++){
+        for(uint32 i = 0;i<g_tenant_info.tenant_num; i++){
                 if (g_tenant_info.tenant_buffer_cxt_array[i]->real_buffer.curr_size < lower_bound){
-                        zone_weights[i]=0.0;
-                    }
-                    else{
-                        zone_weights[i]=g_tenant_info.tenant_buffer_cxt_array[i]->weight;
-                        weight_sum = weight_sum + zone_weights[i];
-                    }
+                    zone_weights[i]=0.0;
+                }
+                else{
+                    zone_weights[i]=g_tenant_info.tenant_buffer_cxt_array[i]->weight;
+                    weight_sum = weight_sum + zone_weights[i];
+                }
         }
-        for(int i=1;i<=g_tenant_info.tenant_num;i++){
+        for(int i = 0;i<g_tenant_info.tenant_num;i++){
             if (g_tenant_info.tenant_buffer_cxt_array[i]->real_buffer.curr_size >= lower_bound){
                 zone_weights[i] = zone_weights[i] / weight_sum;
             }
-                
+        }
+        if(weight_sum <= zero){
+            victim_buffer_cxt = NULL;
+            goto DO_RESET;
         }
         victim = -1;
-        max_retry = 100;
+        max_retry = 10;
         while( victim == -1 && max_retry > 0){
             for(int i = 0; i < g_tenant_info.tenant_num; i++){
                 victim_buffer_cxt = g_tenant_info.tenant_buffer_cxt_array[i];
@@ -3337,24 +3363,27 @@ tenant_buffer_cxt* GetVictimTenant(){
             random=double(rand()) / double(RAND_MAX);
         }
         if(max_retry == 0){
-            ereport(WARNING, (errmsg("Pick victim execced max retry")));
+            ereport(WARNING, (errmsg("[lowerBound]Pick victim execced max retry")));
             for(uint32 i = 0; i < g_tenant_info.tenant_num; i++){
                 victim_buffer_cxt = g_tenant_info.tenant_buffer_cxt_array[i];
-                ereport(WARNING, (errmsg("Tenant: %s, weight: %f, sla: %u, Real[H/M:%u/%u] Ref[H/M:%u/%u] HRD: %f", 
+                ereport(WARNING, (errmsg("Tenant: %s, zone weight/weight:%f/%f, sla: %u, Real[H/M:%u/%u] Ref[H/M:%u/%u] HRD: %f Cap:[%u] lowerBound:[%u]", 
                 victim_buffer_cxt->tenant_name, 
+                zone_weights[i],
                 victim_buffer_cxt->weight,
                 victim_buffer_cxt->sla,
                 victim_buffer_cxt->real_buffer.hits,
                 victim_buffer_cxt->real_buffer.misses,
                 victim_buffer_cxt->ref_buffer.hits,
                 victim_buffer_cxt->ref_buffer.misses,
-                GetTenantHRD(victim_buffer_cxt)
+                GetTenantHRD(victim_buffer_cxt),
+                victim_buffer_cxt->real_buffer.curr_size,
+                lower_bound
                 )));
             }
             return NULL;
         }
-
-
+DO_RESET:
+#if MULTITENANT_RESET_ENABLE
         /* Zone reset*/
         {
             double origin_weight = 0.0;
@@ -3373,9 +3402,9 @@ tenant_buffer_cxt* GetVictimTenant(){
             }
             for(int i = 0; i < g_tenant_info.tenant_num; ++i){
                 if(g_tenant_info.tenant_buffer_cxt_array[i]->real_buffer.curr_size <= lower_bound &&
-                    g_tenant_info.tenant_buffer_cxt_array[i]->weight > 1 / active_tenant){
+                    g_tenant_info.tenant_buffer_cxt_array[i]->weight > 1.0 / active_tenant){
 
-                    g_tenant_info.tenant_buffer_cxt_array[i]->weight = 1 / active_tenant;
+                    g_tenant_info.tenant_buffer_cxt_array[i]->weight = 1.0 / active_tenant;
 
                 }else{
 
@@ -3384,6 +3413,7 @@ tenant_buffer_cxt* GetVictimTenant(){
                 }
             }
         }
+#endif
 
     }
     //ereport(WARNING, (errmsg("pick Victim tenant: %s", victim_buffer_cxt->tenant_name)));
@@ -3433,7 +3463,7 @@ BufferTag new_tag, uint32 new_hash, bool from_free_list){
         buf_hash_operate<HASH_REMOVE>(victim_buffer_cxt->real_buffer.buffer_map, &old_tag, old_hash, &found_descs);
         victim_buffer_cxt->real_buffer.curr_size--;
         Assert(found_descs);
-
+#if ENABLE_HIST
         /* Update hist buffer */
         if(g_tenant_info.history_buffer.curr_size == g_tenant_info.history_buffer.max_capacity){
             buffer_node* tail = g_tenant_info.history_buffer.dummy_tail.prev;
@@ -3441,18 +3471,35 @@ BufferTag new_tag, uint32 new_hash, bool from_free_list){
             buffer_node* prev = tail->prev;
             prev->next = &g_tenant_info.history_buffer.dummy_tail;
             g_tenant_info.history_buffer.dummy_tail.prev = prev;
+            tenant_buffer_cxt * pre_tenant = tail->tenant_info;
             buf_hash_operate<HASH_REMOVE>(g_tenant_info.history_buffer.buffer_map, &tail->key, BufTableHashCode(&tail->key), &found_descs);
-            Assert(found_descs);
             g_tenant_info.history_buffer.curr_size--;
+            if(!found_descs){
+                ereport(WARNING, (errmsg("Tail:%u not found in HistList! previous belongs to tenant:%s size:%u"
+                                    ,   BufTableHashCode(&tail->key)
+                                    ,   pre_tenant == NULL ? "Null":pre_tenant->tenant_name\
+                                    ,   g_tenant_info.history_buffer.curr_size)));
+            }
+            // ereport(WARNING, (errmsg("Tail:%u del from HistList! previous belongs to tenant:%s size:%u"
+            //                         ,   BufTableHashCode(&tail->key)
+            //                         ,   pre_tenant == NULL ? "Null":pre_tenant->tenant_name
+            //                         ,   g_tenant_info.history_buffer.curr_size)));
+            Assert(found_descs);
         }
-        buffer_node* delete_entry = buf_hash_operate<HASH_ENTER>(g_tenant_info.history_buffer.buffer_map, &old_tag, old_hash, &found_descs);
-        Assert(!found_descs);
+        buffer_node* delete_entry = (buffer_node*)buf_hash_operate<HASH_ENTER>(g_tenant_info.history_buffer.buffer_map, &old_tag, old_hash, &found_descs);
+        g_tenant_info.history_buffer.curr_size++;
+        if(found_descs && delete_entry){
+        }else{
+        }
+        //Assert(!found_descs);
         g_tenant_info.history_buffer.dummy_head.next->prev = delete_entry;
         delete_entry->next = g_tenant_info.history_buffer.dummy_head.next;
         delete_entry->prev = &g_tenant_info.history_buffer.dummy_head;
         g_tenant_info.history_buffer.dummy_head.next = delete_entry;
+        delete_entry->tenant_info = buffer_cxt;
+#endif
     }
-
+OUT:
     found_descs = false;
     buffer_node* entry = (buffer_node*)buf_hash_operate<HASH_ENTER>(buffer_cxt->real_buffer.buffer_map, &new_tag, 
         new_hash,  &found_descs);
@@ -3569,20 +3616,29 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
      */
 
     tenant_buffer_cxt* victim_buffer_cxt = buffer_cxt;
-#if ENABLE_BUFFER_ADJUST
-    if( buffer_cxt == g_tenant_info.non_tenant_buffer_cxt){
-        goto GET_BUF;
+    /* Find if insert buf is in Hlist */
+    found_descs = true;
+    #if ENABLE_HIST
+    buffer_node * hist_node = (buffer_node *)buf_hash_operate<HASH_FIND>(g_tenant_info.history_buffer.buffer_map, 
+    &new_tag, new_hash, &found_descs);
+    if(found_descs){
+            bool del;
+            hist_node->next->prev = hist_node->prev;
+            hist_node->prev->next = hist_node->next;
+            buf_hash_operate<HASH_REMOVE>(g_tenant_info.history_buffer.buffer_map, &new_tag, new_hash, &del);
+            g_tenant_info.history_buffer.curr_size--;
     }
-    if( g_tenant_info.free_list_empty && g_tenant_info.tenant_num > 1 && buffer_cxt->real_buffer.curr_size < buffer_cxt->capacity){
+    #endif
+    if(buffer_cxt == g_tenant_info.non_tenant_buffer_cxt)
+        goto GET_BUF;
+#if ENABLE_BUFFER_ADJUST
+    /* Update weight */
+    UpdateWeight(found_descs, buffer_cxt->tenant_oid);//We should find ? in Hlist?
+    if( buffer_cxt != g_tenant_info.non_tenant_buffer_cxt && 
+    g_tenant_info.free_list_empty && g_tenant_info.tenant_num > 1 && 
+    buffer_cxt->real_buffer.curr_size < buffer_cxt->capacity){
         double hrd = GetTenantHRD(buffer_cxt);
         if(hrd > 0){
-            // /* Find if insert buf is in Hlist */
-            bool found_descs = true;
-            buf_hash_operate<HASH_REMOVE>(&g_tenant_info.history_buffer, &new_tag, new_hash, &found_descs);
-            
-            /* Update weight */
-            UpdateWeight(found_descs, buffer_cxt->tenant_oid);//We should find ? in Hlist?
-            
             /* Sampling tenant and pick a victim from which to evict */
             victim_buffer_cxt = GetVictimTenant();
         }
