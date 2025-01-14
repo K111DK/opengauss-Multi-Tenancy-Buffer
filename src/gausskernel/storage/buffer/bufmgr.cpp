@@ -3064,11 +3064,11 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
     return buf;
 }
 tenant_info g_tenant_info;
-void buffer_init(buffer* buffer_cxt, uint32 capacity, const char* name, BufferType type){
+void buffer_init(buffer* buffer_cxt, uint32 capacity, const char* name, BufferType type, bool first_init){
     Assert(buffer_cxt!=NULL);
     Assert(name!=NULL);
     Assert(type == LRU || type == CLOCK);
-    Assert(capacity > 0);
+    //Assert(capacity > 0);
     HASHCTL hctl;
     int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
     securec_check(ret, "\0", "\0");
@@ -3076,49 +3076,63 @@ void buffer_init(buffer* buffer_cxt, uint32 capacity, const char* name, BufferTy
     hctl.entrysize = sizeof(buffer_node);//lru node
     hctl.hash = tag_hash;
     buffer_cxt->buffer_map = ShmemInitHash(name, 
-        capacity + 1000, capacity + 1000, 
+        capacity, capacity,
         &hctl, 
         HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
-    buffer_cxt->dummy_head.next = &buffer_cxt->dummy_tail;
-    buffer_cxt->dummy_head.prev = NULL;
-    buffer_cxt->dummy_tail.prev = &buffer_cxt->dummy_head;
-    buffer_cxt->dummy_tail.next = NULL;
-    buffer_cxt->max_capacity = capacity;
-    buffer_cxt->curr_size = 0;
-    buffer_cxt->type = type;
+    if(first_init){
+        ereport(WARNING, (errmsg("Create index: %s", name)));
+        buffer_cxt->dummy_head.next = &buffer_cxt->dummy_tail;
+        buffer_cxt->dummy_head.prev = NULL;
+        buffer_cxt->dummy_tail.prev = &buffer_cxt->dummy_head;
+        buffer_cxt->dummy_tail.next = NULL;
+        buffer_cxt->max_capacity = capacity;
+        buffer_cxt->curr_size = 0;
+        buffer_cxt->type = type;
+        buffer_cxt->sweep_hand = NULL;
+    }
 }
+/* Make sure held some clock */
 void tenant_buffer_init(tenant_buffer_cxt* tenant_buffer, BufferType real_buffer_type,
 BufferType ref_buffer_type, uint32 ref_capacity){
+    bool first_init = tenant_buffer->valid == false;
+
+    /* Copy name  */
     char index_name[TENANT_NAME_LEN];
     strcpy_s(index_name + 1, TENANT_NAME_LEN - 1, tenant_buffer->tenant_name);
     index_name[TENANT_NAME_LEN - 1] = '\0';
-    index_name[0] = 'R';
-    buffer_init(&tenant_buffer->real_buffer, ref_capacity, index_name, real_buffer_type);
-    ereport(WARNING, (errmsg("Tenant:%s create index: %s", tenant_buffer->tenant_name, index_name)));
-    index_name[0] = 'F';
-    buffer_init(&tenant_buffer->ref_buffer, ref_capacity, index_name, ref_buffer_type);
-    ereport(WARNING, (errmsg("Tenant:%s create index: %s", tenant_buffer->tenant_name, index_name)));
-    pthread_mutex_init(&tenant_buffer->tenant_buffer_lock, NULL);
-    tenant_buffer->capacity = ref_capacity;
-    tenant_buffer->weight = 10.0;
     
-    tenant_buffer->real_buffer.dummy_head.tenant_info = tenant_buffer;
-    tenant_buffer->real_buffer.dummy_tail.tenant_info = tenant_buffer;
-    tenant_buffer->ref_buffer.dummy_head.tenant_info = tenant_buffer;
-    tenant_buffer->ref_buffer.dummy_head.tenant_info = tenant_buffer;
+    /* Init Real Index */
+    index_name[0] = 'R';
+    buffer_init(&tenant_buffer->real_buffer, ref_capacity, index_name, real_buffer_type, first_init);
+    
+    /* Init Ref Index */
+    index_name[0] = 'F';
+    buffer_init(&tenant_buffer->ref_buffer, ref_capacity, index_name, ref_buffer_type, first_init);
+    
+    if(first_init){
+        pthread_mutex_init(&tenant_buffer->tenant_buffer_lock, NULL);
+        tenant_buffer->capacity = ref_capacity;
+        tenant_buffer->weight = 10.0;
+    }
+
+    tenant_buffer->valid = true;
 }
 tenant_buffer_cxt* get_tenant_by_name(const char* name){
     bool tenant_found = false;
-    tenant_buffer_cxt* entry = (tenant_buffer_cxt*)hash_search(g_tenant_info.tenant_map, 
+    tenant_name_mapping* entry = (tenant_name_mapping*)hash_search(g_tenant_info.tenant_map, 
     name, HASH_ENTER, &tenant_found);
     
     /* init entry */
     if (!tenant_found) {
 
-            //Tenant oid
+            /* Assign new Tenant oid */
             entry->tenant_oid = g_tenant_info.tenant_num;
-            g_tenant_info.tenant_buffer_cxt_array[g_tenant_info.tenant_num] = entry;
+            tenant_buffer_cxt* new_tenant = &g_tenant_info.tenant_buffer_cxt_array[g_tenant_info.tenant_num];
             g_tenant_info.tenant_num++;
+
+            /* Cpy tenant name*/
+            Assert(!new_tenant->valid);
+            strcpy_s(new_tenant->tenant_name, TENANT_NAME_LEN, name);
             
             //Tenant name format: T[0-9][0-9](tenant_id) + _ + [0-9][0-9][0-9][0-9](promised_memory in MB) + _ + [0-9][0-9](SLA)
             uint32 tenant_id = (name[1] - '0') * 10 + (name[2] - '0');
@@ -3130,29 +3144,42 @@ tenant_buffer_cxt* get_tenant_by_name(const char* name){
             Assert(ref_capacity > 0 && ref_capacity < NORMAL_SHARED_BUFFER_NUM);
             Assert(sla > 0);
             //Init pool
-            tenant_buffer_init(entry, CLOCK, CLOCK, ref_capacity);
-            entry->sla = sla;
+            tenant_buffer_init(new_tenant, CLOCK, CLOCK, ref_capacity);
+            new_tenant->sla = sla;
     
+    }else{
+        Assert(entry->tenant_oid < g_tenant_info.tenant_num);
+        Assert(g_tenant_info.tenant_buffer_cxt_array[entry->tenant_oid].valid);
     }
-    Assert(entry!=NULL);
-    return entry;
+    return &g_tenant_info.tenant_buffer_cxt_array[entry->tenant_oid];
 }
 
 tenant_buffer_cxt* get_thrd_tenant_buffer_cxt(){
+
+    HASHCTL hctl;
+    int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
+    securec_check(ret, "\0", "\0");
+    hctl.keysize = sizeof(BufferTag);//tag hash
+    hctl.entrysize = sizeof(buffer_node);//lru node
+    hctl.hash = tag_hash;
+    g_tenant_info.tenant_map = ShmemInitHash("tenant info hash", 
+    64, 64, &hctl, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
+
+    for(uint i = 0; i < g_tenant_info.tenant_num; ++i){    
+        Assert(g_tenant_info.tenant_buffer_cxt_array[i].valid);
+        tenant_buffer_init(&g_tenant_info.tenant_buffer_cxt_array[i], CLOCK, CLOCK, 0);
+    }
+
     if(u_sess && u_sess->proc_cxt.MyProcPort 
                 && u_sess->proc_cxt.MyProcPort->user_name
                     && u_sess->proc_cxt.MyProcPort->user_name[1] == '0'){
         //ereport(WARNING, (errmsg("User name: %s is new Tenant", u_sess->proc_cxt.MyProcPort->user_name)));                
         Assert(strlen(u_sess->proc_cxt.MyProcPort->user_name) >= 3 + 1 + 4 + 1 + 2);
         tenant_buffer_cxt* ret = get_tenant_by_name(u_sess->proc_cxt.MyProcPort->user_name);
-        t_thrd.tenant_id = ret->tenant_oid;
-        Assert(ret);
-        Assert(ret->real_buffer.buffer_map);
         return ret;
     }
-
-    t_thrd.tenant_id = UINT32_MAX;
-    return g_tenant_info.non_tenant_buffer_cxt;
+    tenant_buffer_init(&g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE * 10);
+    return &g_tenant_info.non_tenant_buffer_cxt;
 }
 #include "utils/dynahash.h"
 
@@ -3176,7 +3203,7 @@ double GetTenantHRD(tenant_buffer_cxt* buffer_cxt){
 
 /* Currently we do it in LRU manner */
 void UpdateRefBuffer(uint32 access_hash, BufferTag *access_tag, tenant_buffer_cxt* buffer_cxt){
-    if(buffer_cxt == g_tenant_info.non_tenant_buffer_cxt){
+    if(buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt){
         return;
     }
     
@@ -3242,7 +3269,7 @@ void UpdateWeight(bool hrd_reweight, uint32 tenant_oid){
     
     /* Get max sla and max weight */
     for(int i = 0; i < g_tenant_info.tenant_num; i++){
-        buffer_cxt = g_tenant_info.tenant_buffer_cxt_array[i];
+        buffer_cxt = &g_tenant_info.tenant_buffer_cxt_array[i];
         max_sla = max_sla > buffer_cxt->sla ? max_sla : buffer_cxt->sla;
         total_w += buffer_cxt->weight;
     }
@@ -3252,7 +3279,7 @@ void UpdateWeight(bool hrd_reweight, uint32 tenant_oid){
             ereport(WARNING, (errmsg("Oid err: %u. Current num: %u", tenant_oid, g_tenant_info.tenant_num)));
         }
         Assert(tenant_oid < g_tenant_info.tenant_num);
-        buffer_cxt = g_tenant_info.tenant_buffer_cxt_array[tenant_oid];
+        buffer_cxt = &g_tenant_info.tenant_buffer_cxt_array[tenant_oid];
         double hrd = GetTenantHRD(buffer_cxt);
         double sla_factor = (double)buffer_cxt->sla / max_sla;
         total_w -= buffer_cxt->weight;
@@ -3261,7 +3288,7 @@ void UpdateWeight(bool hrd_reweight, uint32 tenant_oid){
     }
     /* global reweight */
     for(int i = 0; i < g_tenant_info.tenant_num; i++){
-        buffer_cxt = g_tenant_info.tenant_buffer_cxt_array[i];
+        buffer_cxt = &g_tenant_info.tenant_buffer_cxt_array[i];
         buffer_cxt->weight = buffer_cxt->weight / total_w;
     }
 
@@ -3292,7 +3319,7 @@ tenant_buffer_cxt* GetVictimTenant(){
     uint32 max_retry = 100;
     while( victim == -1 && max_retry > 0){
         for(int i = 0; i < g_tenant_info.tenant_num; i++){
-            victim_buffer_cxt = g_tenant_info.tenant_buffer_cxt_array[i];
+            victim_buffer_cxt = &g_tenant_info.tenant_buffer_cxt_array[i];
             random = random - victim_buffer_cxt->weight;
             if ( random < zero ){
                 victim = i;
@@ -3306,7 +3333,7 @@ tenant_buffer_cxt* GetVictimTenant(){
     if(max_retry == 0){
         ereport(WARNING, (errmsg("Pick victim execced max retry")));
         for(uint32 i = 0; i < g_tenant_info.tenant_num; i++){
-            victim_buffer_cxt = g_tenant_info.tenant_buffer_cxt_array[i];
+            victim_buffer_cxt = &g_tenant_info.tenant_buffer_cxt_array[i];
             ereport(WARNING, (errmsg("Tenant: %s, weight: %f, sla: %u, Real[H/M:%u/%u] Ref[H/M:%u/%u] HRD: %f", 
             victim_buffer_cxt->tenant_name, 
             victim_buffer_cxt->weight,
@@ -3331,17 +3358,17 @@ tenant_buffer_cxt* GetVictimTenant(){
         double weight_sum = 0;
         double amplify_factor = 10000;
         double zone_weights[ MAX_TENANT + 1 ];
-        for(uint32 i = 0;i<g_tenant_info.tenant_num; i++){
-                if (g_tenant_info.tenant_buffer_cxt_array[i]->real_buffer.curr_size < lower_bound){
+        for(uint32 i = 0;i < g_tenant_info.tenant_num; i++){
+                if (g_tenant_info.tenant_buffer_cxt_array[i].real_buffer.curr_size < lower_bound){
                     zone_weights[i]=0.0;
                 }
                 else{
-                    zone_weights[i]=g_tenant_info.tenant_buffer_cxt_array[i]->weight;
+                    zone_weights[i]=g_tenant_info.tenant_buffer_cxt_array[i].weight;
                     weight_sum = weight_sum + zone_weights[i];
                 }
         }
-        for(int i = 0;i<g_tenant_info.tenant_num;i++){
-            if (g_tenant_info.tenant_buffer_cxt_array[i]->real_buffer.curr_size >= lower_bound){
+        for(int i = 0;i < g_tenant_info.tenant_num;i++){
+            if (g_tenant_info.tenant_buffer_cxt_array[i].real_buffer.curr_size >= lower_bound){
                 zone_weights[i] = zone_weights[i] / weight_sum;
             }
         }
@@ -3353,7 +3380,7 @@ tenant_buffer_cxt* GetVictimTenant(){
         max_retry = 10;
         while( victim == -1 && max_retry > 0){
             for(int i = 0; i < g_tenant_info.tenant_num; i++){
-                victim_buffer_cxt = g_tenant_info.tenant_buffer_cxt_array[i];
+                victim_buffer_cxt = &g_tenant_info.tenant_buffer_cxt_array[i];
                 random = random - zone_weights[i];
                 if ( random < zero ){
                     victim = i;
@@ -3366,7 +3393,7 @@ tenant_buffer_cxt* GetVictimTenant(){
         if(max_retry == 0){
             ereport(WARNING, (errmsg("[lowerBound]Pick victim execced max retry")));
             for(uint32 i = 0; i < g_tenant_info.tenant_num; i++){
-                victim_buffer_cxt = g_tenant_info.tenant_buffer_cxt_array[i];
+                victim_buffer_cxt = &g_tenant_info.tenant_buffer_cxt_array[i];
                 ereport(WARNING, (errmsg("Tenant: %s, zone weight/weight:%f/%f, sla: %u, Real[H/M:%u/%u] Ref[H/M:%u/%u] HRD: %f Cap:[%u] lowerBound:[%u]", 
                 victim_buffer_cxt->tenant_name, 
                 zone_weights[i],
@@ -3390,26 +3417,26 @@ DO_RESET:
             double origin_weight = 0.0;
             double new_sum = 1.0;
             for(int i = 0; i < g_tenant_info.tenant_num; ++i){
-                if(g_tenant_info.tenant_buffer_cxt_array[i]->real_buffer.curr_size <= lower_bound &&
-                    g_tenant_info.tenant_buffer_cxt_array[i]->weight > 1 / active_tenant){
+                if(g_tenant_info.tenant_buffer_cxt_array[i].real_buffer.curr_size <= lower_bound &&
+                    g_tenant_info.tenant_buffer_cxt_array[i].weight > 1 / active_tenant){
 
-                    new_sum -= g_tenant_info.tenant_buffer_cxt_array[i]->weight;
+                    new_sum -= g_tenant_info.tenant_buffer_cxt_array[i].weight;
 
                 }else{
 
-                    origin_weight += g_tenant_info.tenant_buffer_cxt_array[i]->weight;
+                    origin_weight += g_tenant_info.tenant_buffer_cxt_array[i].weight;
 
                 }
             }
             for(int i = 0; i < g_tenant_info.tenant_num; ++i){
-                if(g_tenant_info.tenant_buffer_cxt_array[i]->real_buffer.curr_size <= lower_bound &&
-                    g_tenant_info.tenant_buffer_cxt_array[i]->weight > 1.0 / active_tenant){
+                if(g_tenant_info.tenant_buffer_cxt_array[i].real_buffer.curr_size <= lower_bound &&
+                    g_tenant_info.tenant_buffer_cxt_array[i].weight > 1.0 / active_tenant){
 
-                    g_tenant_info.tenant_buffer_cxt_array[i]->weight = 1.0 / active_tenant;
+                    g_tenant_info.tenant_buffer_cxt_array[i].weight = 1.0 / active_tenant;
 
                 }else{
 
-                    g_tenant_info.tenant_buffer_cxt_array[i]->weight = g_tenant_info.tenant_buffer_cxt_array[i]->weight / origin_weight * new_sum;
+                    g_tenant_info.tenant_buffer_cxt_array[i].weight = g_tenant_info.tenant_buffer_cxt_array[i].weight / origin_weight * new_sum;
 
                 }
             }
@@ -3441,11 +3468,11 @@ BufferTag new_tag, uint32 new_hash, bool from_free_list){
         if(!found_descs){
             bool local_found = false;
             ereport(WARNING, (errmsg("%u delete from %s but not found", old_hash, victim_buffer_cxt->tenant_name)));
-            buf_hash_operate<HASH_FIND>(g_tenant_info.non_tenant_buffer_cxt->real_buffer.buffer_map, &old_tag, old_hash,  &local_found);
-            ereport(WARNING, (errmsg("%s : %s", g_tenant_info.non_tenant_buffer_cxt->tenant_name, local_found ? "found" : "not found")));
+            buf_hash_operate<HASH_FIND>(g_tenant_info.non_tenant_buffer_cxt.real_buffer.buffer_map, &old_tag, old_hash,  &local_found);
+            ereport(WARNING, (errmsg("%s : %s", g_tenant_info.non_tenant_buffer_cxt.tenant_name, local_found ? "found" : "not found")));
             for(int i = 0; i < g_tenant_info.tenant_num; ++i){
-                buf_hash_operate<HASH_FIND>(g_tenant_info.tenant_buffer_cxt_array[i]->real_buffer.buffer_map, &old_tag, old_hash,  &local_found);
-                ereport(WARNING, (errmsg("%s : %s", g_tenant_info.tenant_buffer_cxt_array[i]->tenant_name, local_found ? "found" : "not found")));
+                buf_hash_operate<HASH_FIND>(g_tenant_info.tenant_buffer_cxt_array[i].real_buffer.buffer_map, &old_tag, old_hash,  &local_found);
+                ereport(WARNING, (errmsg("%s : %s", g_tenant_info.tenant_buffer_cxt_array[i].tenant_name, local_found ? "found" : "not found")));
             }
         }
 
@@ -3516,22 +3543,22 @@ OUT:
     /* We evict a VALID buf from OURSELVES */
     bool in_place_replace = victim_buffer_cxt == buffer_cxt && (old_flags & BM_TAG_VALID);
     
-    // if(in_place_replace){
-    //     Assert(!from_free_list && buffer_cxt == victim_buffer_cxt);
-    //     /* We evict a VALID Buffer from OURSELVES */
-    //     entry->prev = pre;
-    //     entry->next = next;
-    //     pre->next = entry;
-    //     next->prev = entry;
-    // }else{
+    if(in_place_replace){
+        Assert(!from_free_list && buffer_cxt == victim_buffer_cxt);
+        /* We evict a VALID Buffer from OURSELVES */
+        entry->prev = pre;
+        entry->next = next;
+        pre->next = entry;
+        next->prev = entry;
+    }else{
         /* Buffer from other tenant( victim != ourselves ) / free list( Not valid ) */
-    buffer_cxt->real_buffer.dummy_tail.prev->next = entry;
-    entry->prev = buffer_cxt->real_buffer.dummy_tail.prev;
-    entry->next = &buffer_cxt->real_buffer.dummy_tail;
-    entry->tenant_info = buffer_cxt;
-    buffer_cxt->real_buffer.dummy_tail.prev = entry;
-    //    Assert(buffer_cxt->real_buffer.dummy_head.next != &buffer_cxt->real_buffer.dummy_tail);
-    //}
+        buffer_cxt->real_buffer.dummy_tail.prev->next = entry;
+        entry->prev = buffer_cxt->real_buffer.dummy_tail.prev;
+        entry->next = &buffer_cxt->real_buffer.dummy_tail;
+        entry->tenant_info = buffer_cxt;
+        buffer_cxt->real_buffer.dummy_tail.prev = entry;
+       Assert(buffer_cxt->real_buffer.dummy_head.next != &buffer_cxt->real_buffer.dummy_tail);
+    }
 }
 
 static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
@@ -3631,7 +3658,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
             g_tenant_info.history_buffer.curr_size--;
     }
 #endif
-    if(buffer_cxt == g_tenant_info.non_tenant_buffer_cxt)
+    if(buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt)
         goto GET_BUF;
 #if ENABLE_BUFFER_ADJUST
     if( buffer_cxt != g_tenant_info.non_tenant_buffer_cxt && 

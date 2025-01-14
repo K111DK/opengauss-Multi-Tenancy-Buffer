@@ -84,58 +84,46 @@ static void buf_push(CandidateList *list, int buf_id)
     list->cand_buf_list[tail_loc] = buf_id;
     (void)pg_atomic_fetch_add_u64(&list->tail, 1);
 }
-static void hlist_buffer_init(buffer* buffer_cxt, uint32 capacity, const char* name, BufferType type){
-    Assert(buffer_cxt!=NULL);
-    Assert(name!=NULL);
-    Assert(type == LRU || type == CLOCK);
-    Assert(capacity > 0);
-    HASHCTL hctl;
-    int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
-    securec_check(ret, "\0", "\0");
-    hctl.keysize = sizeof(BufferTag);//tag hash
-    hctl.entrysize = sizeof(buffer_node);//lru node
-    hctl.hash = tag_hash;
-    buffer_cxt->buffer_map = ShmemInitHash(name, 
-        capacity, capacity, 
-        &hctl, 
-        HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
-    buffer_cxt->dummy_head.next = &buffer_cxt->dummy_tail;
-    buffer_cxt->dummy_head.prev = NULL;
-    buffer_cxt->dummy_tail.prev = &buffer_cxt->dummy_head;
-    buffer_cxt->dummy_tail.next = NULL;
-    buffer_cxt->max_capacity = capacity;
-    buffer_cxt->curr_size = 0;
-    buffer_cxt->type = type;
-}
+// static void hlist_buffer_init(buffer* buffer_cxt, uint32 capacity, const char* name, BufferType type){
+//     Assert(buffer_cxt!=NULL);
+//     Assert(name!=NULL);
+//     Assert(type == LRU || type == CLOCK);
+//     Assert(capacity > 0);
+//     HASHCTL hctl;
+//     int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
+//     securec_check(ret, "\0", "\0");
+//     hctl.keysize = sizeof(BufferTag);//tag hash
+//     hctl.entrysize = sizeof(buffer_node);//lru node
+//     hctl.hash = tag_hash;
+//     buffer_cxt->buffer_map = ShmemInitHash(name, 
+//         capacity, capacity, 
+//         &hctl, 
+//         HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
+//     buffer_cxt->dummy_head.next = &buffer_cxt->dummy_tail;
+//     buffer_cxt->dummy_head.prev = NULL;
+//     buffer_cxt->dummy_tail.prev = &buffer_cxt->dummy_head;
+//     buffer_cxt->dummy_tail.next = NULL;
+//     buffer_cxt->max_capacity = capacity;
+//     buffer_cxt->curr_size = 0;
+//     buffer_cxt->type = type;
+// }
 void InitMultiTenantBufferPool(void){
 
     HASHCTL hctl;
     int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
     securec_check(ret, "\0", "\0");
     hctl.keysize = TENANT_NAME_LEN;
-    hctl.entrysize = sizeof(tenant_buffer_cxt);
-    hctl.hash = string_hash;
+    hctl.entrysize = sizeof(tenant_name_mapping); // oid
+    hctl.hash = tag_hash;
     g_tenant_info.tenant_map = ShmemInitHash("tenant info hash", 
     64, 64, &hctl, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
-    
 
-    bool found_descs = false;    
-    g_tenant_info.non_tenant_buffer_cxt = (tenant_buffer_cxt*)hash_search(g_tenant_info.tenant_map, 
-    "Non Tenant Buffer", HASH_ENTER, &found_descs);
-    if (!found_descs) {
-
-        pthread_mutex_init(&g_tenant_info.tenant_map_lock, NULL);
-
-        /* Backup buffer */
-        tenant_buffer_init(g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE * 10);
-        g_tenant_info.non_tenant_buffer_cxt->tenant_oid = UINT32_MAX;
-
-        /* Evict history list should be fifo */
-        hlist_buffer_init(&g_tenant_info.history_buffer, NORMAL_SHARED_BUFFER_NUM, "History Buffer", LRU);
-
-        /* Free pool init */
-        g_tenant_info.buffer_pool = (Buffer *)
-        ShmemInitStruct("MultiTenantBuffers", NORMAL_SHARED_BUFFER_NUM * sizeof(Buffer), &found_descs);
+    bool found_descs = false;  
+    /* Free pool init */
+    g_tenant_info.buffer_pool = (Buffer *)
+    ShmemInitStruct("MultiTenantBuffers", NORMAL_SHARED_BUFFER_NUM * sizeof(Buffer), &found_descs);
+    if(!found_descs){
+        /* Only happen once */
         MemSet((char*)g_tenant_info.buffer_pool, 0, NORMAL_SHARED_BUFFER_NUM * sizeof(Buffer));
         INIT_CANDIDATE_LIST(g_tenant_info.buffer_list, g_tenant_info.buffer_pool, NORMAL_SHARED_BUFFER_NUM ,0 ,0);
         g_tenant_info.buffer_list.buf_id_start = 0;
@@ -143,6 +131,40 @@ void InitMultiTenantBufferPool(void){
             buf_push(&g_tenant_info.buffer_list, buf_id);
         }
     }
+  
+    /* Evict history list should be fifo */
+    //hlist_buffer_init(&g_tenant_info.history_buffer, NORMAL_SHARED_BUFFER_NUM, "History Buffer", LRU);
+    
+    /* Non tenant buffer */
+    tenant_name_mapping* entry = (tenant_name_mapping*)hash_search(g_tenant_info.tenant_map, "Non Tenant Buffer", HASH_ENTER, &found_descs);
+    if (!found_descs) {
+        entry->tenant_oid = UINT32_MAX;
+        pthread_mutex_init(&g_tenant_info.tenant_map_lock, NULL);
+        /* Backup buffer */
+        strcpy_s(g_tenant_info.non_tenant_buffer_cxt.tenant_name, TENANT_NAME_LEN, "Non Tenant Buffer");
+        tenant_buffer_init(&g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE * 10);
+        g_tenant_info.non_tenant_buffer_cxt.tenant_oid = UINT32_MAX;
+    }
+}
+
+void thrd_Tenant_map_init(){
+    pthread_mutex_lock(&g_tenant_info.tenant_map_lock);
+    
+    HASHCTL hctl;
+    int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
+    securec_check(ret, "\0", "\0");
+    hctl.keysize = sizeof(BufferTag);//tag hash
+    hctl.entrysize = sizeof(buffer_node);//lru node
+    hctl.hash = tag_hash;
+    g_tenant_info.tenant_map = ShmemInitHash("tenant info hash", 
+    64, 64, &hctl, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
+
+    for(uint i = 0; i < g_tenant_info.tenant_num; ++i){    
+        Assert(g_tenant_info.tenant_buffer_cxt_array[i].valid);
+        tenant_buffer_init(&g_tenant_info.tenant_buffer_cxt_array[i], CLOCK, CLOCK, 0);
+    }
+
+    pthread_mutex_unlock(&g_tenant_info.tenant_map_lock);
 }
 
 void InitBufferPool(void)
@@ -267,6 +289,11 @@ void InitBufferPool(void)
         g_instance.bgwriter_cxt.rel_hashtbl_lock = LWLockAssign(LWTRANCHE_UNLINK_REL_TBL);
         g_instance.bgwriter_cxt.rel_one_fork_hashtbl_lock = LWLockAssign(LWTRANCHE_UNLINK_REL_FORK_TBL);
     }
+
+#if ENABLE_MULTI_TENANTCY
+    /* For thrd, must init all shmem index*/
+    thrd_Tenant_map_init();
+#endif
 
     /* re-assign locks for un-reinited buffers, may delete this */
     if (SS_PERFORMING_SWITCHOVER) {

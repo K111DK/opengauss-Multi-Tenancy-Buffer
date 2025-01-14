@@ -421,14 +421,20 @@ typedef struct tenant_buffer_cxt{
     uint32 sla;
     uint32 tenant_oid;
     double weight{10.0};
+    bool valid{false};
 } tenant_buffer_cxt;
-
+typedef struct tenant_name_mapping{
+    //key
+    char tenant_name[TENANT_NAME_LEN];
+    //oid
+    uint32 tenant_oid;
+}tenant_name_mapping;
 typedef struct tenant_info{
     uint64 current_alloc_clean_buf{0};
     uint64 total_clean_buf_taken{0};
     
     /* Back up buffer for startup and so */
-    tenant_buffer_cxt* non_tenant_buffer_cxt;
+    tenant_buffer_cxt non_tenant_buffer_cxt;
     
     /* Free list */
     Buffer* buffer_pool;
@@ -440,7 +446,7 @@ typedef struct tenant_info{
 
     pthread_mutex_t tenant_map_lock;
     struct HTAB* tenant_map;// tenant name -> tenant_buffer_cxt
-    tenant_buffer_cxt* tenant_buffer_cxt_array[MAX_TENANT];
+    tenant_buffer_cxt tenant_buffer_cxt_array[MAX_TENANT];
     uint32 tenant_num{0};
 
 
@@ -449,7 +455,7 @@ typedef struct tenant_info{
 
 } tenant_info;
 extern tenant_info g_tenant_info;
-extern void buffer_init(buffer* buffer_cxt, uint32 capacity, const char* name, int type);
+extern void buffer_init(buffer* buffer_cxt, uint32 capacity, const char* name, int type, bool first_init);
 extern void tenant_buffer_init(tenant_buffer_cxt* tenant_buffer, BufferType real_buffer_type, BufferType ref_buffer_type, uint32 ref_capacity);
 extern tenant_buffer_cxt* get_thrd_tenant_buffer_cxt();
 extern BufferDesc *TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt, bool* from_free_list);
