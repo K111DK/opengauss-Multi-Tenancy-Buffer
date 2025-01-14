@@ -3076,7 +3076,7 @@ void buffer_init(buffer* buffer_cxt, uint32 capacity, const char* name, BufferTy
     hctl.entrysize = sizeof(buffer_node);//lru node
     hctl.hash = tag_hash;
     buffer_cxt->buffer_map = ShmemInitHash(name, 
-        capacity, capacity, 
+        capacity + 1000, capacity + 1000, 
         &hctl, 
         HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
     buffer_cxt->dummy_head.next = &buffer_cxt->dummy_tail;
@@ -3146,6 +3146,8 @@ tenant_buffer_cxt* get_thrd_tenant_buffer_cxt(){
         Assert(strlen(u_sess->proc_cxt.MyProcPort->user_name) >= 3 + 1 + 4 + 1 + 2);
         tenant_buffer_cxt* ret = get_tenant_by_name(u_sess->proc_cxt.MyProcPort->user_name);
         t_thrd.tenant_id = ret->tenant_oid;
+        Assert(ret);
+        Assert(ret->real_buffer.buffer_map);
         return ret;
     }
 
@@ -3233,7 +3235,6 @@ void UpdateRefBuffer(uint32 access_hash, BufferTag *access_tag, tenant_buffer_cx
 
 void UpdateWeight(bool hrd_reweight, uint32 tenant_oid){
     const double zero = 0.0000001;
-    const double amplified_factor = 1000.0;
     double total_w = 0;
     uint32 max_sla = 0;
     tenant_buffer_cxt* buffer_cxt;
@@ -3261,7 +3262,7 @@ void UpdateWeight(bool hrd_reweight, uint32 tenant_oid){
     /* global reweight */
     for(int i = 0; i < g_tenant_info.tenant_num; i++){
         buffer_cxt = g_tenant_info.tenant_buffer_cxt_array[i];
-        buffer_cxt->weight = buffer_cxt->weight * amplified_factor / total_w;
+        buffer_cxt->weight = buffer_cxt->weight / total_w;
     }
 
     // if(g_tenant_info.update_count % 10000 == 0){
@@ -3450,6 +3451,7 @@ BufferTag new_tag, uint32 new_hash, bool from_free_list){
 
         /* Record where old entry evict from */
         Assert(found_descs && old_entry);
+        Assert(old_entry != victim_buffer_cxt->real_buffer.sweep_hand);
         pre = old_entry->prev;
         next = old_entry->next;
         Assert(pre && next);
@@ -3514,22 +3516,22 @@ OUT:
     /* We evict a VALID buf from OURSELVES */
     bool in_place_replace = victim_buffer_cxt == buffer_cxt && (old_flags & BM_TAG_VALID);
     
-    if(in_place_replace){
-        Assert(!from_free_list && buffer_cxt == victim_buffer_cxt);
-        /* We evict a VALID Buffer from OURSELVES */
-        entry->prev = pre;
-        entry->next = next;
-        pre->next = entry;
-        next->prev = entry;
-    }else{
+    // if(in_place_replace){
+    //     Assert(!from_free_list && buffer_cxt == victim_buffer_cxt);
+    //     /* We evict a VALID Buffer from OURSELVES */
+    //     entry->prev = pre;
+    //     entry->next = next;
+    //     pre->next = entry;
+    //     next->prev = entry;
+    // }else{
         /* Buffer from other tenant( victim != ourselves ) / free list( Not valid ) */
-        buffer_cxt->real_buffer.dummy_tail.prev->next = entry;
-        entry->prev = buffer_cxt->real_buffer.dummy_tail.prev;
-        entry->next = &buffer_cxt->real_buffer.dummy_tail;
-        entry->tenant_info = buffer_cxt;
-        buffer_cxt->real_buffer.dummy_tail.prev = entry;
-        Assert(buffer_cxt->real_buffer.dummy_head.next != &buffer_cxt->real_buffer.dummy_tail);
-    }
+    buffer_cxt->real_buffer.dummy_tail.prev->next = entry;
+    entry->prev = buffer_cxt->real_buffer.dummy_tail.prev;
+    entry->next = &buffer_cxt->real_buffer.dummy_tail;
+    entry->tenant_info = buffer_cxt;
+    buffer_cxt->real_buffer.dummy_tail.prev = entry;
+    //    Assert(buffer_cxt->real_buffer.dummy_head.next != &buffer_cxt->real_buffer.dummy_tail);
+    //}
 }
 
 static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
@@ -3618,7 +3620,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     tenant_buffer_cxt* victim_buffer_cxt = buffer_cxt;
     /* Find if insert buf is in Hlist */
     found_descs = true;
-    #if ENABLE_HIST
+#if ENABLE_HIST
     buffer_node * hist_node = (buffer_node *)buf_hash_operate<HASH_FIND>(g_tenant_info.history_buffer.buffer_map, 
     &new_tag, new_hash, &found_descs);
     if(found_descs){
@@ -3628,17 +3630,17 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
             buf_hash_operate<HASH_REMOVE>(g_tenant_info.history_buffer.buffer_map, &new_tag, new_hash, &del);
             g_tenant_info.history_buffer.curr_size--;
     }
-    #endif
+#endif
     if(buffer_cxt == g_tenant_info.non_tenant_buffer_cxt)
         goto GET_BUF;
 #if ENABLE_BUFFER_ADJUST
-    /* Update weight */
-    UpdateWeight(found_descs, buffer_cxt->tenant_oid);//We should find ? in Hlist?
     if( buffer_cxt != g_tenant_info.non_tenant_buffer_cxt && 
     g_tenant_info.free_list_empty && g_tenant_info.tenant_num > 1 && 
     buffer_cxt->real_buffer.curr_size < buffer_cxt->capacity){
         double hrd = GetTenantHRD(buffer_cxt);
         if(hrd > 0){
+            /* Update weight */
+            UpdateWeight(found_descs, buffer_cxt->tenant_oid);//We should find ? in Hlist?
             /* Sampling tenant and pick a victim from which to evict */
             victim_buffer_cxt = GetVictimTenant();
         }
