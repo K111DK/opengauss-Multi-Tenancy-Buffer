@@ -99,6 +99,7 @@ static void buf_push(CandidateList *list, int buf_id)
 //         capacity, capacity, 
 //         &hctl, 
 //         HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
+    
 //     buffer_cxt->dummy_head.next = &buffer_cxt->dummy_tail;
 //     buffer_cxt->dummy_head.prev = NULL;
 //     buffer_cxt->dummy_tail.prev = &buffer_cxt->dummy_head;
@@ -114,7 +115,7 @@ void InitMultiTenantBufferPool(void){
     securec_check(ret, "\0", "\0");
     hctl.keysize = TENANT_NAME_LEN;
     hctl.entrysize = sizeof(tenant_name_mapping); // oid
-    hctl.hash = tag_hash;
+    hctl.hash = string_hash;
     g_tenant_info.tenant_map = ShmemInitHash("tenant info hash", 
     64, 64, &hctl, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
 
@@ -130,10 +131,23 @@ void InitMultiTenantBufferPool(void){
         for(int buf_id = 0; buf_id < NvmBufferStartID; buf_id++){
             buf_push(&g_tenant_info.buffer_list, buf_id);
         }
+
+        // /* Evict history list should be fifo */
+        // HASHCTL hctl1;
+        // memset_s(&hctl1, sizeof(HASHCTL), 0, sizeof(HASHCTL));
+        // hctl1.keysize = sizeof(BufferTag);//tag hash
+        // hctl1.entrysize = sizeof(buffer_node);//lru node
+        // hctl1.hash = tag_hash;
+        // g_tenant_info.history_buffer.buffer_map = ShmemInitHash("Hist", 
+        // NORMAL_SHARED_BUFFER_NUM, NORMAL_SHARED_BUFFER_NUM, &hctl1, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
+        // g_tenant_info.history_buffer.dummy_head.next = &g_tenant_info.history_buffer.dummy_tail;
+        // g_tenant_info.history_buffer.dummy_head.prev = NULL;
+        // g_tenant_info.history_buffer.dummy_tail.prev = &g_tenant_info.history_buffer.dummy_head;
+        // g_tenant_info.history_buffer.dummy_tail.next = NULL;
+        // g_tenant_info.history_buffer.max_capacity = NORMAL_SHARED_BUFFER_NUM;
+        // g_tenant_info.history_buffer.curr_size = 0;
     }
   
-    /* Evict history list should be fifo */
-    //hlist_buffer_init(&g_tenant_info.history_buffer, NORMAL_SHARED_BUFFER_NUM, "History Buffer", LRU);
     
     /* Non tenant buffer */
     tenant_name_mapping* entry = (tenant_name_mapping*)hash_search(g_tenant_info.tenant_map, "Non Tenant Buffer", HASH_ENTER, &found_descs);
@@ -153,9 +167,9 @@ void thrd_Tenant_map_init(){
     HASHCTL hctl;
     int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
     securec_check(ret, "\0", "\0");
-    hctl.keysize = sizeof(BufferTag);//tag hash
-    hctl.entrysize = sizeof(buffer_node);//lru node
-    hctl.hash = tag_hash;
+    hctl.keysize = TENANT_NAME_LEN;
+    hctl.entrysize = sizeof(tenant_name_mapping); // oid
+    hctl.hash = string_hash;
     g_tenant_info.tenant_map = ShmemInitHash("tenant info hash", 
     64, 64, &hctl, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
 
@@ -163,6 +177,18 @@ void thrd_Tenant_map_init(){
         Assert(g_tenant_info.tenant_buffer_cxt_array[i].valid);
         tenant_buffer_init(&g_tenant_info.tenant_buffer_cxt_array[i], CLOCK, CLOCK, 0);
     }
+
+    tenant_buffer_init(&g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE * 10);
+
+    // /* Evict history list should be fifo */
+    // HASHCTL hctl1;
+    // ret = memset_s(&hctl1, sizeof(HASHCTL), 0, sizeof(HASHCTL));
+    // securec_check(ret, "\0", "\0");
+    // hctl1.keysize = sizeof(BufferTag);//tag hash
+    // hctl1.entrysize = sizeof(buffer_node);//lru node
+    // hctl1.hash = tag_hash;
+    // g_tenant_info.history_buffer.buffer_map = ShmemInitHash("Hist", 
+    // NORMAL_SHARED_BUFFER_NUM, NORMAL_SHARED_BUFFER_NUM, &hctl1, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
 
     pthread_mutex_unlock(&g_tenant_info.tenant_map_lock);
 }

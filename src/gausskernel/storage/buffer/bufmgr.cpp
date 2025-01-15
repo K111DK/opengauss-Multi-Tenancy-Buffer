@@ -3155,19 +3155,22 @@ tenant_buffer_cxt* get_tenant_by_name(const char* name){
 }
 
 tenant_buffer_cxt* get_thrd_tenant_buffer_cxt(){
-
-    HASHCTL hctl;
-    int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
-    securec_check(ret, "\0", "\0");
-    hctl.keysize = sizeof(BufferTag);//tag hash
-    hctl.entrysize = sizeof(buffer_node);//lru node
-    hctl.hash = tag_hash;
-    g_tenant_info.tenant_map = ShmemInitHash("tenant info hash", 
-    64, 64, &hctl, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
-
-    for(uint i = 0; i < g_tenant_info.tenant_num; ++i){    
-        Assert(g_tenant_info.tenant_buffer_cxt_array[i].valid);
-        tenant_buffer_init(&g_tenant_info.tenant_buffer_cxt_array[i], CLOCK, CLOCK, 0);
+    {
+        HASHCTL hctl;
+        int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
+        securec_check(ret, "\0", "\0");
+        hctl.keysize = TENANT_NAME_LEN;
+        hctl.entrysize = sizeof(tenant_name_mapping); // oid
+        hctl.hash = string_hash;
+        g_tenant_info.tenant_map = ShmemInitHash("tenant info hash", 
+        64, 64, &hctl, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
+    
+        for(uint i = 0; i < g_tenant_info.tenant_num; ++i){    
+            Assert(g_tenant_info.tenant_buffer_cxt_array[i].valid);
+            tenant_buffer_init(&g_tenant_info.tenant_buffer_cxt_array[i], CLOCK, CLOCK, 0);
+        }
+    
+        tenant_buffer_init(&g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE * 10);
     }
 
     if(u_sess && u_sess->proc_cxt.MyProcPort 
@@ -3495,37 +3498,31 @@ BufferTag new_tag, uint32 new_hash, bool from_free_list){
 #if ENABLE_HIST
         /* Update hist buffer */
         if(g_tenant_info.history_buffer.curr_size == g_tenant_info.history_buffer.max_capacity){
+            
+            /* Get tail */
             buffer_node* tail = g_tenant_info.history_buffer.dummy_tail.prev;
             Assert(tail != &g_tenant_info.history_buffer.dummy_head);
+            
+            /* Pop tail */
             buffer_node* prev = tail->prev;
             prev->next = &g_tenant_info.history_buffer.dummy_tail;
             g_tenant_info.history_buffer.dummy_tail.prev = prev;
-            tenant_buffer_cxt * pre_tenant = tail->tenant_info;
+            
+            /* Remove from hlist */
             buf_hash_operate<HASH_REMOVE>(g_tenant_info.history_buffer.buffer_map, &tail->key, BufTableHashCode(&tail->key), &found_descs);
             g_tenant_info.history_buffer.curr_size--;
-            if(!found_descs){
-                ereport(WARNING, (errmsg("Tail:%u not found in HistList! previous belongs to tenant:%s size:%u"
-                                    ,   BufTableHashCode(&tail->key)
-                                    ,   pre_tenant == NULL ? "Null":pre_tenant->tenant_name\
-                                    ,   g_tenant_info.history_buffer.curr_size)));
-            }
-            // ereport(WARNING, (errmsg("Tail:%u del from HistList! previous belongs to tenant:%s size:%u"
-            //                         ,   BufTableHashCode(&tail->key)
-            //                         ,   pre_tenant == NULL ? "Null":pre_tenant->tenant_name
-            //                         ,   g_tenant_info.history_buffer.curr_size)));
             Assert(found_descs);
         }
+        
+        /* Insert to hlist */
         buffer_node* delete_entry = (buffer_node*)buf_hash_operate<HASH_ENTER>(g_tenant_info.history_buffer.buffer_map, &old_tag, old_hash, &found_descs);
         g_tenant_info.history_buffer.curr_size++;
-        if(found_descs && delete_entry){
-        }else{
-        }
-        //Assert(!found_descs);
+        
+        /* Insert to head */
         g_tenant_info.history_buffer.dummy_head.next->prev = delete_entry;
         delete_entry->next = g_tenant_info.history_buffer.dummy_head.next;
         delete_entry->prev = &g_tenant_info.history_buffer.dummy_head;
         g_tenant_info.history_buffer.dummy_head.next = delete_entry;
-        delete_entry->tenant_info = buffer_cxt;
 #endif
     }
 OUT:
@@ -3600,10 +3597,6 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     bool found_descs = false;   
     buffer_node* entry = 
     (buffer_node*)buf_hash_operate<HASH_FIND>(buffer_cxt->real_buffer.buffer_map, &new_tag, new_hash, &found_descs);
-    // ereport(WARNING, (errmsg("Find hash:[%u] result:[%s] buf_id:[%d]"
-    // ,   new_hash 
-    // ,   found_descs ? "found":"Not found"
-    // ,   buf_id)));
 
     if (found_descs) {
         buf_id = entry->buffer_id;
@@ -3644,11 +3637,15 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
      * buffer.	Remember to unlock the mapping lock while doing the work.
      */
 
-    tenant_buffer_cxt* victim_buffer_cxt = buffer_cxt;
     /* Find if insert buf is in Hlist */
-    found_descs = true;
+    found_descs = false;
+    buffer_node * hist_node;
+    tenant_buffer_cxt* victim_buffer_cxt = buffer_cxt;
+    if(buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt)
+        goto GET_BUF;
+
 #if ENABLE_HIST
-    buffer_node * hist_node = (buffer_node *)buf_hash_operate<HASH_FIND>(g_tenant_info.history_buffer.buffer_map, 
+    hist_node = (buffer_node *)buf_hash_operate<HASH_FIND>(g_tenant_info.history_buffer.buffer_map, 
     &new_tag, new_hash, &found_descs);
     if(found_descs){
             bool del;
@@ -3658,27 +3655,19 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
             g_tenant_info.history_buffer.curr_size--;
     }
 #endif
-    if(buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt)
-        goto GET_BUF;
+    /* Update weight */
+    UpdateWeight(found_descs, buffer_cxt->tenant_oid);//We should find ? in Hlist?
 #if ENABLE_BUFFER_ADJUST
-    if( buffer_cxt != g_tenant_info.non_tenant_buffer_cxt && 
-    g_tenant_info.free_list_empty && g_tenant_info.tenant_num > 1 && 
-    buffer_cxt->real_buffer.curr_size < buffer_cxt->capacity){
+    if( g_tenant_info.free_list_empty && g_tenant_info.tenant_num > 1 && 
+        buffer_cxt->real_buffer.curr_size < buffer_cxt->capacity ){
         double hrd = GetTenantHRD(buffer_cxt);
         if(hrd > 0){
-            /* Update weight */
-            UpdateWeight(found_descs, buffer_cxt->tenant_oid);//We should find ? in Hlist?
             /* Sampling tenant and pick a victim from which to evict */
             victim_buffer_cxt = GetVictimTenant();
         }
     }
 #endif
     victim_buffer_cxt = victim_buffer_cxt == NULL ? buffer_cxt : victim_buffer_cxt;
-    // ereport(WARNING, (errmsg("[%u] fetch buf, vic[%u]. vic size: %u, buf size: %u",
-    // buffer_cxt->tenant_oid,
-    // victim_buffer_cxt ? victim_buffer_cxt->tenant_oid : buffer_cxt->tenant_oid,
-    // victim_buffer_cxt ? victim_buffer_cxt->real_buffer.curr_size : buffer_cxt->real_buffer.curr_size,
-    // buffer_cxt->real_buffer.curr_size))); 
     Assert(victim_buffer_cxt);
 
 GET_BUF:

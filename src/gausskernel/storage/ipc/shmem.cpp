@@ -314,9 +314,11 @@ HTAB* ShmemInitHash(const char* name, /* table string name for shmem index */
      * if it already exists, attach to it rather than allocate and initialize
      * new space
      */
-    if (found)
+    if (found){
         hash_flags |= HASH_ATTACH;
-
+    }else{
+        ereport(WARNING, (errmsg("Share mem Index: %s created", name)));
+    }
     /* Pass location of hashtable header to hash_create */
     infoP->hctl = (HASHHDR*)location;
 
