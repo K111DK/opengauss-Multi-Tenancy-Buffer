@@ -131,23 +131,25 @@ void InitMultiTenantBufferPool(void){
         for(int buf_id = 0; buf_id < NvmBufferStartID; buf_id++){
             buf_push(&g_tenant_info.buffer_list, buf_id);
         }
-
-        // /* Evict history list should be fifo */
-        // HASHCTL hctl1;
-        // memset_s(&hctl1, sizeof(HASHCTL), 0, sizeof(HASHCTL));
-        // hctl1.keysize = sizeof(BufferTag);//tag hash
-        // hctl1.entrysize = sizeof(buffer_node);//lru node
-        // hctl1.hash = tag_hash;
-        // g_tenant_info.history_buffer.buffer_map = ShmemInitHash("Hist", 
-        // NORMAL_SHARED_BUFFER_NUM, NORMAL_SHARED_BUFFER_NUM, &hctl1, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
-        // g_tenant_info.history_buffer.dummy_head.next = &g_tenant_info.history_buffer.dummy_tail;
-        // g_tenant_info.history_buffer.dummy_head.prev = NULL;
-        // g_tenant_info.history_buffer.dummy_tail.prev = &g_tenant_info.history_buffer.dummy_head;
-        // g_tenant_info.history_buffer.dummy_tail.next = NULL;
-        // g_tenant_info.history_buffer.max_capacity = NORMAL_SHARED_BUFFER_NUM;
-        // g_tenant_info.history_buffer.curr_size = 0;
     }
-  
+
+
+    /* Evict history list should be fifo */
+    HASHCTL hctl1;
+    memset_s(&hctl1, sizeof(HASHCTL), 0, sizeof(HASHCTL));
+    hctl1.keysize = sizeof(BufferTag);//tag hash
+    hctl1.entrysize = sizeof(buffer_node);//lru node
+    hctl1.hash = tag_hash;
+    g_tenant_info.history_buffer.buffer_map = ShmemInitHash("Hist", 
+    NORMAL_SHARED_BUFFER_NUM, NORMAL_SHARED_BUFFER_NUM, &hctl1, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
+    if(found_descs){
+        g_tenant_info.history_buffer.dummy_head.next = &g_tenant_info.history_buffer.dummy_tail;
+        g_tenant_info.history_buffer.dummy_head.prev = NULL;
+        g_tenant_info.history_buffer.dummy_tail.prev = &g_tenant_info.history_buffer.dummy_head;
+        g_tenant_info.history_buffer.dummy_tail.next = NULL;
+        g_tenant_info.history_buffer.max_capacity = NORMAL_SHARED_BUFFER_NUM;
+        g_tenant_info.history_buffer.curr_size = 0;
+    }
     
     /* Non tenant buffer */
     tenant_name_mapping* entry = (tenant_name_mapping*)hash_search(g_tenant_info.tenant_map, "Non Tenant Buffer", HASH_ENTER, &found_descs);
@@ -316,10 +318,10 @@ void InitBufferPool(void)
         g_instance.bgwriter_cxt.rel_one_fork_hashtbl_lock = LWLockAssign(LWTRANCHE_UNLINK_REL_FORK_TBL);
     }
 
-#if ENABLE_MULTI_TENANTCY
-    /* For thrd, must init all shmem index*/
-    thrd_Tenant_map_init();
-#endif
+// #if ENABLE_MULTI_TENANTCY
+//     /* For thrd, must init all shmem index*/
+//     thrd_Tenant_map_init();
+// #endif
 
     /* re-assign locks for un-reinited buffers, may delete this */
     if (SS_PERFORMING_SWITCHOVER) {

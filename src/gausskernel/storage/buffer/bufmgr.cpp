@@ -3144,6 +3144,9 @@ tenant_buffer_cxt* get_tenant_by_name(const char* name){
             Assert(ref_capacity > 0 && ref_capacity < NORMAL_SHARED_BUFFER_NUM);
             Assert(sla > 0);
             //Init pool
+#if !ENABLE_BUFFER_ADJUST
+            ref_capacity = (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE * 10) / ACTIVE_TENANT_NUM;
+#endif
             tenant_buffer_init(new_tenant, CLOCK, CLOCK, ref_capacity);
             new_tenant->sla = sla;
     
@@ -3164,13 +3167,22 @@ tenant_buffer_cxt* get_thrd_tenant_buffer_cxt(){
         hctl.hash = string_hash;
         g_tenant_info.tenant_map = ShmemInitHash("tenant info hash", 
         64, 64, &hctl, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
-    
+
         for(uint i = 0; i < g_tenant_info.tenant_num; ++i){    
             Assert(g_tenant_info.tenant_buffer_cxt_array[i].valid);
             tenant_buffer_init(&g_tenant_info.tenant_buffer_cxt_array[i], CLOCK, CLOCK, 0);
         }
-    
+
         tenant_buffer_init(&g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE * 10);
+
+        /* Evict history list should be fifo */
+        HASHCTL hctl1;
+        memset_s(&hctl1, sizeof(HASHCTL), 0, sizeof(HASHCTL));
+        hctl1.keysize = sizeof(BufferTag);//tag hash
+        hctl1.entrysize = sizeof(buffer_node);//lru node
+        hctl1.hash = tag_hash;
+        g_tenant_info.history_buffer.buffer_map = ShmemInitHash("Hist", 
+        NORMAL_SHARED_BUFFER_NUM, NORMAL_SHARED_BUFFER_NUM, &hctl1, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
     }
 
     if(u_sess && u_sess->proc_cxt.MyProcPort 
@@ -3356,7 +3368,6 @@ tenant_buffer_cxt* GetVictimTenant(){
     uint32 lower_bound = NORMAL_SHARED_BUFFER_NUM / ( active_tenant * active_tenant );
     if(victim_buffer_cxt->real_buffer.curr_size < lower_bound){
         /* Sampling among tenant has buf more than lower bound */
-        return NULL;
         random=double(rand()) / double(RAND_MAX);
         double weight_sum = 0;
         double amplify_factor = 10000;
