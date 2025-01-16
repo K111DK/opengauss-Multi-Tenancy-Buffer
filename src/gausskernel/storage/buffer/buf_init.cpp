@@ -355,6 +355,7 @@ Size BufferShmemSize(void)
 
     /* size of buffer descriptors */
     size = add_size(size, mul_size(TOTAL_BUFFER_NUM, sizeof(BufferDescPadded)));
+    size = add_size(size, mul_size(10 * TOTAL_BUFFER_NUM, sizeof(buffer_node)));
     size = add_size(size, PG_CACHE_LINE_SIZE);
     size = add_size(size, mul_size(TOTAL_BUFFER_NUM, sizeof(BufferDescExtra)));
     size = add_size(size, PG_CACHE_LINE_SIZE);

@@ -3184,7 +3184,7 @@ tenant_buffer_cxt* get_thrd_tenant_buffer_cxt(){
         g_tenant_info.history_buffer.buffer_map = ShmemInitHash("Hist", 
         NORMAL_SHARED_BUFFER_NUM, NORMAL_SHARED_BUFFER_NUM, &hctl1, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
     }
-
+    
     if(u_sess && u_sess->proc_cxt.MyProcPort 
                 && u_sess->proc_cxt.MyProcPort->user_name
                     && u_sess->proc_cxt.MyProcPort->user_name[1] == '0'){
