@@ -3139,14 +3139,14 @@ tenant_buffer_cxt* get_tenant_by_name(const char* name){
             uint32 promised_memory = (name[4] - '0') * 1000 + (name[5] - '0') * 100 + (name[6] - '0') * 10 + (name[7] - '0');
             uint32 sla = (name[9] - '0') * 10 + (name[10] - '0');
             uint32 ref_capacity = ( promised_memory * 1024 * 1024) / BLCKSZ;
-            ereport(WARNING,
-                (errmsg("Tenant [%s] added, Id: [%u], Promised mem: [%u mb][%u blk] , SLA: [%u]", name, tenant_id, promised_memory, ref_capacity, sla)));
             Assert(ref_capacity > 0 && ref_capacity < NORMAL_SHARED_BUFFER_NUM);
             Assert(sla > 0);
             //Init pool
 #if !ENABLE_BUFFER_ADJUST
             ref_capacity = (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE * 10) / ACTIVE_TENANT_NUM;
 #endif
+            ereport(WARNING,
+            (errmsg("Tenant [%s] added, Id: [%u], Promised mem: [%u mb][%u blk] , SLA: [%u]", name, tenant_id, promised_memory, ref_capacity, sla)));
             tenant_buffer_init(new_tenant, CLOCK, CLOCK, ref_capacity);
             new_tenant->sla = sla;
     
