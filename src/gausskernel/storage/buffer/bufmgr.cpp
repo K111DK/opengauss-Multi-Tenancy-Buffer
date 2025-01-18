@@ -3118,6 +3118,10 @@ BufferType ref_buffer_type, uint32 ref_capacity){
     tenant_buffer->valid = true;
 }
 void no_limit_tenant_buffer_init(tenant_buffer_cxt* tenant_buffer, BufferType real_buffer_type, BufferType ref_buffer_type, uint32 ref_capacity){
+#if !ENABLE_BUFFER_ADJUST
+    tenant_buffer_init(tenant_buffer, real_buffer_type, ref_buffer_type, ref_capacity);
+    return;
+#endif
     bool first_init = tenant_buffer->valid == false;
 
     /* Copy name  */
