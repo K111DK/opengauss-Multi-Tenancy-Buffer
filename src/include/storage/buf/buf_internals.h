@@ -464,6 +464,7 @@ typedef struct tenant_info{
 extern tenant_info g_tenant_info;
 extern void buffer_init(buffer* buffer_cxt, uint32 capacity, const char* name, int type, bool first_init);
 extern void tenant_buffer_init(tenant_buffer_cxt* tenant_buffer, BufferType real_buffer_type, BufferType ref_buffer_type, uint32 ref_capacity);
+extern void no_limit_tenant_buffer_init(tenant_buffer_cxt* tenant_buffer, BufferType real_buffer_type, BufferType ref_buffer_type, uint32 ref_capacity);
 extern tenant_buffer_cxt* get_thrd_tenant_buffer_cxt();
 extern BufferDesc *TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt, bool* from_free_list);
 extern BufferDesc* TenantStrategyGetBufferFromOther(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt);

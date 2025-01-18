@@ -3117,6 +3117,30 @@ BufferType ref_buffer_type, uint32 ref_capacity){
 
     tenant_buffer->valid = true;
 }
+void no_limit_tenant_buffer_init(tenant_buffer_cxt* tenant_buffer, BufferType real_buffer_type, BufferType ref_buffer_type, uint32 ref_capacity){
+    bool first_init = tenant_buffer->valid == false;
+
+    /* Copy name  */
+    char index_name[TENANT_NAME_LEN];
+    strcpy_s(index_name + 1, TENANT_NAME_LEN - 1, tenant_buffer->tenant_name);
+    index_name[TENANT_NAME_LEN - 1] = '\0';
+    
+    /* Init Real Index */
+    index_name[0] = 'R';
+    buffer_init(&tenant_buffer->real_buffer, NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE, index_name, real_buffer_type, first_init);
+    
+    /* Init Ref Index */
+    index_name[0] = 'F';
+    buffer_init(&tenant_buffer->ref_buffer, ref_capacity, index_name, ref_buffer_type, first_init);
+    
+    if(first_init){
+        pthread_mutex_init(&tenant_buffer->tenant_buffer_lock, NULL);
+        tenant_buffer->capacity = NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE;
+        tenant_buffer->weight = 10.0;
+    }
+
+    tenant_buffer->valid = true;
+}
 tenant_buffer_cxt* get_tenant_by_name(const char* name){
     bool tenant_found = false;
     tenant_name_mapping* entry = (tenant_name_mapping*)hash_search(g_tenant_info.tenant_map, 
@@ -3144,7 +3168,7 @@ tenant_buffer_cxt* get_tenant_by_name(const char* name){
             //Init pool
             ereport(WARNING,
             (errmsg("Tenant [%s] added, Id: [%u], Promised mem: [%u mb][%u blk] , SLA: [%u]", name, tenant_id, promised_memory, ref_capacity, sla)));
-            tenant_buffer_init(new_tenant, CLOCK, CLOCK, ref_capacity);
+            no_limit_tenant_buffer_init(new_tenant, CLOCK, CLOCK, ref_capacity);
             new_tenant->sla = sla;
             g_tenant_info.total_promised += ref_capacity;
             ereport(WARNING,
@@ -3152,7 +3176,6 @@ tenant_buffer_cxt* get_tenant_by_name(const char* name){
             , g_tenant_info.total_promised
             , NORMAL_SHARED_BUFFER_NUM
             , g_tenant_info.tenant_num)));
-            tenant_buffer_init(new_tenant, CLOCK, CLOCK, ref_capacity);
 
             {
                 uint64 total_actual = (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE);
@@ -3193,7 +3216,7 @@ tenant_buffer_cxt* get_thrd_tenant_buffer_cxt(){
 
         for(uint i = 0; i < g_tenant_info.tenant_num; ++i){    
             Assert(g_tenant_info.tenant_buffer_cxt_array[i].valid);
-            tenant_buffer_init(&g_tenant_info.tenant_buffer_cxt_array[i], CLOCK, CLOCK, g_tenant_info.tenant_buffer_cxt_array[i].capacity);
+            no_limit_tenant_buffer_init(&g_tenant_info.tenant_buffer_cxt_array[i], CLOCK, CLOCK, g_tenant_info.tenant_buffer_cxt_array[i].capacity);
         }
 
         tenant_buffer_init(&g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE);
@@ -3696,7 +3719,8 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     /* Update weight */
     UpdateWeight(found_descs, buffer_cxt->tenant_oid);//We should find ? in Hlist?
 #if ENABLE_BUFFER_ADJUST
-    if( (g_tenant_info.tenant_free_taken >= g_tenant_info.total_promised - MINIMAL_BUFFER_SIZE || g_tenant_info.free_list_empty) 
+    if( (g_tenant_info.tenant_free_taken >= NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE 
+            || g_tenant_info.free_list_empty) 
         && g_tenant_info.tenant_num > 1
         && buffer_cxt->real_buffer.curr_size < buffer_cxt->capacity ){
         double hrd = GetTenantHRD(buffer_cxt);

@@ -461,7 +461,7 @@ BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_s
 
     if(buffer_cxt->real_buffer.curr_size < buffer_cxt->real_buffer.max_capacity &&
         buffer_cxt->real_buffer.curr_size < buffer_cxt->limit_max &&
-        (buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt || g_tenant_info.tenant_free_taken < g_tenant_info.total_promised - MINIMAL_BUFFER_SIZE)){
+        (buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt || g_tenant_info.tenant_free_taken < NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE)){
         /* Fetch from global free buffer pool */
         int buf_id;
         while(candidate_buf_pop(&g_tenant_info.buffer_list, &buf_id)){

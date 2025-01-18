@@ -164,37 +164,6 @@ void InitMultiTenantBufferPool(void){
     }
 }
 
-void thrd_Tenant_map_init(){
-    pthread_mutex_lock(&g_tenant_info.tenant_map_lock);
-    
-    HASHCTL hctl;
-    int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
-    securec_check(ret, "\0", "\0");
-    hctl.keysize = TENANT_NAME_LEN;
-    hctl.entrysize = sizeof(tenant_name_mapping); // oid
-    hctl.hash = string_hash;
-    g_tenant_info.tenant_map = ShmemInitHash("tenant info hash", 
-    64, 64, &hctl, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
-
-    for(uint i = 0; i < g_tenant_info.tenant_num; ++i){    
-        Assert(g_tenant_info.tenant_buffer_cxt_array[i].valid);
-        tenant_buffer_init(&g_tenant_info.tenant_buffer_cxt_array[i], CLOCK, CLOCK, 0);
-    }
-
-    tenant_buffer_init(&g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE);
-
-    // /* Evict history list should be fifo */
-    // HASHCTL hctl1;
-    // ret = memset_s(&hctl1, sizeof(HASHCTL), 0, sizeof(HASHCTL));
-    // securec_check(ret, "\0", "\0");
-    // hctl1.keysize = sizeof(BufferTag);//tag hash
-    // hctl1.entrysize = sizeof(buffer_node);//lru node
-    // hctl1.hash = tag_hash;
-    // g_tenant_info.history_buffer.buffer_map = ShmemInitHash("Hist", 
-    // NORMAL_SHARED_BUFFER_NUM, NORMAL_SHARED_BUFFER_NUM, &hctl1, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
-
-    pthread_mutex_unlock(&g_tenant_info.tenant_map_lock);
-}
 
 void InitBufferPool(void)
 {
@@ -319,10 +288,6 @@ void InitBufferPool(void)
         g_instance.bgwriter_cxt.rel_one_fork_hashtbl_lock = LWLockAssign(LWTRANCHE_UNLINK_REL_FORK_TBL);
     }
 
-// #if ENABLE_MULTI_TENANTCY
-//     /* For thrd, must init all shmem index*/
-//     thrd_Tenant_map_init();
-// #endif
 
     /* re-assign locks for un-reinited buffers, may delete this */
     if (SS_PERFORMING_SWITCHOVER) {
@@ -356,7 +321,7 @@ Size BufferShmemSize(void)
 
     /* size of buffer descriptors */
     size = add_size(size, mul_size(TOTAL_BUFFER_NUM, sizeof(BufferDescPadded)));
-    size = add_size(size, mul_size(10 * TOTAL_BUFFER_NUM, sizeof(buffer_node)));
+    size = add_size(size, mul_size(64 * TOTAL_BUFFER_NUM, sizeof(buffer_node)));
     size = add_size(size, PG_CACHE_LINE_SIZE);
     size = add_size(size, mul_size(TOTAL_BUFFER_NUM, sizeof(BufferDescExtra)));
     size = add_size(size, PG_CACHE_LINE_SIZE);
