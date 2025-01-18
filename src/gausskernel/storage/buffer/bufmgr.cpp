@@ -3202,7 +3202,6 @@ tenant_buffer_cxt* get_tenant_by_name(const char* name){
     }
     return &g_tenant_info.tenant_buffer_cxt_array[entry->tenant_oid];
 }
-
 tenant_buffer_cxt* get_thrd_tenant_buffer_cxt(){
     {
         HASHCTL hctl;
@@ -3234,13 +3233,38 @@ tenant_buffer_cxt* get_thrd_tenant_buffer_cxt(){
         NORMAL_SHARED_BUFFER_NUM, NORMAL_SHARED_BUFFER_NUM, &hctl1, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
     }
     
-    if(u_sess && u_sess->proc_cxt.MyProcPort 
-                && u_sess->proc_cxt.MyProcPort->user_name
-                    && u_sess->proc_cxt.MyProcPort->user_name[1] == '0'){
-        //ereport(WARNING, (errmsg("User name: %s is new Tenant", u_sess->proc_cxt.MyProcPort->user_name)));                
-        Assert(strlen(u_sess->proc_cxt.MyProcPort->user_name) >= 3 + 1 + 4 + 1 + 2);
-        tenant_buffer_cxt* ret = get_tenant_by_name(u_sess->proc_cxt.MyProcPort->user_name);
-        return ret;
+    if(u_sess && u_sess->proc_cxt.MyProcPort && u_sess->proc_cxt.MyProcPort->user_name){
+        
+        if(u_sess->proc_cxt.MyProcPort->user_name[1] == '0'){
+            //ereport(WARNING, (errmsg("User name: %s is new Tenant", u_sess->proc_cxt.MyProcPort->user_name)));                
+            Assert(strlen(u_sess->proc_cxt.MyProcPort->user_name) >= 3 + 1 + 4 + 1 + 2);
+            tenant_buffer_cxt* ret = get_tenant_by_name(u_sess->proc_cxt.MyProcPort->user_name);
+            return ret;
+        }
+        if(u_sess->proc_cxt.MyProcPort->user_name[0] == 'e'||u_sess->proc_cxt.MyProcPort->user_name[0] == 'E'){
+            //Print all info then kill ourselves
+            ereport(WARNING, (errmsg("=====Tenant Weight Info[Alloc count:%u][MTPR Enable:%s][Tenant free alloc:%u]====="
+                , g_tenant_info.update_count
+                , ENABLE_BUFFER_ADJUST ? "Yes": "No"
+                , g_tenant_info.tenant_free_taken)));
+            for(uint32 i = 0; i < g_tenant_info.tenant_num; i++){
+                tenant_buffer_cxt* temp = &g_tenant_info.tenant_buffer_cxt_array[i];
+                ereport(WARNING, (errmsg("Tenant:[%s], weight:[%f], sla:[%u], Real[H/M:%u/%u] = [%f] Ref[H/M:%u/%u] = [%f] HRD:[%f] Curr size:[%u]", 
+                temp->tenant_name, 
+                temp->weight,
+                temp->sla,
+                temp->real_buffer.hits,
+                temp->real_buffer.misses,
+                (double)(temp->real_buffer.hits) / (double)(temp->real_buffer.hits + temp->real_buffer.misses)
+                temp->ref_buffer.hits,
+                temp->ref_buffer.misses,
+                (double)(temp->ref_buffer.hits) / (double)(temp->ref_buffer.hits + temp->ref_buffer.misses),
+                GetTenantHRD(temp),
+                temp->real_buffer.curr_size
+                )));
+            }
+            Assert(0);
+        }
     }
     tenant_buffer_init(&g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE);
     return &g_tenant_info.non_tenant_buffer_cxt;
