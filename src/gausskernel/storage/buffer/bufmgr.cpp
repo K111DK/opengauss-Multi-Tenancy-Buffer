@@ -3215,7 +3215,7 @@ tenant_buffer_cxt* get_thrd_tenant_buffer_cxt(){
 
         for(uint i = 0; i < g_tenant_info.tenant_num; ++i){    
             Assert(g_tenant_info.tenant_buffer_cxt_array[i].valid);
-            no_limit_tenant_buffer_init(&g_tenant_info.tenant_buffer_cxt_array[i], CLOCK, CLOCK, g_tenant_info.tenant_buffer_cxt_array[i].capacity);
+            no_limit_tenant_buffer_init(&g_tenant_info.tenant_buffer_cxt_array[i], CLOCK, CLOCK, g_tenant_info.tenant_buffer_cxt_array[i].ref_buffer.max_capacity);
         }
 
         tenant_buffer_init(&g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE);
@@ -3249,17 +3249,16 @@ tenant_buffer_cxt* get_thrd_tenant_buffer_cxt(){
                 , g_tenant_info.tenant_free_taken)));
             for(uint32 i = 0; i < g_tenant_info.tenant_num; i++){
                 tenant_buffer_cxt* temp = &g_tenant_info.tenant_buffer_cxt_array[i];
-                ereport(WARNING, (errmsg("Tenant:[%s], weight:[%f], sla:[%u], Real[H/M:%u/%u] = [%f] Ref[H/M:%u/%u] = [%f] HRD:[%f] Curr size:[%u]", 
+                ereport(WARNING, (errmsg("Tenant:[%s], weight:[%f], sla:[%u], Real[H/M:%u/%u] = [%f] Ref[H/M:%u/%u] = [%f] Curr size:[%u]", 
                 temp->tenant_name, 
                 temp->weight,
                 temp->sla,
                 temp->real_buffer.hits,
                 temp->real_buffer.misses,
-                (double)(temp->real_buffer.hits) / (double)(temp->real_buffer.hits + temp->real_buffer.misses)
+                (double)(temp->real_buffer.hits) / (double)(temp->real_buffer.hits + temp->real_buffer.misses),
                 temp->ref_buffer.hits,
                 temp->ref_buffer.misses,
                 (double)(temp->ref_buffer.hits) / (double)(temp->ref_buffer.hits + temp->ref_buffer.misses),
-                GetTenantHRD(temp),
                 temp->real_buffer.curr_size
                 )));
             }
