@@ -142,7 +142,7 @@ void InitMultiTenantBufferPool(void){
     hctl1.hash = tag_hash;
     g_tenant_info.history_buffer.buffer_map = ShmemInitHash("Hist", 
     NORMAL_SHARED_BUFFER_NUM, NORMAL_SHARED_BUFFER_NUM, &hctl1, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
-    if(found_descs){
+    if(!found_descs){
         g_tenant_info.history_buffer.dummy_head.next = &g_tenant_info.history_buffer.dummy_tail;
         g_tenant_info.history_buffer.dummy_head.prev = NULL;
         g_tenant_info.history_buffer.dummy_tail.prev = &g_tenant_info.history_buffer.dummy_head;
@@ -158,8 +158,9 @@ void InitMultiTenantBufferPool(void){
         pthread_mutex_init(&g_tenant_info.tenant_map_lock, NULL);
         /* Backup buffer */
         strcpy_s(g_tenant_info.non_tenant_buffer_cxt.tenant_name, TENANT_NAME_LEN, "Non Tenant Buffer");
-        tenant_buffer_init(&g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE * 10);
+        tenant_buffer_init(&g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE);
         g_tenant_info.non_tenant_buffer_cxt.tenant_oid = UINT32_MAX;
+        g_tenant_info.total_promised += MINIMAL_BUFFER_SIZE;
     }
 }
 
@@ -180,7 +181,7 @@ void thrd_Tenant_map_init(){
         tenant_buffer_init(&g_tenant_info.tenant_buffer_cxt_array[i], CLOCK, CLOCK, 0);
     }
 
-    tenant_buffer_init(&g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE * 10);
+    tenant_buffer_init(&g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE);
 
     // /* Evict history list should be fifo */
     // HASHCTL hctl1;

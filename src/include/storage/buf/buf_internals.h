@@ -365,9 +365,9 @@ extern void FlushBuffer(void* buf, SMgrRelation reln, ReadBufferMethod flushmeth
 extern void LocalBufferFlushAllBuffer();
 
 
-#define MINIMAL_BUFFER_SIZE 1024
+#define MINIMAL_BUFFER_SIZE 10240
 #define ENABLE_MULTI_TENANTCY 1
-#define ENABLE_BUFFER_ADJUST 1
+#define ENABLE_BUFFER_ADJUST 0
 #define MULTITENANT_RESET_ENABLE 1
 #define ENABLE_HIST 1
 #define ACTIVE_TENANT_NUM 4
@@ -415,7 +415,7 @@ typedef struct tenant_buffer_cxt{
     buffer real_buffer;
     
     uint64 total_access{0};
-    size_t capacity;
+    uint32 capacity;
     uint64 total_clean_buf_taken{0};
     
     pthread_mutex_t tenant_buffer_lock;
@@ -424,6 +424,7 @@ typedef struct tenant_buffer_cxt{
     uint32 tenant_oid;
     double weight{10.0};
     bool valid{false};
+    uint32 limit_max;
 } tenant_buffer_cxt;
 typedef struct tenant_name_mapping{
     //key
@@ -454,6 +455,10 @@ typedef struct tenant_info{
 
     /* Update count */
     uint64 update_count{0};
+    uint64 total_promised{0};
+
+    /* */
+    uint32 tenant_free_taken{0};
 
 } tenant_info;
 extern tenant_info g_tenant_info;

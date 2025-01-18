@@ -459,7 +459,9 @@ BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_s
     (void)pg_atomic_fetch_add_u32(&t_thrd.storage_cxt.StrategyControl->numBufferAllocs, 1);
 
 
-    if(buffer_cxt->real_buffer.curr_size < buffer_cxt->real_buffer.max_capacity){
+    if(buffer_cxt->real_buffer.curr_size < buffer_cxt->real_buffer.max_capacity &&
+        buffer_cxt->real_buffer.curr_size < buffer_cxt->limit_max &&
+        (buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt || g_tenant_info.tenant_free_taken < g_tenant_info.total_promised - MINIMAL_BUFFER_SIZE)){
         /* Fetch from global free buffer pool */
         int buf_id;
         while(candidate_buf_pop(&g_tenant_info.buffer_list, &buf_id)){
@@ -475,6 +477,9 @@ BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_s
                 Assert(!( (local_buf_state & BUF_FLAG_MASK) & BM_TAG_VALID ));
                 //ereport(WARNING, (errmsg("New Buf %d is fetched from global free buffer pool", buf->buf_id)));
                 *from_free_list = true;
+                if(buffer_cxt != &g_tenant_info.non_tenant_buffer_cxt){
+                    g_tenant_info.tenant_free_taken++;
+                }
                 return buf;
             }
         }

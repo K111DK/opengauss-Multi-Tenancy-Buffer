@@ -3142,13 +3142,19 @@ tenant_buffer_cxt* get_tenant_by_name(const char* name){
             Assert(ref_capacity > 0 && ref_capacity < NORMAL_SHARED_BUFFER_NUM);
             Assert(sla > 0);
             //Init pool
-#if !ENABLE_BUFFER_ADJUST
-            ref_capacity = (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE * 10) / ACTIVE_TENANT_NUM;
-#endif
             ereport(WARNING,
             (errmsg("Tenant [%s] added, Id: [%u], Promised mem: [%u mb][%u blk] , SLA: [%u]", name, tenant_id, promised_memory, ref_capacity, sla)));
             tenant_buffer_init(new_tenant, CLOCK, CLOCK, ref_capacity);
             new_tenant->sla = sla;
+            g_tenant_info.total_promised += ref_capacity;
+            ereport(WARNING,
+            (errmsg("Current Total Promised:[%u] Actual[%u] Active Tenant Num[%u]"
+            , g_tenant_info.total_promised
+            , NORMAL_SHARED_BUFFER_NUM
+            , g_tenant_info.tenant_num)));
+            tenant_buffer_init(new_tenant, CLOCK, CLOCK, ref_capacity);
+            new_tenant->limit_max = g_tenant_info.total_promised > NORMAL_SHARED_BUFFER_NUM ?
+                ref_capacity * (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE) / (g_tenant_info.total_promised - MINIMAL_BUFFER_SIZE) : ref_capacity;
     
     }else{
         Assert(entry->tenant_oid < g_tenant_info.tenant_num);
@@ -3170,10 +3176,18 @@ tenant_buffer_cxt* get_thrd_tenant_buffer_cxt(){
 
         for(uint i = 0; i < g_tenant_info.tenant_num; ++i){    
             Assert(g_tenant_info.tenant_buffer_cxt_array[i].valid);
-            tenant_buffer_init(&g_tenant_info.tenant_buffer_cxt_array[i], CLOCK, CLOCK, 0);
+            tenant_buffer_init(&g_tenant_info.tenant_buffer_cxt_array[i], CLOCK, CLOCK, g_tenant_info.tenant_buffer_cxt_array[i].capacity);
         }
 
-        tenant_buffer_init(&g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE * 10);
+        tenant_buffer_init(&g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE);
+
+        g_tenant_info.non_tenant_buffer_cxt.limit_max = MINIMAL_BUFFER_SIZE;
+        for(uint i = 0; i < g_tenant_info.tenant_num; ++i){
+            uint32 ref_capacity = g_tenant_info.tenant_buffer_cxt_array[i].ref_buffer.max_capacity;    
+            g_tenant_info.tenant_buffer_cxt_array[i].limit_max \
+            = g_tenant_info.total_promised > NORMAL_SHARED_BUFFER_NUM ? ( ref_capacity * (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE) ) / (g_tenant_info.total_promised - MINIMAL_BUFFER_SIZE) : ref_capacity;
+        }
+
 
         /* Evict history list should be fifo */
         HASHCTL hctl1;
@@ -3193,7 +3207,7 @@ tenant_buffer_cxt* get_thrd_tenant_buffer_cxt(){
         tenant_buffer_cxt* ret = get_tenant_by_name(u_sess->proc_cxt.MyProcPort->user_name);
         return ret;
     }
-    tenant_buffer_init(&g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE * 10);
+    tenant_buffer_init(&g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE);
     return &g_tenant_info.non_tenant_buffer_cxt;
 }
 #include "utils/dynahash.h"
@@ -3280,7 +3294,6 @@ void UpdateWeight(bool hrd_reweight, uint32 tenant_oid){
     double total_w = 0;
     uint32 max_sla = 0;
     tenant_buffer_cxt* buffer_cxt;
-    g_tenant_info.update_count++;
     
     /* Get max sla and max weight */
     for(int i = 0; i < g_tenant_info.tenant_num; i++){
@@ -3307,23 +3320,6 @@ void UpdateWeight(bool hrd_reweight, uint32 tenant_oid){
         buffer_cxt->weight = buffer_cxt->weight / total_w;
     }
 
-    // if(g_tenant_info.update_count % 10000 == 0){
-    //     ereport(WARNING, (errmsg("==============Tenant Weight Info[Update time:%u]==============", g_tenant_info.update_count)));
-    //     for(uint32 i = 0; i < g_tenant_info.tenant_num; i++){
-    //         buffer_cxt = g_tenant_info.tenant_buffer_cxt_array[i];
-    //         ereport(WARNING, (errmsg("Tenant:[%s], weight:[%f], sla:[%u], Real[H/M:%u/%u] Ref[H/M:%u/%u] HRD:[%f] Curr size:[%u]", 
-    //         buffer_cxt->tenant_name, 
-    //         buffer_cxt->weight,
-    //         buffer_cxt->sla,
-    //         buffer_cxt->real_buffer.hits,
-    //         buffer_cxt->real_buffer.misses,
-    //         buffer_cxt->ref_buffer.hits,
-    //         buffer_cxt->ref_buffer.misses,
-    //         GetTenantHRD(buffer_cxt),
-    //         buffer_cxt->real_buffer.curr_size
-    //         )));
-    //     }
-    // }
 }
 
 tenant_buffer_cxt* GetVictimTenant(){
@@ -3575,11 +3571,30 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     // if(strategy && strategy->btype == 3){
     //     ereport(WARNING, ((errmsg("Vaccuming"))));
     // }
-
     Assert(found);
     
     /* We will hold a big damn lock here */
     pthread_mutex_lock(&g_tenant_info.tenant_map_lock);
+    if(g_tenant_info.update_count++ % 1000000 == 0 && ENABLE_BUFFER_ADJUST){
+        ereport(WARNING, (errmsg("=====Tenant Weight Info[Alloc count:%u][MTPR Enable:%s][Tenant free alloc:%u]====="
+        , g_tenant_info.update_count
+        , ENABLE_BUFFER_ADJUST ? "Yes": "No"
+        , g_tenant_info.tenant_free_taken)));
+        for(uint32 i = 0; i < g_tenant_info.tenant_num; i++){
+            tenant_buffer_cxt* temp = &g_tenant_info.tenant_buffer_cxt_array[i];
+            ereport(WARNING, (errmsg("Tenant:[%s], weight:[%f], sla:[%u], Real[H/M:%u/%u] Ref[H/M:%u/%u] HRD:[%f] Curr size:[%u]", 
+            temp->tenant_name, 
+            temp->weight,
+            temp->sla,
+            temp->real_buffer.hits,
+            temp->real_buffer.misses,
+            temp->ref_buffer.hits,
+            temp->ref_buffer.misses,
+            GetTenantHRD(temp),
+            temp->real_buffer.curr_size
+            )));
+        }
+    }
     Assert(!IsSegmentPhysicalRelNode(smgr->smgr_rnode.node));
     
     tenant_buffer_cxt * buffer_cxt = get_thrd_tenant_buffer_cxt();
@@ -3669,8 +3684,9 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     /* Update weight */
     UpdateWeight(found_descs, buffer_cxt->tenant_oid);//We should find ? in Hlist?
 #if ENABLE_BUFFER_ADJUST
-    if( g_tenant_info.free_list_empty && g_tenant_info.tenant_num > 1 && 
-        buffer_cxt->real_buffer.curr_size < buffer_cxt->capacity ){
+    if( (g_tenant_info.tenant_free_taken >= g_tenant_info.total_promised - MINIMAL_BUFFER_SIZE || g_tenant_info.free_list_empty) 
+        && g_tenant_info.tenant_num > 1
+        && buffer_cxt->real_buffer.curr_size < buffer_cxt->capacity ){
         double hrd = GetTenantHRD(buffer_cxt);
         if(hrd > 0){
             /* Sampling tenant and pick a victim from which to evict */
