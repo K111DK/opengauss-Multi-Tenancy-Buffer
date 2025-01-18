@@ -3153,8 +3153,25 @@ tenant_buffer_cxt* get_tenant_by_name(const char* name){
             , NORMAL_SHARED_BUFFER_NUM
             , g_tenant_info.tenant_num)));
             tenant_buffer_init(new_tenant, CLOCK, CLOCK, ref_capacity);
-            new_tenant->limit_max = g_tenant_info.total_promised > NORMAL_SHARED_BUFFER_NUM ?
-                ref_capacity * (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE) / (g_tenant_info.total_promised - MINIMAL_BUFFER_SIZE) : ref_capacity;
+
+            {
+                uint64 total_actual = (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE);
+                uint64 total_promised = (g_tenant_info.total_promised - MINIMAL_BUFFER_SIZE);
+                for(uint i = 0; i < g_tenant_info.tenant_num; ++i){
+#if ENABLE_BUFFER_ADJUST
+                g_tenant_info.tenant_buffer_cxt_array[i].limit_max = g_tenant_info.tenant_buffer_cxt_array[i].real_buffer.max_capacity;
+#else
+                uint32 max_cap = g_tenant_info.tenant_buffer_cxt_array[i].real_buffer.max_capacity;    
+                g_tenant_info.tenant_buffer_cxt_array[i].limit_max = total_promised > total_actual ? (uint32)(( (uint64)max_cap * total_actual) / total_promised) : max_cap;
+                ereport(WARNING, (errmsg("Tenant[%s] Promised:[%u] Actual[%u] Active Tenant Num[%u]"
+                , g_tenant_info.tenant_buffer_cxt_array[i].tenant_name
+                , g_tenant_info.tenant_buffer_cxt_array[i].real_buffer.max_capacity
+                , g_tenant_info.tenant_buffer_cxt_array[i].limit_max
+                , g_tenant_info.tenant_num)));
+#endif
+                }
+            }
+
     
     }else{
         Assert(entry->tenant_oid < g_tenant_info.tenant_num);
@@ -3182,11 +3199,6 @@ tenant_buffer_cxt* get_thrd_tenant_buffer_cxt(){
         tenant_buffer_init(&g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE);
 
         g_tenant_info.non_tenant_buffer_cxt.limit_max = MINIMAL_BUFFER_SIZE;
-        for(uint i = 0; i < g_tenant_info.tenant_num; ++i){
-            uint32 ref_capacity = g_tenant_info.tenant_buffer_cxt_array[i].ref_buffer.max_capacity;    
-            g_tenant_info.tenant_buffer_cxt_array[i].limit_max \
-            = g_tenant_info.total_promised > NORMAL_SHARED_BUFFER_NUM ? ( ref_capacity * (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE) ) / (g_tenant_info.total_promised - MINIMAL_BUFFER_SIZE) : ref_capacity;
-        }
 
 
         /* Evict history list should be fifo */
@@ -3575,7 +3587,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     
     /* We will hold a big damn lock here */
     pthread_mutex_lock(&g_tenant_info.tenant_map_lock);
-    if(g_tenant_info.update_count++ % 1000000 == 0 && ENABLE_BUFFER_ADJUST){
+    if(g_tenant_info.update_count++ % 1000000 == 0){
         ereport(WARNING, (errmsg("=====Tenant Weight Info[Alloc count:%u][MTPR Enable:%s][Tenant free alloc:%u]====="
         , g_tenant_info.update_count
         , ENABLE_BUFFER_ADJUST ? "Yes": "No"
