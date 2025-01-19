@@ -3289,11 +3289,8 @@ double GetTenantHRD(tenant_buffer_cxt* buffer_cxt){
     if((ref_hits + ref_misses) == 0 || (real_hits + real_misses) == 0){
         return 0;
     }
-    
-    double hrd = (double)ref_hits / (ref_hits + ref_misses) * 100 - (float)real_hits / (real_hits + real_misses) * 100;
-    //ereport(WARNING, (errmsg("Tenant [%s] HRD: %u", buffer_cxt->tenant_name, hrd)));
-    return hrd < 0 ? 0 : hrd;
-
+    double hrd = (double)((double)real_misses - (double)ref_misses) / (double) ((double)real_hits + (double)real_misses) ;
+    return hrd <= 0.0 ? 0.0 : hrd;
 }
 
 /* Currently we do it in LRU manner */
@@ -3527,22 +3524,6 @@ tenant_buffer_cxt* GetVictimTenant(){
 DO_RESET:
 #if MULTITENANT_RESET_ENABLE
         /* Zone reset*/
-        for(uint32 i = 0; i < g_tenant_info.tenant_num; i++){
-                tenant_buffer_cxt* temp = &g_tenant_info.tenant_buffer_cxt_array[i];
-                ereport(WARNING, (errmsg("Before reset: Tenant:[%s], weight:[%f], sla:[%u], HRD:[%f], Real[H/M:%u/%u] = [%f] Ref[H/M:%u/%u] = [%f] Curr size:[%u]", 
-                temp->tenant_name, 
-                temp->weight,
-                temp->sla,
-                GetTenantHRD(temp),
-                temp->real_buffer.hits,
-                temp->real_buffer.misses,
-                (double)(temp->real_buffer.hits) / (double)(temp->real_buffer.hits + temp->real_buffer.misses),
-                temp->ref_buffer.hits,
-                temp->ref_buffer.misses,
-                (double)(temp->ref_buffer.hits) / (double)(temp->ref_buffer.hits + temp->ref_buffer.misses),
-                temp->real_buffer.curr_size
-                )));
-        }
         {
             double origin_weight = 0.0;
             double new_sum = 1.0;
@@ -3570,22 +3551,6 @@ DO_RESET:
 
                 }
             }
-        }
-        for(uint32 i = 0; i < g_tenant_info.tenant_num; i++){
-                tenant_buffer_cxt* temp = &g_tenant_info.tenant_buffer_cxt_array[i];
-                ereport(WARNING, (errmsg("After reset: Tenant:[%s], weight:[%f], sla:[%u], HRD:[%f], Real[H/M:%u/%u] = [%f] Ref[H/M:%u/%u] = [%f] Curr size:[%u]", 
-                temp->tenant_name, 
-                temp->weight,
-                temp->sla,
-                GetTenantHRD(temp),
-                temp->real_buffer.hits,
-                temp->real_buffer.misses,
-                (double)(temp->real_buffer.hits) / (double)(temp->real_buffer.hits + temp->real_buffer.misses),
-                temp->ref_buffer.hits,
-                temp->ref_buffer.misses,
-                (double)(temp->ref_buffer.hits) / (double)(temp->ref_buffer.hits + temp->ref_buffer.misses),
-                temp->real_buffer.curr_size
-                )));
         }
 #endif
 
@@ -3711,7 +3676,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     
     /* We will hold a big damn lock here */
     pthread_mutex_lock(&g_tenant_info.tenant_map_lock);
-    if(g_tenant_info.update_count++ % 1000000 == 0){
+    if(g_tenant_info.update_count++ % 1000 == 0){
         ereport(WARNING, (errmsg("=====Tenant Weight Info[Alloc count:%u][MTPR Enable:%s][Tenant free alloc:%u]====="
         , g_tenant_info.update_count
         , ENABLE_BUFFER_ADJUST ? "Yes": "No"
@@ -3825,7 +3790,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
         && g_tenant_info.tenant_num > 1
         && buffer_cxt->real_buffer.curr_size < buffer_cxt->capacity ){
         double hrd = GetTenantHRD(buffer_cxt);
-        if(hrd >= 0.5){
+        if(hrd >= 0.00){
             /* Sampling tenant and pick a victim from which to evict */
             victim_buffer_cxt = GetVictimTenant();
         }
