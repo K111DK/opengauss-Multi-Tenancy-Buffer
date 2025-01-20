@@ -3276,7 +3276,7 @@ tenant_buffer_cxt* get_thrd_tenant_buffer_cxt(){
             ereport(WARNING, (errmsg("Final Hit Rate[H:%u/M:%u] = [%.2f%]",
                                     total_hit,
                                     total_miss,
-                                    100.0 *( (double)total_hit / (double) total_miss )
+                                    100.0 *( (double)total_hit / (double) (total_hit + total_miss) )
                                     )));
             Assert(0);
         }
