@@ -458,11 +458,11 @@ BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_s
      */
     (void)pg_atomic_fetch_add_u32(&t_thrd.storage_cxt.StrategyControl->numBufferAllocs, 1);
 
-
-    if(buffer_cxt->real_buffer.curr_size < buffer_cxt->real_buffer.max_capacity &&
-        buffer_cxt->real_buffer.curr_size < buffer_cxt->limit_max &&
-        (buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt || g_tenant_info.tenant_free_taken < NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE)){
-        /* Fetch from global free buffer pool */
+    if(buffer_cxt->real_buffer.curr_size < buffer_cxt->ref_buffer.max_capacity || buffer_cxt->real_buffer.misses > buffer_cxt->ref_buffer.misses){
+        if(buffer_cxt->real_buffer.curr_size < buffer_cxt->real_buffer.max_capacity &&
+            buffer_cxt->real_buffer.curr_size < buffer_cxt->limit_max &&
+            (buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt || g_tenant_info.tenant_free_taken < NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE)){
+            /* Fetch from global free buffer pool */
         int buf_id;
         while(candidate_buf_pop(&g_tenant_info.buffer_list, &buf_id)){
             Assert(buf_id < SegmentBufferStartID);
@@ -485,7 +485,9 @@ BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_s
         }
         /* Fetch from other tenant's buffer pool */
         g_tenant_info.free_list_empty = true;
+        }
     }
+EVICT:
     /* Fetch from tenant's buffer pool */
     BufferDesc* ans =  ClockSweepBufferEvict(strategy, buf_state, buffer_cxt);
     bool found = false;
