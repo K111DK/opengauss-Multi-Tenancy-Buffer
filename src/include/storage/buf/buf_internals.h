@@ -369,7 +369,7 @@ extern void LocalBufferFlushAllBuffer();
 #define ENABLE_MULTI_TENANTCY 1
 #define ENABLE_BUFFER_ADJUST 1
 #define MULTITENANT_RESET_ENABLE 1
-#define ENABLE_HIST 0
+#define ENABLE_HIST 1
 #define ACTIVE_TENANT_NUM 4
 enum BufferType{
     LRU = 0,
@@ -414,7 +414,6 @@ typedef struct tenant_buffer_cxt{
     buffer ref_buffer;
     buffer real_buffer;
     
-    uint64 total_access{0};
     uint32 capacity;
     uint64 total_clean_buf_taken{0};
     
@@ -425,6 +424,10 @@ typedef struct tenant_buffer_cxt{
     double weight{10.0};
     bool valid{false};
     uint32 limit_max;
+    uint64 total_not_normal{0};
+    uint64 total_not_normal_hits{0};
+    uint64 total_normal{0};
+    uint64 total_normal_hits{0};
 } tenant_buffer_cxt;
 typedef struct tenant_name_mapping{
     //key

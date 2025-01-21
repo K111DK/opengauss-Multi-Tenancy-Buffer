@@ -3073,7 +3073,7 @@ void show_tenant_status(){
         , g_tenant_info.tenant_free_taken)));
     for(uint32 i = 0; i < g_tenant_info.tenant_num; i++){
                 tenant_buffer_cxt* temp = &g_tenant_info.tenant_buffer_cxt_array[i];
-                ereport(WARNING, (errmsg("Tenant:[%s], weight:[%f], sla:[%u], HRD = [%f], Real[H/M:%u/%u] = [%.2f%] Ref[H/M:%u/%u] = [%.2f%] Curr size:[%u]", 
+                ereport(WARNING, (errmsg("Tenant:[%s], weight:[%f], sla:[%u], HRD = [%f], Real[H/M:%u/%u] = [%.2f%] Ref[H/M:%u/%u] = [%.2f%] Curr size:[%u] Normal[H/M:%u/%u] = [%.2f%]", 
                 temp->tenant_name, 
                 temp->weight,
                 temp->sla,
@@ -3084,7 +3084,10 @@ void show_tenant_status(){
                 temp->ref_buffer.hits,
                 temp->ref_buffer.misses,
                 100.0 * (double)(temp->ref_buffer.hits) / (double)(temp->ref_buffer.hits + temp->ref_buffer.misses),
-                temp->real_buffer.curr_size
+                temp->real_buffer.curr_size,
+                temp->total_normal_hits,
+                temp->total_normal - temp->total_normal_hits,
+                100.0 * (double)(temp->total_normal_hits) / (double)(temp->total_normal)
                 )));
                 total_hit += temp->real_buffer.hits;
                 total_miss += temp->real_buffer.misses;
@@ -3376,31 +3379,13 @@ void UpdateWeight(bool hrd_reweight, tenant_buffer_cxt* buffer_cxt){
         max_sla = max_sla > temp->sla ? max_sla : temp->sla;
         total_w += temp->weight;
     }
-    if(true){
+    if(hrd_reweight){
         /* Do reweight by hrd */
         double sla_factor = (double)buffer_cxt->sla / max_sla;
         double pre_val = buffer_cxt->weight;
         double hrd = GetTenantHRD(buffer_cxt);
         total_w -= buffer_cxt->weight;
-        buffer_cxt->weight = zero + buffer_cxt->weight * exp(-1.0 * hrd * sla_factor);
-        if(buffer_cxt->tenant_name[5] == '2'){
-            buffer_cxt->weight = zero + buffer_cxt->weight;
-        }
-        ereport(WARNING, (errmsg("Tenant: %s, weight: %f, sla: %u, Real[H/M:%u/%u] Ref[H/M:%u/%u] HRD: %f, Pre weight: %f, sla factor: %f, Downgrade factor: %f, After weight: %f", 
-            buffer_cxt->tenant_name, 
-            buffer_cxt->weight,
-            buffer_cxt->sla,
-            buffer_cxt->real_buffer.hits,
-            buffer_cxt->real_buffer.misses,
-            buffer_cxt->ref_buffer.hits,
-            buffer_cxt->ref_buffer.misses,
-            hrd,
-            pre_val,
-            sla_factor,
-            exp(-1.0 * hrd * sla_factor),
-            buffer_cxt->weight
-        )));
-        
+        buffer_cxt->weight = zero + buffer_cxt->weight * exp(-1.0 * hrd * sla_factor);        
         total_w += buffer_cxt->weight;
     }
     /* global reweight */
@@ -3655,21 +3640,16 @@ OUT:
 
 static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
                                BufferAccessStrategy strategy, bool *found, const XLogPhyBlock *pblk){
-    
-    // if(strategy && strategy->btype == 3){
-    //     ereport(WARNING, ((errmsg("Vaccuming"))));
-    // }
     Assert(found);
     
     /* We will hold a big damn lock here */
     pthread_mutex_lock(&g_tenant_info.tenant_map_lock);
-    if(g_tenant_info.update_count++ % 50000 == 0){
+    if(g_tenant_info.update_count++ % 1000000 == 0){
         show_tenant_status();
     }
     Assert(!IsSegmentPhysicalRelNode(smgr->smgr_rnode.node));
     
     tenant_buffer_cxt * buffer_cxt = get_thrd_tenant_buffer_cxt();
-    //tenant_buffer_cxt * buffer_cxt = g_tenant_info.non_tenant_buffer_cxt;
 
     BufferTag old_tag;
     uint32 old_hash = 0;
@@ -3724,7 +3704,13 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
             buffer_cxt->real_buffer.misses++;
         /* Update ref buffer cxt */
         UpdateRefBuffer(new_hash, &new_tag, buffer_cxt);
-
+        if(strategy && (strategy->btype == BAS_VACUUM || strategy->btype == BAS_REPAIR) ){
+            buffer_cxt->total_not_normal++;
+            buffer_cxt->total_not_normal_hits += *found ? 1 : 0;
+        }else{
+            buffer_cxt->total_normal++;
+            buffer_cxt->total_normal_hits += *found ? 1 : 0;
+        }
         pthread_mutex_unlock(&g_tenant_info.tenant_map_lock);
         return buf;
     }
@@ -3949,7 +3935,13 @@ GET_BUF:
     
     /* Update ref buffer cxt */
     UpdateRefBuffer(new_hash, &new_tag, buffer_cxt);
-
+    if(strategy && (strategy->btype == BAS_VACUUM || strategy->btype == BAS_REPAIR) ){
+        buffer_cxt->total_not_normal++;
+        buffer_cxt->total_not_normal_hits += *found ? 1 : 0;
+    }else{
+        buffer_cxt->total_normal++;
+        buffer_cxt->total_normal_hits += *found ? 1 : 0;
+    }
     pthread_mutex_unlock(&g_tenant_info.tenant_map_lock);
     return buf;
 }
