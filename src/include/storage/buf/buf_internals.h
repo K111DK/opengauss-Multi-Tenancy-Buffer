@@ -468,6 +468,8 @@ extern void no_limit_tenant_buffer_init(tenant_buffer_cxt* tenant_buffer, Buffer
 extern tenant_buffer_cxt* get_thrd_tenant_buffer_cxt();
 extern BufferDesc *TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt, bool* from_free_list);
 extern BufferDesc* TenantStrategyGetBufferFromOther(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt);
-
+extern void show_tenant_status();
+extern void tenant_HTAB_init();
+double GetTenantHRD(tenant_buffer_cxt* buffer_cxt);
 
 #endif /* BUFMGR_INTERNALS_H */

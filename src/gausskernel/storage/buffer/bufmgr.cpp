@@ -3064,6 +3064,37 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
     return buf;
 }
 tenant_info g_tenant_info;
+void show_tenant_status(){
+    uint64 total_hit = 0;
+    uint64 total_miss = 0;
+    ereport(WARNING, (errmsg("=====Tenant Weight Info[Alloc count:%u][MTPR Enable:%s][Tenant free alloc:%u]====="
+        , g_tenant_info.update_count
+        , ENABLE_BUFFER_ADJUST ? "Yes": "No"
+        , g_tenant_info.tenant_free_taken)));
+    for(uint32 i = 0; i < g_tenant_info.tenant_num; i++){
+                tenant_buffer_cxt* temp = &g_tenant_info.tenant_buffer_cxt_array[i];
+                ereport(WARNING, (errmsg("Tenant:[%s], weight:[%f], sla:[%u], HRD = [%f], Real[H/M:%u/%u] = [%.2f%] Ref[H/M:%u/%u] = [%.2f%] Curr size:[%u]", 
+                temp->tenant_name, 
+                temp->weight,
+                temp->sla,
+                GetTenantHRD(temp),
+                temp->real_buffer.hits,
+                temp->real_buffer.misses,
+                100.0 * (double)(temp->real_buffer.hits) / (double)(temp->real_buffer.hits + temp->real_buffer.misses),
+                temp->ref_buffer.hits,
+                temp->ref_buffer.misses,
+                100.0 * (double)(temp->ref_buffer.hits) / (double)(temp->ref_buffer.hits + temp->ref_buffer.misses),
+                temp->real_buffer.curr_size
+                )));
+                total_hit += temp->real_buffer.hits;
+                total_miss += temp->real_buffer.misses;
+    }
+    ereport(WARNING, (errmsg("Final Hit Rate[H:%u/M:%u] = [%.2f%]",
+                                    total_hit,
+                                    total_miss,
+                                    100.0 *( (double)total_hit / (double) (total_hit + total_miss) )
+                                    )));
+}
 void buffer_init(buffer* buffer_cxt, uint32 capacity, const char* name, BufferType type, bool first_init){
     Assert(buffer_cxt!=NULL);
     Assert(name!=NULL);
@@ -3209,79 +3240,53 @@ tenant_buffer_cxt* get_tenant_by_name(const char* name){
     }
     return &g_tenant_info.tenant_buffer_cxt_array[entry->tenant_oid];
 }
-tenant_buffer_cxt* get_thrd_tenant_buffer_cxt(){
-    {
-        HASHCTL hctl;
-        int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
-        securec_check(ret, "\0", "\0");
-        hctl.keysize = TENANT_NAME_LEN;
-        hctl.entrysize = sizeof(tenant_name_mapping); // oid
-        hctl.hash = string_hash;
-        g_tenant_info.tenant_map = ShmemInitHash("tenant info hash", 
-        64, 64, &hctl, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
+void tenant_HTAB_init(){
+    /* Init tenant map */
+    HASHCTL hctl;
+    int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
+    securec_check(ret, "\0", "\0");
+    hctl.keysize = TENANT_NAME_LEN;
+    hctl.entrysize = sizeof(tenant_name_mapping); // oid
+    hctl.hash = string_hash;
+    g_tenant_info.tenant_map = ShmemInitHash("tenant info hash", 
+    64, 64, &hctl, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
 
-        for(uint i = 0; i < g_tenant_info.tenant_num; ++i){    
-            Assert(g_tenant_info.tenant_buffer_cxt_array[i].valid);
-            no_limit_tenant_buffer_init(&g_tenant_info.tenant_buffer_cxt_array[i], CLOCK, CLOCK, g_tenant_info.tenant_buffer_cxt_array[i].ref_buffer.max_capacity);
-        }
-
-        tenant_buffer_init(&g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE);
-
-        g_tenant_info.non_tenant_buffer_cxt.limit_max = MINIMAL_BUFFER_SIZE;
-
-
-        /* Evict history list should be fifo */
-        HASHCTL hctl1;
-        memset_s(&hctl1, sizeof(HASHCTL), 0, sizeof(HASHCTL));
-        hctl1.keysize = sizeof(BufferTag);//tag hash
-        hctl1.entrysize = sizeof(buffer_node);//lru node
-        hctl1.hash = tag_hash;
-        g_tenant_info.history_buffer.buffer_map = ShmemInitHash("Hist", 
-        NORMAL_SHARED_BUFFER_NUM, NORMAL_SHARED_BUFFER_NUM, &hctl1, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
+    /* Init tenant HTAB */
+    for(uint i = 0; i < g_tenant_info.tenant_num; ++i){    
+        Assert(g_tenant_info.tenant_buffer_cxt_array[i].valid);
+        no_limit_tenant_buffer_init(&g_tenant_info.tenant_buffer_cxt_array[i], CLOCK, CLOCK, g_tenant_info.tenant_buffer_cxt_array[i].ref_buffer.max_capacity);
     }
-    
+
+    /* Init non tenant buffer */
+    tenant_buffer_init(&g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE);
+    g_tenant_info.non_tenant_buffer_cxt.limit_max = MINIMAL_BUFFER_SIZE;
+
+
+    /* Init evict history buffer */
+    HASHCTL hctl1;
+    memset_s(&hctl1, sizeof(HASHCTL), 0, sizeof(HASHCTL));
+    hctl1.keysize = sizeof(BufferTag);//tag hash
+    hctl1.entrysize = sizeof(buffer_node);//lru node
+    hctl1.hash = tag_hash;
+    g_tenant_info.history_buffer.buffer_map = ShmemInitHash("Hist", 
+    NORMAL_SHARED_BUFFER_NUM, NORMAL_SHARED_BUFFER_NUM, &hctl1, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
+}
+tenant_buffer_cxt* get_thrd_tenant_buffer_cxt(){
+    /* Reattach HTAB for each thrd */
+    tenant_HTAB_init();
+
     if(u_sess && u_sess->proc_cxt.MyProcPort && u_sess->proc_cxt.MyProcPort->user_name){
-        
         if(u_sess->proc_cxt.MyProcPort->user_name[1] == '0'){
-            //ereport(WARNING, (errmsg("User name: %s is new Tenant", u_sess->proc_cxt.MyProcPort->user_name)));                
-            Assert(strlen(u_sess->proc_cxt.MyProcPort->user_name) >= 3 + 1 + 4 + 1 + 2);
             tenant_buffer_cxt* ret = get_tenant_by_name(u_sess->proc_cxt.MyProcPort->user_name);
             return ret;
         }
         if(u_sess->proc_cxt.MyProcPort->user_name[0] == 'e'||u_sess->proc_cxt.MyProcPort->user_name[0] == 'E'){
             //Print all info then kill ourselves
-            uint64 total_hit = 0;
-            uint64 total_miss = 0;
-            ereport(WARNING, (errmsg("=====Tenant Weight Info[Alloc count:%u][MTPR Enable:%s][Tenant free alloc:%u]====="
-                , g_tenant_info.update_count
-                , ENABLE_BUFFER_ADJUST ? "Yes": "No"
-                , g_tenant_info.tenant_free_taken)));
-            for(uint32 i = 0; i < g_tenant_info.tenant_num; i++){
-                tenant_buffer_cxt* temp = &g_tenant_info.tenant_buffer_cxt_array[i];
-                ereport(WARNING, (errmsg("Tenant:[%s], weight:[%f], sla:[%u], Real[H/M:%u/%u%] = [%.2f] Ref[H/M:%u/%u] = [%.2f%] Curr size:[%u]", 
-                temp->tenant_name, 
-                temp->weight,
-                temp->sla,
-                temp->real_buffer.hits,
-                temp->real_buffer.misses,
-                100.0 * (double)(temp->real_buffer.hits) / (double)(temp->real_buffer.hits + temp->real_buffer.misses),
-                temp->ref_buffer.hits,
-                temp->ref_buffer.misses,
-                100.0 * (double)(temp->ref_buffer.hits) / (double)(temp->ref_buffer.hits + temp->ref_buffer.misses),
-                temp->real_buffer.curr_size
-                )));
-                total_hit += temp->real_buffer.hits;
-                total_miss += temp->real_buffer.misses;
-            }
-            ereport(WARNING, (errmsg("Final Hit Rate[H:%u/M:%u] = [%.2f%]",
-                                    total_hit,
-                                    total_miss,
-                                    100.0 *( (double)total_hit / (double) (total_hit + total_miss) )
-                                    )));
+            show_tenant_status();
             Assert(0);
         }
     }
-    tenant_buffer_init(&g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE);
+
     return &g_tenant_info.non_tenant_buffer_cxt;
 }
 #include "utils/dynahash.h"
@@ -3360,34 +3365,48 @@ void UpdateRefBuffer(uint32 access_hash, BufferTag *access_tag, tenant_buffer_cx
     
 }
 
-void UpdateWeight(bool hrd_reweight, uint32 tenant_oid){
+void UpdateWeight(bool hrd_reweight, tenant_buffer_cxt* buffer_cxt){
     const double zero = 0.0000001;
     double total_w = 0;
     uint32 max_sla = 0;
-    tenant_buffer_cxt* buffer_cxt;
+    tenant_buffer_cxt* temp;
     /* Get max sla and max weight */
     for(int i = 0; i < g_tenant_info.tenant_num; i++){
-        buffer_cxt = &g_tenant_info.tenant_buffer_cxt_array[i];
-        max_sla = max_sla > buffer_cxt->sla ? max_sla : buffer_cxt->sla;
-        total_w += buffer_cxt->weight;
+        temp = &g_tenant_info.tenant_buffer_cxt_array[i];
+        max_sla = max_sla > temp->sla ? max_sla : temp->sla;
+        total_w += temp->weight;
     }
-    if(hrd_reweight){
+    if(true){
         /* Do reweight by hrd */
-        if(tenant_oid >= g_tenant_info.tenant_num){
-            ereport(WARNING, (errmsg("Oid err: %u. Current num: %u", tenant_oid, g_tenant_info.tenant_num)));
-        }
-        Assert(tenant_oid < g_tenant_info.tenant_num);
         double sla_factor = (double)buffer_cxt->sla / max_sla;
         double pre_val = buffer_cxt->weight;
         double hrd = GetTenantHRD(buffer_cxt);
         total_w -= buffer_cxt->weight;
         buffer_cxt->weight = zero + buffer_cxt->weight * exp(-1.0 * hrd * sla_factor);
+        if(buffer_cxt->tenant_name[5] == '2'){
+            buffer_cxt->weight = zero + buffer_cxt->weight;
+        }
+        ereport(WARNING, (errmsg("Tenant: %s, weight: %f, sla: %u, Real[H/M:%u/%u] Ref[H/M:%u/%u] HRD: %f, Pre weight: %f, sla factor: %f, Downgrade factor: %f, After weight: %f", 
+            buffer_cxt->tenant_name, 
+            buffer_cxt->weight,
+            buffer_cxt->sla,
+            buffer_cxt->real_buffer.hits,
+            buffer_cxt->real_buffer.misses,
+            buffer_cxt->ref_buffer.hits,
+            buffer_cxt->ref_buffer.misses,
+            hrd,
+            pre_val,
+            sla_factor,
+            exp(-1.0 * hrd * sla_factor),
+            buffer_cxt->weight
+        )));
+        
         total_w += buffer_cxt->weight;
     }
     /* global reweight */
     for(int i = 0; i < g_tenant_info.tenant_num; i++){
-        buffer_cxt = &g_tenant_info.tenant_buffer_cxt_array[i];
-        buffer_cxt->weight = buffer_cxt->weight / total_w;
+        temp = &g_tenant_info.tenant_buffer_cxt_array[i];
+        temp->weight = temp->weight / total_w;
     }
 }
 
@@ -3644,25 +3663,8 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     
     /* We will hold a big damn lock here */
     pthread_mutex_lock(&g_tenant_info.tenant_map_lock);
-    if(g_tenant_info.update_count++ % 1000000 == 0){
-        ereport(WARNING, (errmsg("=====Tenant Weight Info[Alloc count:%u][MTPR Enable:%s][Tenant free alloc:%u]====="
-        , g_tenant_info.update_count
-        , ENABLE_BUFFER_ADJUST ? "Yes": "No"
-        , g_tenant_info.tenant_free_taken)));
-        for(uint32 i = 0; i < g_tenant_info.tenant_num; i++){
-            tenant_buffer_cxt* temp = &g_tenant_info.tenant_buffer_cxt_array[i];
-            ereport(WARNING, (errmsg("Tenant:[%s], weight:[%f], sla:[%u], Real[H/M:%u/%u] Ref[H/M:%u/%u] HRD:[%f] Curr size:[%u]", 
-            temp->tenant_name, 
-            temp->weight,
-            temp->sla,
-            temp->real_buffer.hits,
-            temp->real_buffer.misses,
-            temp->ref_buffer.hits,
-            temp->ref_buffer.misses,
-            GetTenantHRD(temp),
-            temp->real_buffer.curr_size
-            )));
-        }
+    if(g_tenant_info.update_count++ % 50000 == 0){
+        show_tenant_status();
     }
     Assert(!IsSegmentPhysicalRelNode(smgr->smgr_rnode.node));
     
@@ -3750,11 +3752,10 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
             g_tenant_info.history_buffer.curr_size--;
     }
 #endif
-    /* Update weight */
-    UpdateWeight(found_descs, buffer_cxt->tenant_oid);//We should find ? in Hlist?
 #if ENABLE_BUFFER_ADJUST
-    if( (g_tenant_info.tenant_free_taken >= NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE 
-            || g_tenant_info.free_list_empty) 
+    /* Update weight */
+    UpdateWeight(found_descs, buffer_cxt);//We should find ? in Hlist?
+    if( (g_tenant_info.tenant_free_taken >= NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE || g_tenant_info.free_list_empty) 
         && g_tenant_info.tenant_num > 1
         && buffer_cxt->real_buffer.curr_size < buffer_cxt->capacity ){
         if(buffer_cxt->real_buffer.misses > buffer_cxt->ref_buffer.misses){
