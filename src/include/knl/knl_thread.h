@@ -3514,7 +3514,12 @@ typedef struct knl_thrd_context {
     knl_t_ondemand_xlog_copy_context ondemand_xlog_copy_cxt;
     knl_t_rc_context rc_cxt;
 
-    uint32 tenant_id;
+
+    void * thrd_ref_HTAB;
+    void * thrd_hist_HTAB;
+    void * thrd_tenant_map_HTAB;
+    void * thrd_tenant_buffer_cxt;
+
 } knl_thrd_context;
 
 #ifdef ENABLE_MOT

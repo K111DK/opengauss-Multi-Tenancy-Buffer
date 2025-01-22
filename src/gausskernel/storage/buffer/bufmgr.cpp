@@ -3098,209 +3098,27 @@ void show_tenant_status(){
                                     100.0 *( (double)total_hit / (double) (total_hit + total_miss) )
                                     )));
 }
-void buffer_init(buffer* buffer_cxt, uint32 capacity, const char* name, BufferType type, bool first_init){
-    Assert(buffer_cxt!=NULL);
-    Assert(name!=NULL);
-    Assert(type == LRU || type == CLOCK);
-    //Assert(capacity > 0);
-    HASHCTL hctl;
-    int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
+extern void InitRefBuffer(buffer* buffer_cxt, uint32 capacity, const char* name, BufferType type){
+    int ret = memset_s(&buffer_cxt->hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
     securec_check(ret, "\0", "\0");
-    hctl.keysize = sizeof(BufferTag);//tag hash
-    hctl.entrysize = sizeof(buffer_node);//lru node
-    hctl.hash = tag_hash;
-    buffer_cxt->buffer_map = ShmemInitHash(name, 
-        capacity, capacity,
-        &hctl, 
-        HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
-    if(first_init){
-        ereport(WARNING, (errmsg("Create index: %s", name)));
-        buffer_cxt->dummy_head.next = &buffer_cxt->dummy_tail;
-        buffer_cxt->dummy_head.prev = NULL;
-        buffer_cxt->dummy_tail.prev = &buffer_cxt->dummy_head;
-        buffer_cxt->dummy_tail.next = NULL;
-        buffer_cxt->max_capacity = capacity;
-        buffer_cxt->curr_size = 0;
-        buffer_cxt->type = type;
-        buffer_cxt->sweep_hand = NULL;
-    }
-}
-/* Make sure held some clock */
-void tenant_buffer_init(tenant_buffer_cxt* tenant_buffer, BufferType real_buffer_type,
-BufferType ref_buffer_type, uint32 ref_capacity){
-    bool first_init = tenant_buffer->valid == false;
-
-    /* Copy name  */
-    char index_name[TENANT_NAME_LEN];
-    strcpy_s(index_name + 1, TENANT_NAME_LEN - 1, tenant_buffer->tenant_name);
-    index_name[TENANT_NAME_LEN - 1] = '\0';
-    
-    /* Init Real Index */
-    index_name[0] = 'R';
-    buffer_init(&tenant_buffer->real_buffer, ref_capacity, index_name, real_buffer_type, first_init);
-    
-    /* Init Ref Index */
-    index_name[0] = 'F';
-    buffer_init(&tenant_buffer->ref_buffer, ref_capacity, index_name, ref_buffer_type, first_init);
-    
-    if(first_init){
-        pthread_mutex_init(&tenant_buffer->tenant_buffer_lock, NULL);
-        tenant_buffer->capacity = ref_capacity;
-        tenant_buffer->weight = 10.0;
-    }
-
-    tenant_buffer->valid = true;
-}
-void no_limit_tenant_buffer_init(tenant_buffer_cxt* tenant_buffer, BufferType real_buffer_type, BufferType ref_buffer_type, uint32 ref_capacity){
-#if !ENABLE_BUFFER_ADJUST
-    tenant_buffer_init(tenant_buffer, real_buffer_type, ref_buffer_type, ref_capacity);
-    return;
-#endif
-    bool first_init = tenant_buffer->valid == false;
-
-    /* Copy name  */
-    char index_name[TENANT_NAME_LEN];
-    strcpy_s(index_name + 1, TENANT_NAME_LEN - 1, tenant_buffer->tenant_name);
-    index_name[TENANT_NAME_LEN - 1] = '\0';
-    
-    /* Init Real Index */
-    index_name[0] = 'R';
-    buffer_init(&tenant_buffer->real_buffer, NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE, index_name, real_buffer_type, first_init);
-    
-    /* Init Ref Index */
-    index_name[0] = 'F';
-    buffer_init(&tenant_buffer->ref_buffer, ref_capacity, index_name, ref_buffer_type, first_init);
-    
-    if(first_init){
-        pthread_mutex_init(&tenant_buffer->tenant_buffer_lock, NULL);
-        tenant_buffer->capacity = NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE;
-        tenant_buffer->weight = 10.0;
-    }
-
-    tenant_buffer->valid = true;
-}
-tenant_buffer_cxt* get_tenant_by_name(const char* name){
-    bool tenant_found = false;
-    tenant_name_mapping* entry = (tenant_name_mapping*)hash_search(g_tenant_info.tenant_map, 
-    name, HASH_ENTER, &tenant_found);
-    
-    /* init entry */
-    if (!tenant_found) {
-
-            /* Assign new Tenant oid */
-            entry->tenant_oid = g_tenant_info.tenant_num;
-            tenant_buffer_cxt* new_tenant = &g_tenant_info.tenant_buffer_cxt_array[g_tenant_info.tenant_num];
-            g_tenant_info.tenant_num++;
-
-            /* Cpy tenant name*/
-            Assert(!new_tenant->valid);
-            strcpy_s(new_tenant->tenant_name, TENANT_NAME_LEN, name);
-            
-            //Tenant name format: T[0-9][0-9](tenant_id) + _ + [0-9][0-9][0-9][0-9](promised_memory in MB) + _ + [0-9][0-9](SLA)
-            uint32 tenant_id = (name[1] - '0') * 10 + (name[2] - '0');
-            uint32 promised_memory = (name[4] - '0') * 1000 + (name[5] - '0') * 100 + (name[6] - '0') * 10 + (name[7] - '0');
-            uint32 sla = (name[9] - '0') * 10 + (name[10] - '0');
-            uint32 ref_capacity = ( promised_memory * 1024 * 1024) / BLCKSZ;
-            Assert(sla > 0);
-            //Init pool
-            ereport(WARNING,
-            (errmsg("Tenant [%s] added, Id: [%u], Promised mem: [%u mb][%u blk] , SLA: [%u]", name, tenant_id, promised_memory, ref_capacity, sla)));
-            no_limit_tenant_buffer_init(new_tenant, CLOCK, CLOCK, ref_capacity);
-            new_tenant->sla = sla;
-            g_tenant_info.total_promised += ref_capacity;
-            ereport(WARNING,
-            (errmsg("Current Total Promised:[%u] Actual[%u] Active Tenant Num[%u]"
-            , g_tenant_info.total_promised
-            , NORMAL_SHARED_BUFFER_NUM
-            , g_tenant_info.tenant_num)));
-
-            {
-                uint64 total_actual = (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE);
-                uint64 total_promised = (g_tenant_info.total_promised - MINIMAL_BUFFER_SIZE);
-                for(uint i = 0; i < g_tenant_info.tenant_num; ++i){
-
-                    /* Every time new tenant in, reset the weight */
-                    g_tenant_info.tenant_buffer_cxt_array[i].weight = 1.0 / g_tenant_info.tenant_num;
-
-#if ENABLE_BUFFER_ADJUST
-                g_tenant_info.tenant_buffer_cxt_array[i].limit_max = g_tenant_info.tenant_buffer_cxt_array[i].real_buffer.max_capacity;
-#else
-                uint32 max_cap = g_tenant_info.tenant_buffer_cxt_array[i].real_buffer.max_capacity;    
-                g_tenant_info.tenant_buffer_cxt_array[i].limit_max = total_promised > total_actual ? (uint32)(( (uint64)max_cap * total_actual) / total_promised) : max_cap;
-                ereport(WARNING, (errmsg("Tenant[%s] Promised:[%u] Actual[%u] Active Tenant Num[%u]"
-                , g_tenant_info.tenant_buffer_cxt_array[i].tenant_name
-                , g_tenant_info.tenant_buffer_cxt_array[i].real_buffer.max_capacity
-                , g_tenant_info.tenant_buffer_cxt_array[i].limit_max
-                , g_tenant_info.tenant_num)));
-#endif
-                }
-            }
-
-    
-    }else{
-        Assert(entry->tenant_oid < g_tenant_info.tenant_num);
-        Assert(g_tenant_info.tenant_buffer_cxt_array[entry->tenant_oid].valid);
-    }
-    return &g_tenant_info.tenant_buffer_cxt_array[entry->tenant_oid];
-}
-void tenant_HTAB_init(){
-    /* Init tenant map */
-    HASHCTL hctl;
-    int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
-    securec_check(ret, "\0", "\0");
-    hctl.keysize = TENANT_NAME_LEN;
-    hctl.entrysize = sizeof(tenant_name_mapping); // oid
-    hctl.hash = string_hash;
-    g_tenant_info.tenant_map = ShmemInitHash("tenant info hash", 
-    64, 64, &hctl, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
-
-    /* Init tenant HTAB */
-    for(uint i = 0; i < g_tenant_info.tenant_num; ++i){    
-        Assert(g_tenant_info.tenant_buffer_cxt_array[i].valid);
-        no_limit_tenant_buffer_init(&g_tenant_info.tenant_buffer_cxt_array[i], CLOCK, CLOCK, g_tenant_info.tenant_buffer_cxt_array[i].ref_buffer.max_capacity);
-    }
-
-    /* Init non tenant buffer */
-    tenant_buffer_init(&g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE);
-    g_tenant_info.non_tenant_buffer_cxt.limit_max = MINIMAL_BUFFER_SIZE;
-
-
-    /* Init evict history buffer */
-    HASHCTL hctl1;
-    memset_s(&hctl1, sizeof(HASHCTL), 0, sizeof(HASHCTL));
-    hctl1.keysize = sizeof(BufferTag);//tag hash
-    hctl1.entrysize = sizeof(buffer_node);//lru node
-    hctl1.hash = tag_hash;
-    g_tenant_info.history_buffer.buffer_map = ShmemInitHash("Hist", 
-    NORMAL_SHARED_BUFFER_NUM, NORMAL_SHARED_BUFFER_NUM, &hctl1, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
-}
-tenant_buffer_cxt* get_thrd_tenant_buffer_cxt(){
-    /* Reattach HTAB for each thrd */
-    tenant_HTAB_init();
-
-    if(u_sess && u_sess->proc_cxt.MyProcPort && u_sess->proc_cxt.MyProcPort->user_name){
-        if(u_sess->proc_cxt.MyProcPort->user_name[1] == '0'){
-            tenant_buffer_cxt* ret = get_tenant_by_name(u_sess->proc_cxt.MyProcPort->user_name);
-            return ret;
-        }
-        if(u_sess->proc_cxt.MyProcPort->user_name[0] == 'e'||u_sess->proc_cxt.MyProcPort->user_name[0] == 'E'){
-            //Print all info then kill ourselves
-            show_tenant_status();
-            Assert(0);
-        }
-    }
-
-    return &g_tenant_info.non_tenant_buffer_cxt;
+    buffer_cxt->hctl.keysize = sizeof(BufferTag);//tag hash
+    buffer_cxt->hctl.entrysize = sizeof(buffer_node);//lru node
+    buffer_cxt->hctl.hash = tag_hash;
+    buffer_cxt->dummy_head.next = &buffer_cxt->dummy_tail;
+    buffer_cxt->dummy_head.prev = NULL;
+    buffer_cxt->dummy_tail.prev = &buffer_cxt->dummy_head;
+    buffer_cxt->dummy_tail.next = NULL;
+    buffer_cxt->max_capacity = capacity;
+    buffer_cxt->curr_size = 0;
+    buffer_cxt->type = type;
 }
 #include "utils/dynahash.h"
-
-
 double GetTenantHRD(tenant_buffer_cxt* buffer_cxt){
 
-    uint32 ref_hits = buffer_cxt->ref_buffer.hits;
-    uint32 ref_misses = buffer_cxt->ref_buffer.misses;
-    uint32 real_hits = buffer_cxt->real_buffer.hits;
-    uint32 real_misses = buffer_cxt->real_buffer.misses;
+    uint64 ref_hits = buffer_cxt->ref_buffer.hits;
+    uint64 ref_misses = buffer_cxt->ref_buffer.misses;
+    uint64 real_hits = buffer_cxt->real_hits;
+    uint64 real_misses = buffer_cxt->real_misses;
     
     if((ref_hits + ref_misses) == 0 || (real_hits + real_misses) == 0){
         return 0;
@@ -3310,22 +3128,19 @@ double GetTenantHRD(tenant_buffer_cxt* buffer_cxt){
 }
 
 /* Currently we do it in LRU manner */
-void UpdateRefBuffer(uint32 access_hash, BufferTag *access_tag, tenant_buffer_cxt* buffer_cxt){
-    if(buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt){
+void UpdateRefBuffer(uint32 access_hash, BufferTag *access_tag, buffer* buffer_cxt){
+    if(t_thrd.thrd_ref_HTAB == NULL || buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt){
         return;
     }
     
-    BufferType type = buffer_cxt->ref_buffer.type;
-    buffer *ref = &buffer_cxt->ref_buffer;
-    bool found_descs = false;   
-    
-    buffer_node* entry = (buffer_node*)buf_hash_operate<HASH_FIND>(ref->buffer_map, access_tag, access_hash, &found_descs);
+    bool hit = false;
+    bool found_descs = false;
+    buffer* ref = &buffer_cxt->ref_buffer;
+    pthread_mutex_lock(&buffer_cxt->ref_buffer.lock);   
+    buffer_node* entry = (buffer_node*)buf_hash_operate<HASH_FIND>((HTAB*)t_thrd.thrd_ref_HTAB, access_tag, access_hash, &found_descs);
     
     if(found_descs){
-        ref->hits++;
-        
-        /* Update buffer struct */
-        
+        ref->hits++;        
         /* Remove */
         entry->next->prev = entry->prev;
         entry->prev->next = entry->next;
@@ -3335,11 +3150,11 @@ void UpdateRefBuffer(uint32 access_hash, BufferTag *access_tag, tenant_buffer_cx
         ref->dummy_head.next->prev = entry;
         ref->dummy_head.next = entry;
         entry->prev = &ref->dummy_head;
+        pthread_mutex_unlock(&buffer_cxt->ref_buffer.lock);  
         return;
     }
 
     ref->misses++;
-
     /* Evict if needed */
     if(ref->curr_size >= ref->max_capacity){
         buffer_node* tail = ref->dummy_tail.prev;
@@ -3348,14 +3163,14 @@ void UpdateRefBuffer(uint32 access_hash, BufferTag *access_tag, tenant_buffer_cx
         prev->next = &ref->dummy_tail;
         ref->dummy_tail.prev = prev;
 
-        buf_hash_operate<HASH_REMOVE>(ref->buffer_map, &tail->key, BufTableHashCode(&tail->key), &found_descs);
+        buf_hash_operate<HASH_REMOVE>((HTAB*)t_thrd.thrd_ref_HTAB, &tail->key, BufTableHashCode(&tail->key), &found_descs);
         Assert(found_descs);
         ref->curr_size--;
     }
     
     Assert(ref->curr_size < ref->max_capacity);
     /* Enter new hash */
-    entry = (buffer_node*)buf_hash_operate<HASH_ENTER>(ref->buffer_map, access_tag, access_hash, &found_descs);
+    entry = (buffer_node*)buf_hash_operate<HASH_ENTER>((HTAB*)t_thrd.thrd_ref_HTAB, access_tag, access_hash, &found_descs);
     Assert(!found_descs);
 
     
@@ -3365,21 +3180,35 @@ void UpdateRefBuffer(uint32 access_hash, BufferTag *access_tag, tenant_buffer_cx
     ref->dummy_head.next = entry;
     entry->prev = &ref->dummy_head;
     ref->curr_size++;
+    pthread_mutex_unlock(&buffer_cxt->ref_buffer.lock);
     
 }
 
-void UpdateWeight(bool hrd_reweight, tenant_buffer_cxt* buffer_cxt){
-    const double zero = 0.0000001;
-    double total_w = 0;
-    uint32 max_sla = 0;
-    tenant_buffer_cxt* temp;
-    /* Get max sla and max weight */
-    for(int i = 0; i < g_tenant_info.tenant_num; i++){
-        temp = &g_tenant_info.tenant_buffer_cxt_array[i];
-        max_sla = max_sla > temp->sla ? max_sla : temp->sla;
-        total_w += temp->weight;
+void UpdateWeight(BufferTag *access_tag, uint32 access_hash){
+    bool found_descs = false;
+    pthread_mutex_lock(&g_tenant_info.hist_lock);
+    buffer_node *hist_node = (buffer_node *)buf_hash_operate<HASH_FIND>((HTAB*)t_thrd.thrd_hist_HTAB, 
+    access_tag, access_hash, &found_descs);
+    if(found_descs){
+            bool del;
+            hist_node->next->prev = hist_node->prev;
+            hist_node->prev->next = hist_node->next;
+            buf_hash_operate<HASH_REMOVE>(g_tenant_info.history_buffer.buffer_map, &new_tag, new_hash, &del);
+            g_tenant_info.history_buffer.curr_size--;
     }
-    if(hrd_reweight){
+    pthread_mutex_unlock(&g_tenant_info.hist_lock);
+    
+    if(found_descs){
+        const double zero = 0.0000001;
+        double total_w = 0;
+        uint32 max_sla = 0;
+        tenant_buffer_cxt* temp;
+        /* Get max sla and max weight */
+        for(int i = 0; i < g_tenant_info.tenant_num; i++){
+            temp = &g_tenant_info.tenant_buffer_cxt_array[i];
+            max_sla = max_sla > temp->sla ? max_sla : temp->sla;
+            total_w += temp->weight;
+        }
         /* Do reweight by hrd */
         double sla_factor = (double)buffer_cxt->sla / max_sla;
         double pre_val = buffer_cxt->weight;
@@ -3387,11 +3216,12 @@ void UpdateWeight(bool hrd_reweight, tenant_buffer_cxt* buffer_cxt){
         total_w -= buffer_cxt->weight;
         buffer_cxt->weight = zero + buffer_cxt->weight * exp(-1.0 * hrd * sla_factor);        
         total_w += buffer_cxt->weight;
-    }
-    /* global reweight */
-    for(int i = 0; i < g_tenant_info.tenant_num; i++){
-        temp = &g_tenant_info.tenant_buffer_cxt_array[i];
-        temp->weight = temp->weight / total_w;
+
+        /* global reweight */
+        for(int i = 0; i < g_tenant_info.tenant_num; i++){
+            temp = &g_tenant_info.tenant_buffer_cxt_array[i];
+            temp->weight = temp->weight / total_w;
+        }
     }
 }
 

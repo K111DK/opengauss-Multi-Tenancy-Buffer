@@ -67,6 +67,143 @@ const int PAGE_QUEUE_SLOT_MULTI_NBUFFERS = 5;
  * This is called once during shared-memory initialization (either in the
  * postmaster, or in a standalone backend).
  */
+tenant_buffer_cxt* GetThrdTenant(char* name){
+    tenant_buffer_cxt* thrd_tenant = NULL;
+    bool tenant_found = false;
+    tenant_name_mapping* entry = (tenant_name_mapping*)hash_search(t_thrd.thrd_tenant_map_HTAB, name, HASH_ENTER, &tenant_found);
+    /* init entry */
+    if (!tenant_found) {
+            /* Assign new Tenant oid */
+            tenant_buffer_cxt* new_tenant = &g_tenant_info.tenant_buffer_cxt_array[g_tenant_info.tenant_num];
+            entry->tenant_cxt = new_tenant;
+            g_tenant_info.tenant_num++;
+            thrd_tenant = new_tenant;
+            
+            //Tenant name format: T[0-9][0-9](tenant_id) + _ + [0-9][0-9][0-9][0-9](promised_memory in MB) + _ + [0-9][0-9](SLA)
+            uint32 tenant_id = (name[1] - '0') * 10 + (name[2] - '0');
+            uint32 promised_memory = (name[4] - '0') * 1000 + (name[5] - '0') * 100 + (name[6] - '0') * 10 + (name[7] - '0');
+            uint32 sla = (name[9] - '0') * 10 + (name[10] - '0');
+            uint32 ref_capacity = ( promised_memory * 1024 * 1024) / BLCKSZ;
+            
+            // We should init ref buffer here
+            new_tenant->sla = sla;
+            new_tenant->tenant_oid = entry->tenant_oid;
+            new_tenant->max_real_size = NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE;
+            g_tenant_info.total_promised += ref_capacity;
+            strcpy_s(new_tenant->tenant_name, TENANT_NAME_LEN, name);
+            InitRefBuffer(&new_tenant->ref_buffer, ref_capacity, name, LRU);
+            
+            
+            ereport(WARNING,
+            (errmsg("Tenant [%s] added, Id: [%u], Promised mem: [%u mb][%u blk] , SLA: [%u]", name, tenant_id, promised_memory, ref_capacity, sla)));
+            ereport(WARNING,
+            (errmsg("Current Total Promised:[%u] Actual[%u] Active Tenant Num[%u]", g_tenant_info.total_promised, NORMAL_SHARED_BUFFER_NUM, g_tenant_info.tenant_num)));
+
+            {
+                uint64 total_actual = (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE);
+                uint64 total_promised = (g_tenant_info.total_promised - MINIMAL_BUFFER_SIZE);
+                for(uint i = 0; i < g_tenant_info.tenant_num; ++i){
+
+                /* Every time new tenant in, reset the weight */
+                g_tenant_info.tenant_buffer_cxt_array[i].weight = 1.0 / g_tenant_info.tenant_num;
+
+#if ENABLE_BUFFER_ADJUST
+                g_tenant_info.tenant_buffer_cxt_array[i].limit_max = new_tenant->max_real_size;
+#else
+                uint32 max_cap = g_tenant_info.tenant_buffer_cxt_array[i].real_buffer.max_capacity;    
+                g_tenant_info.tenant_buffer_cxt_array[i].limit_max = total_promised > total_actual ? (uint32)(( (uint64)max_cap * total_actual) / total_promised) : max_cap;
+                ereport(WARNING, (errmsg("Tenant[%s] Promised:[%u] Actual[%u] Active Tenant Num[%u]"
+                , g_tenant_info.tenant_buffer_cxt_array[i].tenant_name
+                , g_tenant_info.tenant_buffer_cxt_array[i].real_buffer.max_capacity
+                , g_tenant_info.tenant_buffer_cxt_array[i].limit_max
+                , g_tenant_info.tenant_num)));
+#endif
+                }
+            }
+    }else{
+        thrd_tenant = entry->tenant_cxt;
+    }
+    return thrd_tenant;
+}
+void ThrdGetRefBufferIndex(tenant_buffer_cxt* buffer_cxt){
+    t_thrd.thrd_ref_HTAB = (void*)ShmemInitHash(buffer_cxt->tenant_name, 
+        buffer_cxt->max_ref_size, buffer_cxt->max_ref_size,
+        &buffer_cxt->ref_buffer.hctl, 
+        HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
+}
+void InitTenantPrivateCxt(){
+    bool kill_db = false;
+    bool name_valid = u_sess && u_sess->proc_cxt.MyProcPort && u_sess->proc_cxt.MyProcPort->user_name;
+    if(name_valid){
+        name_valid = u_sess->proc_cxt.MyProcPort->user_name[0] == 't' || u_sess->proc_cxt.MyProcPort->user_name[0] == 'T';  ;
+        kill_db = u_sess->proc_cxt.MyProcPort->user_name[0] == 'e'||u_sess->proc_cxt.MyProcPort->user_name[0] == 'E';
+    }
+    if(kill_db){
+        show_tenant_status();
+    }
+    tenant_buffer_cxt* thrd_tenant = NULL;
+    const char* curr_thrd_name = name_valid ? u_sess->proc_cxt.MyProcPort->user_name : "Non Tenant";
+    if(name_valid){
+        thrd_tenant = GetThrdTenant(curr_thrd_name);
+    }else{
+        thrd_tenant = &g_tenant_info.non_tenant_buffer_cxt;
+    }
+    /* Attach Ref buffer Hist */
+    if(name_valid){
+        ThrdGetRefBufferIndex(thrd_tenant);
+    }else{
+        t_thrd.thrd_ref_HTAB = NULL;
+    }
+}
+void InitTenantMap(){
+    HASHCTL hctl;
+    int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
+    securec_check(ret, "\0", "\0");
+    hctl.keysize = TENANT_NAME_LEN;
+    hctl.entrysize = sizeof(tenant_name_mapping); // oid
+    hctl.hash = string_hash;
+    t_thrd.thrd_tenant_map_HTAB = ShmemInitHash("tenant info hash", 
+    64, 64, &hctl, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
+}
+void InitNonTenantBuffer(){
+    bool found_descs = false;
+    tenant_name_mapping* entry = (tenant_name_mapping*)hash_search(t_thrd.thrd_tenant_map_HTAB, "Non Tenant", HASH_ENTER, &found_descs);
+    if(!found_descs){
+        entry->tenant_cxt = &g_tenant_info.non_tenant_buffer_cxt;
+        g_tenant_info.non_tenant_buffer_cxt.max_real_size = MINIMAL_BUFFER_SIZE;
+        g_tenant_info.non_tenant_buffer_cxt.curr_real_size = 0;
+    }
+}
+void InitBufferPool(bool *found_descs){
+    g_tenant_info.buffer_pool = (Buffer *)
+    ShmemInitStruct("MultiTenantBuffers", NORMAL_SHARED_BUFFER_NUM * sizeof(Buffer), found_descs);
+    if(!(*found_descs)){
+        /* Only happen once */
+        MemSet((char*)g_tenant_info.buffer_pool, 0, NORMAL_SHARED_BUFFER_NUM * sizeof(Buffer));
+        INIT_CANDIDATE_LIST(g_tenant_info.buffer_list, g_tenant_info.buffer_pool, NORMAL_SHARED_BUFFER_NUM ,0 ,0);
+        g_tenant_info.buffer_list.buf_id_start = 0;
+        for(int buf_id = 0; buf_id < NvmBufferStartID; buf_id++){
+            buf_push(&g_tenant_info.buffer_list, buf_id);
+        }
+    }
+}
+static void InitTenantHist(){
+    HASHCTL hctl1;
+    memset_s(&hctl1, sizeof(HASHCTL), 0, sizeof(HASHCTL));
+    hctl1.keysize = sizeof(BufferTag);//tag hash
+    hctl1.entrysize = sizeof(buffer_node);//lru node
+    hctl1.hash = tag_hash;
+    t_thrd.thrd_hist_HTAB = ShmemInitHash("Hist", 
+    NORMAL_SHARED_BUFFER_NUM, NORMAL_SHARED_BUFFER_NUM, &hctl1, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
+    if(!found_descs){
+        g_tenant_info.history_buffer.dummy_head.next = &g_tenant_info.history_buffer.dummy_tail;
+        g_tenant_info.history_buffer.dummy_head.prev = NULL;
+        g_tenant_info.history_buffer.dummy_tail.prev = &g_tenant_info.history_buffer.dummy_head;
+        g_tenant_info.history_buffer.dummy_tail.next = NULL;
+        g_tenant_info.history_buffer.max_capacity = NORMAL_SHARED_BUFFER_NUM;
+        g_tenant_info.history_buffer.curr_size = 0;
+    }
+}
 static void buf_push(CandidateList *list, int buf_id)
 {
     uint32 list_size = list->cand_list_size;
@@ -84,84 +221,22 @@ static void buf_push(CandidateList *list, int buf_id)
     list->cand_buf_list[tail_loc] = buf_id;
     (void)pg_atomic_fetch_add_u64(&list->tail, 1);
 }
-// static void hlist_buffer_init(buffer* buffer_cxt, uint32 capacity, const char* name, BufferType type){
-//     Assert(buffer_cxt!=NULL);
-//     Assert(name!=NULL);
-//     Assert(type == LRU || type == CLOCK);
-//     Assert(capacity > 0);
-//     HASHCTL hctl;
-//     int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
-//     securec_check(ret, "\0", "\0");
-//     hctl.keysize = sizeof(BufferTag);//tag hash
-//     hctl.entrysize = sizeof(buffer_node);//lru node
-//     hctl.hash = tag_hash;
-//     buffer_cxt->buffer_map = ShmemInitHash(name, 
-//         capacity, capacity, 
-//         &hctl, 
-//         HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
-    
-//     buffer_cxt->dummy_head.next = &buffer_cxt->dummy_tail;
-//     buffer_cxt->dummy_head.prev = NULL;
-//     buffer_cxt->dummy_tail.prev = &buffer_cxt->dummy_head;
-//     buffer_cxt->dummy_tail.next = NULL;
-//     buffer_cxt->max_capacity = capacity;
-//     buffer_cxt->curr_size = 0;
-//     buffer_cxt->type = type;
-// }
 void InitMultiTenantBufferPool(void){
-
-    HASHCTL hctl;
-    int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
-    securec_check(ret, "\0", "\0");
-    hctl.keysize = TENANT_NAME_LEN;
-    hctl.entrysize = sizeof(tenant_name_mapping); // oid
-    hctl.hash = string_hash;
-    g_tenant_info.tenant_map = ShmemInitHash("tenant info hash", 
-    64, 64, &hctl, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
+    /* Init thread tenant map */
+    InitTenantMap();
 
     bool found_descs = false;  
     /* Free pool init */
-    g_tenant_info.buffer_pool = (Buffer *)
-    ShmemInitStruct("MultiTenantBuffers", NORMAL_SHARED_BUFFER_NUM * sizeof(Buffer), &found_descs);
-    if(!found_descs){
-        /* Only happen once */
-        MemSet((char*)g_tenant_info.buffer_pool, 0, NORMAL_SHARED_BUFFER_NUM * sizeof(Buffer));
-        INIT_CANDIDATE_LIST(g_tenant_info.buffer_list, g_tenant_info.buffer_pool, NORMAL_SHARED_BUFFER_NUM ,0 ,0);
-        g_tenant_info.buffer_list.buf_id_start = 0;
-        for(int buf_id = 0; buf_id < NvmBufferStartID; buf_id++){
-            buf_push(&g_tenant_info.buffer_list, buf_id);
-        }
-    }
-
+    InitBufferPool(&found_descs);
 
     /* Evict history list should be fifo */
-    HASHCTL hctl1;
-    memset_s(&hctl1, sizeof(HASHCTL), 0, sizeof(HASHCTL));
-    hctl1.keysize = sizeof(BufferTag);//tag hash
-    hctl1.entrysize = sizeof(buffer_node);//lru node
-    hctl1.hash = tag_hash;
-    g_tenant_info.history_buffer.buffer_map = ShmemInitHash("Hist", 
-    NORMAL_SHARED_BUFFER_NUM, NORMAL_SHARED_BUFFER_NUM, &hctl1, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
-    if(!found_descs){
-        g_tenant_info.history_buffer.dummy_head.next = &g_tenant_info.history_buffer.dummy_tail;
-        g_tenant_info.history_buffer.dummy_head.prev = NULL;
-        g_tenant_info.history_buffer.dummy_tail.prev = &g_tenant_info.history_buffer.dummy_head;
-        g_tenant_info.history_buffer.dummy_tail.next = NULL;
-        g_tenant_info.history_buffer.max_capacity = NORMAL_SHARED_BUFFER_NUM;
-        g_tenant_info.history_buffer.curr_size = 0;
-    }
-    
-    /* Non tenant buffer */
-    tenant_name_mapping* entry = (tenant_name_mapping*)hash_search(g_tenant_info.tenant_map, "Non Tenant Buffer", HASH_ENTER, &found_descs);
-    if (!found_descs) {
-        entry->tenant_oid = UINT32_MAX;
-        pthread_mutex_init(&g_tenant_info.tenant_map_lock, NULL);
-        /* Backup buffer */
-        strcpy_s(g_tenant_info.non_tenant_buffer_cxt.tenant_name, TENANT_NAME_LEN, "Non Tenant Buffer");
-        tenant_buffer_init(&g_tenant_info.non_tenant_buffer_cxt, CLOCK, CLOCK, MINIMAL_BUFFER_SIZE);
-        g_tenant_info.non_tenant_buffer_cxt.tenant_oid = UINT32_MAX;
-        g_tenant_info.total_promised += MINIMAL_BUFFER_SIZE;
-    }
+    InitTenantHist();
+
+    /* Non-Tenant Buffer */
+    InitNonTenantBuffer();
+
+    /* Init tenant buffer */
+    InitTenantPrivateCxt();    
 }
 
 
@@ -184,6 +259,12 @@ void InitBufferPool(void)
         ShmemInitStruct("Buffer Descriptors Extra",
                         TOTAL_BUFFER_NUM * sizeof(BufferDescExtra) + PG_CACHE_LINE_SIZE,
                         &found_buf_extra));
+
+#if ENABLE_MULTI_TENANTCY
+        /* We make sure this won't exec twice */
+        InitMultiTenantBufferPool();
+#endif
+
 
     /* Init candidate buffer list and candidate buffer free map */
     candidate_buf_init();
@@ -257,12 +338,6 @@ void InitBufferPool(void)
         /* note: this path is only taken in EXEC_BACKEND case */
     } else {
 
-#if ENABLE_MULTI_TENANTCY
-        /* We make sure this won't exec twice */
-        ereport(WARNING, (errmsg("Total shared buffer num: %d", NORMAL_SHARED_BUFFER_NUM)));
-        InitMultiTenantBufferPool();
-#endif
-
         int i;
 
         /*
@@ -283,6 +358,11 @@ void InitBufferPool(void)
             buf->extra->aio_in_progress = false;
             buf->extra->dirty_queue_loc = PG_UINT64_MAX;
             buf->extra->encrypt = false;
+
+            buf->prev = NULL;
+            buf->next = NULL;
+            buf->tenantOid = UINT32_MAX;
+            
         }
         g_instance.bgwriter_cxt.rel_hashtbl_lock = LWLockAssign(LWTRANCHE_UNLINK_REL_TBL);
         g_instance.bgwriter_cxt.rel_one_fork_hashtbl_lock = LWLockAssign(LWTRANCHE_UNLINK_REL_FORK_TBL);
