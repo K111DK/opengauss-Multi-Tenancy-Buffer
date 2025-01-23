@@ -339,15 +339,15 @@ retry:
     int try_get_loc_times = max_buffer_can_use;
     pthread_mutex_lock(&buffer_cxt->tenant_buffer_lock);
     for(;;){        
-        if(buffer_cxt->dummy_head.next == &buffer_cxt->dummy_tail){
+        if(buffer_cxt->real_dummy_head.next == &buffer_cxt->real_dummy_tail){
             ereport(WARNING, ((errmsg("no unpinned buffers available"))));
             Assert(0);
         }
         if(buffer_cxt->sweep_hand == NULL){
-            buffer_cxt->sweep_hand = buffer_cxt->dummy_head.next;
+            buffer_cxt->sweep_hand = buffer_cxt->real_dummy_head.next;
         }
-        if(buffer_cxt->sweep_hand == &buffer_cxt->dummy_tail){
-            buffer_cxt->sweep_hand = buffer_cxt->dummy_head.next;
+        if(buffer_cxt->sweep_hand == &buffer_cxt->real_dummy_tail){
+            buffer_cxt->sweep_hand = buffer_cxt->real_dummy_head.next;
         }
         buf = buffer_cxt->sweep_hand;
         if (!retryLockBufHdr(buf, &local_buf_state)) {
@@ -384,7 +384,7 @@ retry:
             UnlockBufHdr(buf, local_buf_state);
             pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
 
-            if (am_standby && u_sess->attr.attr_storage.shared_buffers_fraction < 1.0) {
+            if (u_sess->attr.attr_storage.shared_buffers_fraction < 1.0) {
                 ereport(WARNING, (errmsg("no unpinned buffers available")));
                 u_sess->attr.attr_storage.shared_buffers_fraction =
                     Min(u_sess->attr.attr_storage.shared_buffers_fraction + 0.1, 1.0);

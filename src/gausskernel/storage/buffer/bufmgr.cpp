@@ -3075,19 +3075,21 @@ void show_tenant_status(){
     for(uint32 i = 0; i < g_tenant_info.tenant_num; i++){
                 pthread_spin_lock(&g_tenant_info.tenant_buffer_cxt_array[i].hit_stat_lock);
                 tenant_buffer_cxt* temp = &g_tenant_info.tenant_buffer_cxt_array[i];
+                
                 ereport(WARNING, (errmsg("Tenant:[%s], weight:[%f], sla:[%u], HRD = [%f], Real[H/M:%u/%u] = [%.2f%] Ref[H/M:%u/%u] = [%.2f%] Curr size:[%u]", 
-                temp->tenant_name, 
-                temp->weight,
-                temp->sla,
-                GetTenantHRD(temp),
-                temp->real_hits,
-                temp->real_misses,
-                100.0 * (double)(temp->real_hits) / (double)(temp->real_hits + temp->real_misses),
-                temp->ref_hits,
-                temp->ref_misses,
-                100.0 * (double)(temp->ref_hits) / (double)(temp->ref_hits + temp->ref_misses),
-                temp->curr_ref_size,
-                )));
+                    temp->tenant_name, 
+                    temp->weight,
+                    temp->sla,
+                    GetTenantHRD(temp),
+                    temp->real_hits,
+                    temp->real_misses,
+                    100.0 * (double)(temp->real_hits) / (double)(temp->real_hits + temp->real_misses),
+                    temp->ref_hits,
+                    temp->ref_misses,
+                    100.0 * (double)(temp->ref_hits) / (double)(temp->ref_hits + temp->ref_misses),
+                    temp->curr_ref_size))
+                );
+
                 total_hit += temp->real_hits;
                 total_miss += temp->real_misses;
                 pthread_spin_unlock(&g_tenant_info.tenant_buffer_cxt_array[i].hit_stat_lock);
@@ -3118,11 +3120,11 @@ double GetTenantHRD(tenant_buffer_cxt* buffer_cxt){
 bool UpdateRefBuffer(uint32 access_hash, BufferTag *access_tag){
     tenant_buffer_cxt* buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
     if(t_thrd.thrd_ref_HTAB == NULL || buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt){
-        return;
+        return false;
     }
     bool hit = false;
     bool found_descs = false;
-    pthread_mutex_lock(&buffer_cxt->ref_lock);
+    pthread_mutex_lock(&buffer_cxt->tenant_ref_buffer_lock);
     buffer_node* entry = (buffer_node*)buf_hash_operate<HASH_FIND>((HTAB*)t_thrd.thrd_ref_HTAB, access_tag, access_hash, &found_descs);
     
     if(found_descs){
@@ -3136,7 +3138,7 @@ bool UpdateRefBuffer(uint32 access_hash, BufferTag *access_tag){
         buffer_cxt->ref_dummy_head.next->prev = entry;
         buffer_cxt->ref_dummy_head.next = entry;
         entry->prev = &buffer_cxt->ref_dummy_head;
-        pthread_mutex_unlock(&buffer_cxt->ref_lock);
+        pthread_mutex_unlock(&buffer_cxt->tenant_ref_buffer_lock);
         return hit;
     }
 
@@ -3161,11 +3163,11 @@ bool UpdateRefBuffer(uint32 access_hash, BufferTag *access_tag){
     buffer_cxt->ref_dummy_head.next = entry;
     entry->prev = &buffer_cxt->ref_dummy_head;
     buffer_cxt->curr_ref_size++;
-    pthread_mutex_unlock(&buffer_cxt->ref_lock);
+    pthread_mutex_unlock(&buffer_cxt->tenant_ref_buffer_lock);
     return hit;
 }
 void UpdateHitRateStat(uint32 access_hash, BufferTag *access_tag, bool found){
-    bool ref_hit = UpdateRefBuffer(access_hash, access_tag, buffer_cxt);
+    bool ref_hit = UpdateRefBuffer(access_hash, access_tag);
     bool real_hit = found;
     tenant_buffer_cxt* buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
     pthread_spin_lock(&buffer_cxt->hit_stat_lock);
@@ -3189,8 +3191,8 @@ void UpdateWeight(BufferTag *access_tag, uint32 access_hash){
             bool del;
             hist_node->next->prev = hist_node->prev;
             hist_node->prev->next = hist_node->next;
-            buf_hash_operate<HASH_REMOVE>(g_tenant_info.history_buffer.buffer_map, &new_tag, new_hash, &del);
-            g_tenant_info.history_buffer.curr_size--;
+            buf_hash_operate<HASH_REMOVE>((HTAB*)t_thrd.thrd_hist_HTAB, access_tag, access_hash, &del);
+            g_tenant_info.curr_hist_size--;
     }
     pthread_mutex_unlock(&g_tenant_info.hist_lock);
 
@@ -3231,7 +3233,7 @@ void TenantWeightReset(){
     double origin_weight = 0.0;
     double new_sum = 1.0;
     for(int i = 0; i < g_tenant_info.tenant_num; ++i){
-        if(g_tenant_info.tenant_buffer_cxt_array[i].real_buffer.curr_size <= lower_bound &&
+        if(g_tenant_info.tenant_buffer_cxt_array[i].curr_real_size <= lower_bound &&
             g_tenant_info.tenant_buffer_cxt_array[i].weight > 1.0 / active_tenant){
 
             new_sum -= 1.0 / active_tenant;
@@ -3243,7 +3245,7 @@ void TenantWeightReset(){
         }
     }
     for(int i = 0; i < g_tenant_info.tenant_num; ++i){
-        if(g_tenant_info.tenant_buffer_cxt_array[i].real_buffer.curr_size <= lower_bound &&
+        if(g_tenant_info.tenant_buffer_cxt_array[i].curr_real_size <= lower_bound &&
             g_tenant_info.tenant_buffer_cxt_array[i].weight > 1.0 / active_tenant){
 
             g_tenant_info.tenant_buffer_cxt_array[i].weight = 1.0 / active_tenant;
@@ -3276,13 +3278,13 @@ tenant_buffer_cxt* TenantSampling(bool* do_reset){
     }
     if(max_retry == 0){
         ereport(WARNING, (errmsg("Pick victim execced max retry")));
-        goto MAX_RETRY;
+        return (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
     }
 
     /* If victim buffer is lower than lower bound. Sampling other tenant, and do reset. */
     uint32 active_tenant = g_tenant_info.tenant_num == 0 ? 1 : g_tenant_info.tenant_num; //Active tenant
     uint32 lower_bound = (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE) / ( active_tenant * active_tenant );
-    if(victim_buffer_cxt->real_buffer.curr_size < lower_bound){
+    if(victim_buffer_cxt->curr_real_size < lower_bound){
         *do_reset = true;
         /* Sampling among tenant has buf more than lower bound */
         random=double(rand()) / double(RAND_MAX);
@@ -3290,7 +3292,7 @@ tenant_buffer_cxt* TenantSampling(bool* do_reset){
         double amplify_factor = 10000;
         double zone_weights[ MAX_TENANT + 1 ];
         for(uint32 i = 0;i < g_tenant_info.tenant_num; i++){
-                if (g_tenant_info.tenant_buffer_cxt_array[i].real_buffer.curr_size < lower_bound){
+                if (g_tenant_info.tenant_buffer_cxt_array[i].curr_real_size < lower_bound){
                     zone_weights[i]=0.0;
                 }
                 else{
@@ -3299,13 +3301,13 @@ tenant_buffer_cxt* TenantSampling(bool* do_reset){
                 }
         }
         for(int i = 0;i < g_tenant_info.tenant_num;i++){
-            if (g_tenant_info.tenant_buffer_cxt_array[i].real_buffer.curr_size >= lower_bound){
+            if (g_tenant_info.tenant_buffer_cxt_array[i].curr_real_size >= lower_bound){
                 zone_weights[i] = zone_weights[i] / weight_sum;
             }
         }
         if(weight_sum <= zero){
             victim_buffer_cxt = NULL;
-            goto DO_RESET;
+            return (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
         }
         victim = -1;
         max_retry = 10;
@@ -3323,12 +3325,10 @@ tenant_buffer_cxt* TenantSampling(bool* do_reset){
         }
         if(max_retry == 0){
             ereport(WARNING, (errmsg("[lowerBound]Pick victim execced max retry")));
-            goto MAX_RETRY;
+            return (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
         }
     }
     return victim_buffer_cxt;
-MAX_RETRY:
-    return (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
 }
 tenant_buffer_cxt* GetVictimTenant(){
     /* We can still take from free list */
@@ -3338,7 +3338,7 @@ tenant_buffer_cxt* GetVictimTenant(){
     }
 
     pthread_spin_lock(&g_tenant_info.free_list_lock);
-    bool take_from_free_list = &g_tenant_info.tenant_free_taken < (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE);
+    bool take_from_free_list = g_tenant_info.tenant_free_taken < (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE);
     pthread_spin_unlock(&g_tenant_info.free_list_lock);
     if(take_from_free_list){
         return (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
@@ -3347,7 +3347,7 @@ tenant_buffer_cxt* GetVictimTenant(){
     /* Pick victim */
     bool do_reset = false;
     pthread_mutex_lock(&g_tenant_info.tenant_stat_lock);
-    buffer* victim_buffer_cxt = TenantSampling(&do_reset);
+    tenant_buffer_cxt* victim_buffer_cxt = TenantSampling(&do_reset);
 #if MULTITENANT_RESET_ENABLE
     if(do_reset){
         /* Zone reset*/
@@ -3357,21 +3357,12 @@ tenant_buffer_cxt* GetVictimTenant(){
     pthread_mutex_unlock(&g_tenant_info.tenant_stat_lock);
     return victim_buffer_cxt;
 }
-static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
-                               BufferAccessStrategy strategy, bool *found, const XLogPhyBlock *pblk){
-    #if ENABLE_MULTI_TENANTCY
-        return TenantBufferAlloc(smgr, relpersistence, fork_num, block_num, strategy, found, pblk);
-    #else
-        return BufferAllocInternal(smgr, relpersistence, fork_num, block_num, strategy, found, pblk);
-    #endif
-}
 static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
-                               BufferAccessStrategy strategy, bool *found, const XLogPhyBlock *pblk)
-{
+                               BufferAccessStrategy strategy, bool *found, const XLogPhyBlock *pblk){
     Assert(t_thrd.thrd_hist_HTAB);
     Assert(t_thrd.thrd_tenant_map_HTAB);
     Assert(t_thrd.thrd_tenant_buffer_cxt);
-    Assert(t_thrd.thrd_ref_HTAB);
+    Assert(t_thrd.thrd_ref_HTAB || (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt);
 
     if(pg_atomic_add_fetch_u64(&g_tenant_info.update_count, 1) % LOG_INTERVAL == 0){
         show_tenant_status();
@@ -3473,7 +3464,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
          * spinlock still held!
          */
         pgstat_report_waitevent(WAIT_EVENT_BUF_STRATEGY_GET);
-        buf = (BufferDesc *)TenantStrategyGetBuffer(strategy, &buf_state);
+        buf = (BufferDesc *)TenantStrategyGetBuffer(strategy, &buf_state, victim_buffer_cxt);
         pgstat_report_waitevent(WAIT_EVENT_END);
 
         Assert(BUF_STATE_GET_REFCOUNT(buf_state) == 0);
@@ -3694,17 +3685,17 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
         pthread_mutex_lock(second_lock);
         
         /* Evict from victim list */
-        (BufferDesc *) evict_prev = ((BufferDesc *)buf)->prev;
-        (BufferDesc *) evict_next = ((BufferDesc *)buf)->next;
+        BufferDesc * evict_prev = ((BufferDesc *)buf)->prev;
+        BufferDesc * evict_next = ((BufferDesc *)buf)->next;
         evict_prev->next = evict_next;
         evict_next->prev = evict_prev;
         victim_buffer_cxt->curr_real_size--;
 
         /* Insert into buffer_cxt */
-        buffer_cxt->dummy_tail.prev->next = buf;
-        ((BufferDesc *)buf)->prev = buffer_cxt->dummy_tail.prev;
-        ((BufferDesc *)buf)->next = &buffer_cxt->dummy_tail;
-        buffer_cxt->dummy_tail.prev = buf;
+        buffer_cxt->real_dummy_tail.next = buf;
+        ((BufferDesc *)buf)->prev = buffer_cxt->real_dummy_tail.prev;
+        ((BufferDesc *)buf)->next = &buffer_cxt->real_dummy_tail;
+        buffer_cxt->real_dummy_tail.prev = buf;
         buffer_cxt->curr_real_size++;
         ((BufferDesc *)buf)->tenantOid = buffer_cxt->tenant_oid;
 
@@ -3784,6 +3775,14 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     }
     UpdateHitRateStat(new_hash, &new_tag, *found);
     return buf;
+}
+static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
+                               BufferAccessStrategy strategy, bool *found, const XLogPhyBlock *pblk){
+    #if ENABLE_MULTI_TENANTCY
+        return TenantBufferAlloc(smgr, relpersistence, fork_num, block_num, strategy, found, pblk);
+    #else
+        return BufferAllocInternal(smgr, relpersistence, fork_num, block_num, strategy, found, pblk);
+    #endif
 }
 /*
  * InvalidateBuffer -- mark a shared buffer invalid and return it to the

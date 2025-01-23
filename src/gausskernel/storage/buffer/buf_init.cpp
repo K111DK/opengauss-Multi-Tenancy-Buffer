@@ -67,20 +67,37 @@ const int PAGE_QUEUE_SLOT_MULTI_NBUFFERS = 5;
  * This is called once during shared-memory initialization (either in the
  * postmaster, or in a standalone backend).
  */
+static void buf_push(CandidateList *list, int buf_id)
+{
+    uint32 list_size = list->cand_list_size;
+    uint32 tail_loc;
 
+    pg_memory_barrier();
+    volatile uint64 head = pg_atomic_read_u64(&list->head);
+    pg_memory_barrier();
+    volatile uint64 tail = pg_atomic_read_u64(&list->tail);
+
+    if (unlikely(tail - head >= list_size)) {
+        return;
+    }
+    tail_loc = tail % list_size;
+    list->cand_buf_list[tail_loc] = buf_id;
+    (void)pg_atomic_fetch_add_u64(&list->tail, 1);
+}
 /* We'll do it with tenant map lock */
-tenant_buffer_cxt* GetThrdTenant(char* name){
+tenant_buffer_cxt* GetThrdTenant(const char* name){
     tenant_buffer_cxt* thrd_tenant = NULL;
     bool tenant_found = false;
-    uint32 name_hash = string_hash(name);
+    uint32 name_hash = string_hash(name, TENANT_NAME_LEN);
     
     pthread_mutex_lock(&g_tenant_info.tenant_map_lock);
-    tenant_name_mapping* entry = (tenant_name_mapping*)hash_search_with_hash_value(t_thrd.thrd_tenant_map_HTAB, name,
+    tenant_name_mapping* entry = (tenant_name_mapping*)hash_search_with_hash_value((HTAB*)t_thrd.thrd_tenant_map_HTAB, name,
     name_hash, HASH_ENTER, &tenant_found);
     /* init entry */
     if (!tenant_found) {
             /* Assign new Tenant oid */
             tenant_buffer_cxt* new_tenant = &g_tenant_info.tenant_buffer_cxt_array[g_tenant_info.tenant_num];
+            new_tenant->tenant_oid = g_tenant_info.tenant_num;
             entry->tenant_cxt = new_tenant;
             g_tenant_info.tenant_num++;
             thrd_tenant = new_tenant;
@@ -95,7 +112,6 @@ tenant_buffer_cxt* GetThrdTenant(char* name){
 
             // Init basic info
             new_tenant->sla = sla;
-            new_tenant->tenant_oid = entry->tenant_oid;
 
             /* Real buffer init */
             {
@@ -117,7 +133,7 @@ tenant_buffer_cxt* GetThrdTenant(char* name){
                 new_tenant->ref_dummy_head.prev = NULL;
                 new_tenant->ref_dummy_tail.prev = &new_tenant->ref_dummy_head;
                 new_tenant->ref_dummy_tail.next = NULL;
-                new_tenant->max_ref_capacity = ref_capacity;
+                new_tenant->max_ref_size = ref_capacity;
                 new_tenant->curr_ref_size = 0;
             }
 
@@ -189,15 +205,15 @@ void InitTenantPrivateCxt(){
 }
 void InitNonTenantBuffer(){
     bool found_descs = false;
-    tenant_name_mapping* entry = (tenant_name_mapping*)hash_search(t_thrd.thrd_tenant_map_HTAB, NON_TENANT_NAME, HASH_ENTER, &found_descs);
+    tenant_name_mapping* entry = (tenant_name_mapping*)hash_search((HTAB*)t_thrd.thrd_tenant_map_HTAB, NON_TENANT_NAME, HASH_ENTER, &found_descs);
     if(!found_descs){
         entry->tenant_cxt = &g_tenant_info.non_tenant_buffer_cxt;
         g_tenant_info.non_tenant_buffer_cxt.max_real_size = MINIMAL_BUFFER_SIZE;
         g_tenant_info.non_tenant_buffer_cxt.curr_real_size = 0;
-        g_tenant_info.non_tenant_buffer_cxt.dummy_head.next = &g_tenant_info.non_tenant_buffer_cxt.dummy_tail;
-        g_tenant_info.non_tenant_buffer_cxt.dummy_head.prev = NULL;
-        g_tenant_info.non_tenant_buffer_cxt.dummy_tail.prev = &g_tenant_info.non_tenant_buffer_cxt.dummy_head;
-        g_tenant_info.non_tenant_buffer_cxt.dummy_tail.next = NULL;
+        g_tenant_info.non_tenant_buffer_cxt.real_dummy_head.next = &g_tenant_info.non_tenant_buffer_cxt.real_dummy_tail;
+        g_tenant_info.non_tenant_buffer_cxt.real_dummy_head.prev = NULL;
+        g_tenant_info.non_tenant_buffer_cxt.real_dummy_tail.prev = &g_tenant_info.non_tenant_buffer_cxt.real_dummy_head;
+        g_tenant_info.non_tenant_buffer_cxt.real_dummy_tail.next = NULL;
     }
 }
 void InitBufferPool(bool *found_descs){
@@ -214,6 +230,7 @@ void InitBufferPool(bool *found_descs){
     }
 }
 static void InitTenantHist(){
+    bool found_descs = false;
     HASHCTL hctl1;
     memset_s(&hctl1, sizeof(HASHCTL), 0, sizeof(HASHCTL));
     hctl1.keysize = sizeof(BufferTag);//tag hash
@@ -230,25 +247,8 @@ static void InitTenantHist(){
         g_tenant_info.curr_hist_size = 0;
     }
 }
-static void buf_push(CandidateList *list, int buf_id)
-{
-    uint32 list_size = list->cand_list_size;
-    uint32 tail_loc;
-
-    pg_memory_barrier();
-    volatile uint64 head = pg_atomic_read_u64(&list->head);
-    pg_memory_barrier();
-    volatile uint64 tail = pg_atomic_read_u64(&list->tail);
-
-    if (unlikely(tail - head >= list_size)) {
-        return;
-    }
-    tail_loc = tail % list_size;
-    list->cand_buf_list[tail_loc] = buf_id;
-    (void)pg_atomic_fetch_add_u64(&list->tail, 1);
-}
 static void InitTenantBufferLock(){
-    pthread_mutex_init(&g_tenant_info.free_list_lock, NULL);
+    pthread_spin_init(&g_tenant_info.free_list_lock, NULL);
     pthread_mutex_init(&g_tenant_info.hist_lock, NULL);
     pthread_mutex_init(&g_tenant_info.tenant_stat_lock, NULL);
     pthread_mutex_init(&g_tenant_info.tenant_map_lock, NULL);
@@ -294,7 +294,6 @@ void InitBufferPool(void)
     bool found_buf_extra = false;
     uint64 buffer_size;
     BufferDescExtra *extra = NULL;
-    t_thrd.tenant_id = UINT32_MAX - 1;
 
     t_thrd.storage_cxt.BufferDescriptors = (BufferDescPadded *)CACHELINEALIGN(
         ShmemInitStruct("Buffer Descriptors",
