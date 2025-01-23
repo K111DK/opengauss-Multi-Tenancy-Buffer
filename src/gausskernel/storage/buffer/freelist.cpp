@@ -328,7 +328,6 @@ retry:
 }
 /* Nothing on the freelist, so run the "clock sweep" algorithm */
 BufferDesc* ClockSweepBufferEvict(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt){
-    pthread_mutex_lock(&buffer_cxt->tenant_buffer_lock);
     uint32 local_buf_state = 0; /* to avoid repeated (de-)referencing */
     BufferDesc *buf = NULL;
 retry:
@@ -338,6 +337,7 @@ retry:
     int max_buffer_can_use = buffer_cxt->max_real_size;
     try_counter = max_buffer_can_use;
     int try_get_loc_times = max_buffer_can_use;
+    pthread_mutex_lock(&buffer_cxt->tenant_buffer_lock);
     for(;;){        
         if(buffer_cxt->dummy_head.next == &buffer_cxt->dummy_tail){
             ereport(WARNING, ((errmsg("no unpinned buffers available"))));
@@ -382,6 +382,7 @@ retry:
              * infinite loop.
              */
             UnlockBufHdr(buf, local_buf_state);
+            pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
 
             if (am_standby && u_sess->attr.attr_storage.shared_buffers_fraction < 1.0) {
                 ereport(WARNING, (errmsg("no unpinned buffers available")));
@@ -412,7 +413,6 @@ BufferDesc* GetBufFreeList(BufferAccessStrategy strategy, uint32* buf_state, ten
     int buf_id;
     BufferDesc *buf = NULL;
     uint32 local_buf_state = 0;
-    pthread_mutex_lock(&g_tenant_info.free_list_lock);
     while(candidate_buf_pop(&g_tenant_info.buffer_list, &buf_id)){
         Assert(buf_id < SegmentBufferStartID);
         buf = GetBufferDescriptor(buf_id);
@@ -424,14 +424,9 @@ BufferDesc* GetBufFreeList(BufferAccessStrategy strategy, uint32* buf_state, ten
         if (available) {
             *buf_state = local_buf_state;
             Assert(!( (local_buf_state & BUF_FLAG_MASK) & BM_TAG_VALID ));
-            if(buffer_cxt != &g_tenant_info.non_tenant_buffer_cxt){
-                g_tenant_info.tenant_free_taken++;
-            }
-            pthread_mutex_unlock(&g_tenant_info.free_list_lock);
             return buf;
         }
     }
-    pthread_mutex_unlock(&g_tenant_info.free_list_lock);
     return NULL;
 }
 BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt)
@@ -452,22 +447,30 @@ BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_s
      * strategy object are intentionally not counted here.
      */
     (void)pg_atomic_fetch_add_u32(&t_thrd.storage_cxt.StrategyControl->numBufferAllocs, 1);
-
-    //buffer_cxt->real_buffer.curr_size < buffer_cxt->ref_buffer.max_capacity || buffer_cxt->real_buffer.misses > buffer_cxt->ref_buffer.misses
-    //buffer_cxt->real_buffer.curr_size < buffer_cxt->real_buffer.max_capacity
-    //buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt || g_tenant_info.tenant_free_taken < NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE)
-    bool take_from_free_list = (buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt || g_tenant_info.tenant_free_taken < NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE);
+    bool take_from_free_list = false;
+    if(buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt){
+        pthread_spin_lock(&g_tenant_info.free_list_lock);
+        if(g_tenant_info.non_tenant_free_taken < MINIMAL_BUFFER_SIZE){
+            g_tenant_info.non_tenant_free_taken++;
+            take_from_free_list = true;
+        }
+        pthread_spin_unlock(&g_tenant_info.free_list_lock);
+    }else{
+        pthread_spin_lock(&g_tenant_info.free_list_lock);
+        if(g_tenant_info.tenant_free_taken < (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE)){
+            g_tenant_info.tenant_free_taken++;
+            take_from_free_list = true;
+        }
+        pthread_spin_unlock(&g_tenant_info.free_list_lock);
+    }
+    
     if(take_from_free_list){
         /* Fetch from global free buffer pool */
         buf = GetBufFreeList(strategy, buf_state, buffer_cxt);
         if(buf != NULL){
             return buf;
-        }else{
-            /* Fetch from other tenant's buffer pool */
-            g_tenant_info.free_list_empty = true;
         }
     }
-    
 EVICT:
     /* Fetch from tenant's buffer pool */
     BufferDesc* ans =  ClockSweepBufferEvict(strategy, buf_state, buffer_cxt);

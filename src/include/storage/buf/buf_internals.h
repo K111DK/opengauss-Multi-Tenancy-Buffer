@@ -373,59 +373,51 @@ extern void LocalBufferFlushAllBuffer();
 #define ENABLE_BUFFER_ADJUST 1
 #define MULTITENANT_RESET_ENABLE 1
 #define ENABLE_HIST 1
-#define ACTIVE_TENANT_NUM 4
+#define TENANT_NAME_LEN 32
+#define MAX_TENANT 32
+#define HIST_NAME "HIST"
+#define NON_TENANT_NAME "NON_TENANT"
+#define LOG_INTERVAL 1000000
 enum BufferType{
     LRU = 0,
     CLOCK,
 };
-
 typedef struct buffer_node {
     BufferTag key;
     int buffer_id;
     struct buffer_node* prev;
     struct buffer_node* next;
 } buffer_node;
-typedef struct buffer {
-    /* Basic struct */
-    pthread_mutex_t lock;
-    buffer_node dummy_head;
-    buffer_node dummy_tail;
-    uint64 max_capacity;
-    uint64 curr_size;
-
-    uint64 hits{0};
-    uint64 misses{0};
-
-    /* HTAB init */
-    HASHCTL hctl;
-    char buffer_index_name[TENANT_NAME_LEN];
-    /* Maybe unsed */
-    BufferType type;
-} buffer;
-
-
-#define TENANT_NAME_LEN 32
-#define MAX_TENANT 32
 typedef struct tenant_buffer_cxt{
     //key
     char tenant_name[TENANT_NAME_LEN];
     
     //ref buffer cxt
-    buffer ref_buffer;
+    pthread_mutex_t tenant_ref_buffer_lock;
+    buffer_node ref_dummy_head;
+    buffer_node ref_dummy_tail;
     uint64 max_ref_size{0};
     uint64 curr_ref_size{0};
+    /* ref buffer HTAB init */
+    HASHCTL ref_hctl;
+    
 
     //real buffer cxt
-    BufferDesc dummy_head;
-    BufferDesc dummy_tail;
-    uint64 real_hits{0};
-    uint64 real_misses{0};
+    pthread_mutex_t tenant_buffer_lock;
+    BufferDesc real_dummy_head;
+    BufferDesc real_dummy_tail;
     BufferDesc* sweep_hand;
     uint64 curr_real_size{0};
     uint64 max_real_size{0};
 
 
-    pthread_mutex_t tenant_buffer_lock;
+    //Buffer hit stat lock
+    pthread_spinlock_t hit_stat_lock;
+    uint64 real_hits{0};
+    uint64 real_misses{0};
+    uint64 ref_hits{0};
+    uint64 ref_misses{0};
+
 
     /* Multi Tenant info */ 
     uint32 sla;
@@ -443,17 +435,19 @@ typedef struct tenant_name_mapping{
 typedef struct tenant_info{   
     
     /* Free list */
-    pthread_mutex_t free_list_lock;
+    pthread_spinlock_t free_list_lock;
     Buffer* buffer_pool;
     CandidateList buffer_list;
-
-    /* We'll left MINIMAL_BUFFER for non tenant user */
-    uint64 total_clean_buf_taken{0}; 
-    bool free_list_empty{false};
+    /* <= NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_NUM*/
+    uint64 tenant_free_taken{0};
+    uint64 non_tenant_free_taken{0};
 
     /* History list */
     pthread_mutex_t hist_lock;
-    buffer history_buffer;
+    buffer_node hist_dummy_head;
+    buffer_node hist_dummy_tail;
+    uint64 max_hist_size{0};
+    uint64 curr_hist_size{0};
 
     /* Tenant map lock */
     pthread_mutex_t tenant_map_lock;
@@ -463,16 +457,14 @@ typedef struct tenant_info{
     tenant_buffer_cxt non_tenant_buffer_cxt;
     
     /* Tenant cxt array */
-    pthread_mutex_t tenant_stat_lock;
+    pthread_mutex_t tenant_stat_lock;/* Acquire while change weight */
     tenant_buffer_cxt tenant_buffer_cxt_array[MAX_TENANT];
     uint32 tenant_num{0};
 
     /* Update count */
-    uint64 update_count{0};
+    pg_atomic_uint64 update_count{0};
     uint64 total_promised{0};
 
-    /* */
-    uint64 tenant_free_taken{0};
 
 } tenant_info;
 extern tenant_info g_tenant_info;
@@ -486,7 +478,6 @@ extern void tenant_HTAB_init();
 double GetTenantHRD(tenant_buffer_cxt* buffer_cxt);
 
 /* new */
-extern void InitRefBuffer();
 extern void ThrdGetRefBufferIndex(tenant_buffer_cxt* buffer_cxt);
 extern void UpdateRefBuffer(uint32 access_hash, BufferTag *access_tag);
 #endif /* BUFMGR_INTERNALS_H */

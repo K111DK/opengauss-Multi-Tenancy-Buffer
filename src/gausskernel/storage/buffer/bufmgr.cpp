@@ -3067,56 +3067,44 @@ tenant_info g_tenant_info;
 void show_tenant_status(){
     uint64 total_hit = 0;
     uint64 total_miss = 0;
+    pthread_mutex_lock(&g_tenant_info.tenant_stat_lock);
     ereport(WARNING, (errmsg("=====Tenant Weight Info[Alloc count:%u][MTPR Enable:%s][Tenant free alloc:%u]====="
         , g_tenant_info.update_count
         , ENABLE_BUFFER_ADJUST ? "Yes": "No"
         , g_tenant_info.tenant_free_taken)));
     for(uint32 i = 0; i < g_tenant_info.tenant_num; i++){
+                pthread_spin_lock(&g_tenant_info.tenant_buffer_cxt_array[i].hit_stat_lock);
                 tenant_buffer_cxt* temp = &g_tenant_info.tenant_buffer_cxt_array[i];
-                ereport(WARNING, (errmsg("Tenant:[%s], weight:[%f], sla:[%u], HRD = [%f], Real[H/M:%u/%u] = [%.2f%] Ref[H/M:%u/%u] = [%.2f%] Curr size:[%u] Normal[H/M:%u/%u] = [%.2f%]", 
+                ereport(WARNING, (errmsg("Tenant:[%s], weight:[%f], sla:[%u], HRD = [%f], Real[H/M:%u/%u] = [%.2f%] Ref[H/M:%u/%u] = [%.2f%] Curr size:[%u]", 
                 temp->tenant_name, 
                 temp->weight,
                 temp->sla,
                 GetTenantHRD(temp),
-                temp->real_buffer.hits,
-                temp->real_buffer.misses,
-                100.0 * (double)(temp->real_buffer.hits) / (double)(temp->real_buffer.hits + temp->real_buffer.misses),
-                temp->ref_buffer.hits,
-                temp->ref_buffer.misses,
-                100.0 * (double)(temp->ref_buffer.hits) / (double)(temp->ref_buffer.hits + temp->ref_buffer.misses),
-                temp->real_buffer.curr_size,
-                temp->total_normal_hits,
-                temp->total_normal - temp->total_normal_hits,
-                100.0 * (double)(temp->total_normal_hits) / (double)(temp->total_normal)
+                temp->real_hits,
+                temp->real_misses,
+                100.0 * (double)(temp->real_hits) / (double)(temp->real_hits + temp->real_misses),
+                temp->ref_hits,
+                temp->ref_misses,
+                100.0 * (double)(temp->ref_hits) / (double)(temp->ref_hits + temp->ref_misses),
+                temp->curr_ref_size,
                 )));
-                total_hit += temp->real_buffer.hits;
-                total_miss += temp->real_buffer.misses;
+                total_hit += temp->real_hits;
+                total_miss += temp->real_misses;
+                pthread_spin_unlock(&g_tenant_info.tenant_buffer_cxt_array[i].hit_stat_lock);
     }
+    pthread_mutex_unlock(&g_tenant_info.tenant_stat_lock);
     ereport(WARNING, (errmsg("Final Hit Rate[H:%u/M:%u] = [%.2f%]",
                                     total_hit,
                                     total_miss,
                                     100.0 *( (double)total_hit / (double) (total_hit + total_miss) )
                                     )));
 }
-extern void InitRefBuffer(buffer* buffer_cxt, uint32 capacity, const char* name, BufferType type){
-    int ret = memset_s(&buffer_cxt->hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
-    securec_check(ret, "\0", "\0");
-    buffer_cxt->hctl.keysize = sizeof(BufferTag);//tag hash
-    buffer_cxt->hctl.entrysize = sizeof(buffer_node);//lru node
-    buffer_cxt->hctl.hash = tag_hash;
-    buffer_cxt->dummy_head.next = &buffer_cxt->dummy_tail;
-    buffer_cxt->dummy_head.prev = NULL;
-    buffer_cxt->dummy_tail.prev = &buffer_cxt->dummy_head;
-    buffer_cxt->dummy_tail.next = NULL;
-    buffer_cxt->max_capacity = capacity;
-    buffer_cxt->curr_size = 0;
-    buffer_cxt->type = type;
-}
 #include "utils/dynahash.h"
+/* Make sure we held hit stat lock */
 double GetTenantHRD(tenant_buffer_cxt* buffer_cxt){
 
-    uint64 ref_hits = buffer_cxt->ref_buffer.hits;
-    uint64 ref_misses = buffer_cxt->ref_buffer.misses;
+    uint64 ref_hits = buffer_cxt->ref_hits;
+    uint64 ref_misses = buffer_cxt->ref_misses;
     uint64 real_hits = buffer_cxt->real_hits;
     uint64 real_misses = buffer_cxt->real_misses;
     
@@ -3127,69 +3115,69 @@ double GetTenantHRD(tenant_buffer_cxt* buffer_cxt){
     return hrd <= 0.0 ? 0.0 : hrd;
 }
 /* Currently we do it in LRU manner */
-void UpdateRefBuffer(uint32 access_hash, BufferTag *access_tag, buffer* buffer_cxt){
+bool UpdateRefBuffer(uint32 access_hash, BufferTag *access_tag){
+    tenant_buffer_cxt* buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
     if(t_thrd.thrd_ref_HTAB == NULL || buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt){
         return;
     }
-    
     bool hit = false;
     bool found_descs = false;
-    buffer* ref = &buffer_cxt->ref_buffer;
-    pthread_mutex_lock(&buffer_cxt->ref_buffer.lock);   
+    pthread_mutex_lock(&buffer_cxt->ref_lock);
     buffer_node* entry = (buffer_node*)buf_hash_operate<HASH_FIND>((HTAB*)t_thrd.thrd_ref_HTAB, access_tag, access_hash, &found_descs);
     
     if(found_descs){
-        ref->hits++;        
+        hit = true;        
         /* Remove */
         entry->next->prev = entry->prev;
         entry->prev->next = entry->next;
 
         /* Insert to head */
-        entry->next = ref->dummy_head.next;
-        ref->dummy_head.next->prev = entry;
-        ref->dummy_head.next = entry;
-        entry->prev = &ref->dummy_head;
-        pthread_mutex_unlock(&buffer_cxt->ref_buffer.lock);  
-        return;
+        entry->next = buffer_cxt->ref_dummy_head.next;
+        buffer_cxt->ref_dummy_head.next->prev = entry;
+        buffer_cxt->ref_dummy_head.next = entry;
+        entry->prev = &buffer_cxt->ref_dummy_head;
+        pthread_mutex_unlock(&buffer_cxt->ref_lock);
+        return hit;
     }
 
-    ref->misses++;
     /* Evict if needed */
-    if(ref->curr_size >= ref->max_capacity){
-        buffer_node* tail = ref->dummy_tail.prev;
-        Assert(tail != &ref->dummy_head);
+    if(buffer_cxt->curr_ref_size >= buffer_cxt->max_ref_size){
+        buffer_node* tail = buffer_cxt->ref_dummy_tail.prev;
+        Assert(tail != &buffer_cxt->ref_dummy_head);
         buffer_node* prev = tail->prev;
-        prev->next = &ref->dummy_tail;
-        ref->dummy_tail.prev = prev;
+        prev->next = &buffer_cxt->ref_dummy_tail;
+        buffer_cxt->ref_dummy_tail.prev = prev;
 
         buf_hash_operate<HASH_REMOVE>((HTAB*)t_thrd.thrd_ref_HTAB, &tail->key, BufTableHashCode(&tail->key), &found_descs);
         Assert(found_descs);
-        ref->curr_size--;
+        buffer_cxt->curr_ref_size--;
     }
-    
-    Assert(ref->curr_size < ref->max_capacity);
     /* Enter new hash */
     entry = (buffer_node*)buf_hash_operate<HASH_ENTER>((HTAB*)t_thrd.thrd_ref_HTAB, access_tag, access_hash, &found_descs);
     Assert(!found_descs);
-
-    
     /* Insert to head */
-    entry->next = ref->dummy_head.next;
-    ref->dummy_head.next->prev = entry;
-    ref->dummy_head.next = entry;
-    entry->prev = &ref->dummy_head;
-    ref->curr_size++;
-    pthread_mutex_unlock(&buffer_cxt->ref_buffer.lock);
-    
+    entry->next = buffer_cxt->ref_dummy_head.next;
+    buffer_cxt->ref_dummy_head.next->prev = entry;
+    buffer_cxt->ref_dummy_head.next = entry;
+    entry->prev = &buffer_cxt->ref_dummy_head;
+    buffer_cxt->curr_ref_size++;
+    pthread_mutex_unlock(&buffer_cxt->ref_lock);
+    return hit;
 }
 void UpdateHitRateStat(uint32 access_hash, BufferTag *access_tag, bool found){
-    UpdateRefBuffer(access_hash, access_tag, buffer_cxt);
+    bool ref_hit = UpdateRefBuffer(access_hash, access_tag, buffer_cxt);
+    bool real_hit = found;
     tenant_buffer_cxt* buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
-    if(found){
-        buffer_cxt->hits++;
-    }else{ 
-        buffer_cxt->misses++;
-    }
+    pthread_spin_lock(&buffer_cxt->hit_stat_lock);
+    if(ref_hit)
+        buffer_cxt->ref_hits++;
+    else
+        buffer_cxt->ref_misses++;
+    if(real_hit)
+        buffer_cxt->real_hits++;
+    else
+        buffer_cxt->real_misses++;
+    pthread_spin_unlock(&buffer_cxt->hit_stat_lock);
 }
 void UpdateWeight(BufferTag *access_tag, uint32 access_hash){
     bool found_descs = false;
@@ -3206,12 +3194,16 @@ void UpdateWeight(BufferTag *access_tag, uint32 access_hash){
     }
     pthread_mutex_unlock(&g_tenant_info.hist_lock);
 
-    pthread_mutex_lock(&g_tenant_info.tenant_stat_lock);
+    pthread_spin_lock(&buffer_cxt->hit_stat_lock);
+    double hrd = GetTenantHRD(buffer_cxt);
+    pthread_spin_lock(&buffer_cxt->hit_stat_lock);
+
     if(found_descs){
         const double zero = 0.0000001;
         double total_w = 0;
         uint32 max_sla = 0;
         tenant_buffer_cxt* temp;
+        pthread_mutex_lock(&g_tenant_info.tenant_stat_lock);
         /* Get max sla and max weight */
         for(int i = 0; i < g_tenant_info.tenant_num; i++){
             temp = &g_tenant_info.tenant_buffer_cxt_array[i];
@@ -3221,7 +3213,6 @@ void UpdateWeight(BufferTag *access_tag, uint32 access_hash){
         /* Do reweight by hrd */
         double sla_factor = (double)buffer_cxt->sla / max_sla;
         double pre_val = buffer_cxt->weight;
-        double hrd = GetTenantHRD(buffer_cxt);
         total_w -= buffer_cxt->weight;
         buffer_cxt->weight = zero + buffer_cxt->weight * exp(-1.0 * hrd * sla_factor);        
         total_w += buffer_cxt->weight;
@@ -3231,8 +3222,8 @@ void UpdateWeight(BufferTag *access_tag, uint32 access_hash){
             temp = &g_tenant_info.tenant_buffer_cxt_array[i];
             temp->weight = temp->weight / total_w;
         }
+        pthread_mutex_unlock(&g_tenant_info.tenant_stat_lock);
     }
-    pthread_mutex_unlock(&g_tenant_info.tenant_stat_lock);
 }
 void TenantWeightReset(){
     uint32 active_tenant = g_tenant_info.tenant_num == 0 ? 1 : g_tenant_info.tenant_num; //Active tenant
@@ -3341,13 +3332,21 @@ MAX_RETRY:
 }
 tenant_buffer_cxt* GetVictimTenant(){
     /* We can still take from free list */
-    bool take_from_free_list = g_tenant_info.tenant_free_taken < NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE 
-    && !g_tenant_info.free_list_empty; 
+    bool is_non_tenant = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt;
+    if(is_non_tenant){
+        return (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
+    }
+
+    pthread_spin_lock(&g_tenant_info.free_list_lock);
+    bool take_from_free_list = &g_tenant_info.tenant_free_taken < (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE);
+    pthread_spin_unlock(&g_tenant_info.free_list_lock);
     if(take_from_free_list){
         return (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
     }
+    
     /* Pick victim */
     bool do_reset = false;
+    pthread_mutex_lock(&g_tenant_info.tenant_stat_lock);
     buffer* victim_buffer_cxt = TenantSampling(&do_reset);
 #if MULTITENANT_RESET_ENABLE
     if(do_reset){
@@ -3355,425 +3354,9 @@ tenant_buffer_cxt* GetVictimTenant(){
         TenantWeightReset();
     }
 #endif
+    pthread_mutex_unlock(&g_tenant_info.tenant_stat_lock);
     return victim_buffer_cxt;
 }
-
-/* We might not need it now */
-static void BufferMapUpdate(tenant_buffer_cxt* buffer_cxt, tenant_buffer_cxt* victim_buffer_cxt, 
-BufferDesc *buf, uint32 old_flags, 
-BufferTag old_tag, uint32 old_hash, 
-BufferTag new_tag, uint32 new_hash, bool from_free_list){
-
-
-    Assert(buffer_cxt);
-    Assert(victim_buffer_cxt);
-    bool found_descs = false;
-    int pre_owner = -1;
-    buffer_node* pre = NULL;
-    buffer_node* next = NULL;
-
-    if (old_flags & BM_TAG_VALID) {
-        Assert(!from_free_list);
-        buffer_node* old_entry = (buffer_node*)buf_hash_operate<HASH_FIND>(victim_buffer_cxt->real_buffer.buffer_map, 
-        &old_tag, old_hash,  &found_descs);
-        if(!found_descs){
-            bool local_found = false;
-            ereport(WARNING, (errmsg("%u delete from %s but not found", old_hash, victim_buffer_cxt->tenant_name)));
-            buf_hash_operate<HASH_FIND>(g_tenant_info.non_tenant_buffer_cxt.real_buffer.buffer_map, &old_tag, old_hash,  &local_found);
-            ereport(WARNING, (errmsg("%s : %s", g_tenant_info.non_tenant_buffer_cxt.tenant_name, local_found ? "found" : "not found")));
-            for(int i = 0; i < g_tenant_info.tenant_num; ++i){
-                buf_hash_operate<HASH_FIND>(g_tenant_info.tenant_buffer_cxt_array[i].real_buffer.buffer_map, &old_tag, old_hash,  &local_found);
-                ereport(WARNING, (errmsg("%s : %s", g_tenant_info.tenant_buffer_cxt_array[i].tenant_name, local_found ? "found" : "not found")));
-            }
-        }
-
-        /* Record where old entry evict from */
-        Assert(found_descs && old_entry);
-        Assert(old_entry != victim_buffer_cxt->real_buffer.sweep_hand);
-        pre = old_entry->prev;
-        next = old_entry->next;
-        Assert(pre && next);
-
-        pre_owner = old_entry->tenant_id;
-        Assert(pre_owner == victim_buffer_cxt->tenant_oid);
-
-        /* Remove old entry from list */
-        old_entry->prev->next = old_entry->next;
-        old_entry->next->prev = old_entry->prev;
-        buf_hash_operate<HASH_REMOVE>(victim_buffer_cxt->real_buffer.buffer_map, &old_tag, old_hash, &found_descs);
-        victim_buffer_cxt->real_buffer.curr_size--;
-        Assert(found_descs);
-#if ENABLE_HIST
-        /* Update hist buffer */
-        if(g_tenant_info.history_buffer.curr_size == g_tenant_info.history_buffer.max_capacity){
-            
-            /* Get tail */
-            buffer_node* tail = g_tenant_info.history_buffer.dummy_tail.prev;
-            Assert(tail != &g_tenant_info.history_buffer.dummy_head);
-            
-            /* Pop tail */
-            buffer_node* prev = tail->prev;
-            prev->next = &g_tenant_info.history_buffer.dummy_tail;
-            g_tenant_info.history_buffer.dummy_tail.prev = prev;
-            
-            /* Remove from hlist */
-            buf_hash_operate<HASH_REMOVE>(g_tenant_info.history_buffer.buffer_map, &tail->key, BufTableHashCode(&tail->key), &found_descs);
-            g_tenant_info.history_buffer.curr_size--;
-            Assert(found_descs);
-        }
-        
-        /* Insert to hlist */
-        buffer_node* delete_entry = (buffer_node*)buf_hash_operate<HASH_ENTER>(g_tenant_info.history_buffer.buffer_map, &old_tag, old_hash, &found_descs);
-        g_tenant_info.history_buffer.curr_size++;
-        
-        /* Insert to head */
-        g_tenant_info.history_buffer.dummy_head.next->prev = delete_entry;
-        delete_entry->next = g_tenant_info.history_buffer.dummy_head.next;
-        delete_entry->prev = &g_tenant_info.history_buffer.dummy_head;
-        g_tenant_info.history_buffer.dummy_head.next = delete_entry;
-#endif
-    }
-OUT:
-    found_descs = false;
-    buffer_node* entry = (buffer_node*)buf_hash_operate<HASH_ENTER>(buffer_cxt->real_buffer.buffer_map, &new_tag, 
-        new_hash,  &found_descs);
-    buffer_cxt->real_buffer.curr_size++;
-    //ereport(WARNING, (errmsg("%u insert to %s", new_hash, buffer_cxt->tenant_name)));
-
-    Assert(BufTableHashCode(&entry->key) == BufTableHashCode(&new_tag));
-    Assert(!found_descs);
-    entry->buffer_id = buf->buf_id;
-    entry->tenant_id = buffer_cxt->tenant_oid;
-
-    /* We evict a VALID buf from OURSELVES */
-    bool in_place_replace = victim_buffer_cxt == buffer_cxt && (old_flags & BM_TAG_VALID);
-    
-    if(in_place_replace){
-        Assert(!from_free_list && buffer_cxt == victim_buffer_cxt);
-        /* We evict a VALID Buffer from OURSELVES */
-        entry->prev = pre;
-        entry->next = next;
-        pre->next = entry;
-        next->prev = entry;
-    }else{
-        /* Buffer from other tenant( victim != ourselves ) / free list( Not valid ) */
-        buffer_cxt->real_buffer.dummy_tail.prev->next = entry;
-        entry->prev = buffer_cxt->real_buffer.dummy_tail.prev;
-        entry->next = &buffer_cxt->real_buffer.dummy_tail;
-        entry->tenant_info = buffer_cxt;
-        buffer_cxt->real_buffer.dummy_tail.prev = entry;
-       Assert(buffer_cxt->real_buffer.dummy_head.next != &buffer_cxt->real_buffer.dummy_tail);
-    }
-}
-
-// static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
-//                                BufferAccessStrategy strategy, bool *found, const XLogPhyBlock *pblk){
-//     Assert(found);
-    
-//     /* We will hold a big damn lock here */
-//     pthread_mutex_lock(&g_tenant_info.tenant_map_lock);
-//     if(g_tenant_info.update_count++ % 1000000 == 0){
-//         show_tenant_status();
-//     }
-//     Assert(!IsSegmentPhysicalRelNode(smgr->smgr_rnode.node));
-    
-//     tenant_buffer_cxt * buffer_cxt = get_thrd_tenant_buffer_cxt();
-
-//     BufferTag old_tag;
-//     uint32 old_hash = 0;
-//     uint32 old_flags;
-//     bool from_free_list = false;
-
-//     BufferTag new_tag;
-//     /* create a tag so we can lookup the buffer */
-//     INIT_BUFFERTAG(new_tag, smgr->smgr_rnode.node, fork_num, block_num);
-//     /* determine its hash code and partition lock ID */
-//     uint32 new_hash = BufTableHashCode(&new_tag);
-//     // ereport(WARNING, (errmsg("Alloc Block rel[%u,%u,%u,%u] ", new_tag.rnode.spcNode
-//     //                                                         , new_tag.rnode.dbNode
-//     //                                                         , new_tag.rnode.relNode
-//     //                                                         , new_tag.rnode.bucketNode))); 
-
-//     int buf_id;
-//     BufferDesc *buf = NULL;
-//     bool valid = false;
-//     uint32 buf_state;
-
-//     bool found_descs = false;   
-//     buffer_node* entry = 
-//     (buffer_node*)buf_hash_operate<HASH_FIND>(buffer_cxt->real_buffer.buffer_map, &new_tag, new_hash, &found_descs);
-
-//     if (found_descs) {
-//         buf_id = entry->buffer_id;
-//         /*
-//          * Found it.  Now, pin the buffer so no one can steal it from the
-//          * buffer pool, and check to see if the correct data has been loaded
-//          * into the buffer.
-//          */
-//         buf = GetBufferDescriptor(buf_id);
-//         valid = PinBuffer(buf, strategy);
-//         *found = TRUE;
-//         if (!valid) {
-//             if (StartBufferIO(buf, true)) {
-//                 *found = FALSE;
-//             }
-//         }
-//         /* set Physical segment file. */
-//         if (ENABLE_DMS && pblk != NULL) {
-//             Assert(PhyBlockIsValid(*pblk));
-//             buf->extra->seg_fileno = pblk->relNode;
-//             buf->extra->seg_blockno = pblk->block;
-//             MarkReadPblk(buf->buf_id, pblk);
-//         }
-
-//         if(*found)
-//             buffer_cxt->real_buffer.hits++;
-//         else
-//             buffer_cxt->real_buffer.misses++;
-//         /* Update ref buffer cxt */
-//         UpdateRefBuffer(new_hash, &new_tag, buffer_cxt);
-//         if(strategy && (strategy->btype == BAS_VACUUM || strategy->btype == BAS_REPAIR) ){
-//             buffer_cxt->total_not_normal++;
-//             buffer_cxt->total_not_normal_hits += *found ? 1 : 0;
-//         }else{
-//             buffer_cxt->total_normal++;
-//             buffer_cxt->total_normal_hits += *found ? 1 : 0;
-//         }
-//         pthread_mutex_unlock(&g_tenant_info.tenant_map_lock);
-//         return buf;
-//     }
-
-//     /*
-//      * Didn't find it in the buffer pool.  We'll have to initialize a new
-//      * buffer.	Remember to unlock the mapping lock while doing the work.
-//      */
-
-//     /* Find if insert buf is in Hlist */
-//     found_descs = true;
-//     buffer_node * hist_node;
-//     tenant_buffer_cxt* victim_buffer_cxt = buffer_cxt;
-//     if(buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt)
-//         goto GET_BUF;
-
-// #if ENABLE_HIST
-//     hist_node = (buffer_node *)buf_hash_operate<HASH_FIND>(g_tenant_info.history_buffer.buffer_map, 
-//     &new_tag, new_hash, &found_descs);
-//     if(found_descs){
-//             bool del;
-//             hist_node->next->prev = hist_node->prev;
-//             hist_node->prev->next = hist_node->next;
-//             buf_hash_operate<HASH_REMOVE>(g_tenant_info.history_buffer.buffer_map, &new_tag, new_hash, &del);
-//             g_tenant_info.history_buffer.curr_size--;
-//     }
-// #endif
-// #if ENABLE_BUFFER_ADJUST
-//     /* Update weight */
-//     UpdateWeight(found_descs, buffer_cxt);//We should find ? in Hlist?
-//     if( (g_tenant_info.tenant_free_taken >= NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE || g_tenant_info.free_list_empty) 
-//         && g_tenant_info.tenant_num > 1
-//         && buffer_cxt->real_buffer.curr_size < buffer_cxt->capacity ){
-//         if(buffer_cxt->real_buffer.misses > buffer_cxt->ref_buffer.misses){
-//             /* Sampling tenant and pick a victim from which to evict */
-//             victim_buffer_cxt = GetVictimTenant();
-//         }
-//     }
-// #endif
-//     victim_buffer_cxt = victim_buffer_cxt == NULL ? buffer_cxt : victim_buffer_cxt;
-//     Assert(victim_buffer_cxt);
-
-// GET_BUF:
-//     for (;;) {
-//         bool needGetLock = false;
-//         /*
-//          * Ensure, while the spinlock's not yet held, that there's a free refcount
-//          * entry.
-//          */
-//         ReservePrivateRefCountEntry();
-        
-//         if(victim_buffer_cxt != buffer_cxt){
-//             buf = (BufferDesc *)TenantStrategyGetBufferFromOther(strategy, &buf_state, victim_buffer_cxt);
-//         }else{
-//             buf = (BufferDesc *)TenantStrategyGetBuffer(strategy, &buf_state, buffer_cxt, &from_free_list);
-//         }
-
-//         Assert(BUF_STATE_GET_REFCOUNT(buf_state) == 0);
-//         old_flags = buf_state & BUF_FLAG_MASK;
-//         /* Pin the buffer and then release the buffer spinlock */
-//         PinBuffer_Locked(buf);
-//         PageCheckIfCanEliminate(buf, &old_flags, &needGetLock);
-
-//         if (old_flags & BM_DIRTY) {
-//             // ereport(WARNING, ((errmsg("Try flushing dirty %u", buf->buf_id))));
-//             /* backend should not flush dirty pages if working version less than DW_SUPPORT_NEW_SINGLE_FLUSH */
-//             if (!backend_can_flush_dirty_page()) {
-//                 UnpinBuffer(buf, true);
-//                 (void)sched_yield();
-//                 continue;
-//             }
-
-//             /*
-//              * We need a share-lock on the buffer contents to write it out
-//              * (else we might write invalid data, eg because someone else is
-//              * compacting the page contents while we write).  We must use a
-//              * conditional lock acquisition here to avoid deadlock.  Even
-//              * though the buffer was not pinned (and therefore surely not
-//              * locked) when StrategyGetBuffer returned it, someone else could
-//              * have pinned and exclusive-locked it by the time we get here. If
-//              * we try to get the lock unconditionally, we'd block waiting for
-//              * them; if they later block waiting for us, deadlock ensues.
-//              * (This has been observed to happen when two backends are both
-//              * trying to split btree index pages, and the second one just
-//              * happens to be trying to split the page the first one got from
-//              * StrategyGetBuffer.)
-//              */
-//             bool needDoFlush = false;
-//             if (!needGetLock) {
-//                 needDoFlush = LWLockConditionalAcquire(buf->content_lock, LW_SHARED);
-//             } else {
-//                 LWLockAcquire(buf->content_lock, LW_SHARED);
-//                 needDoFlush = true;
-//             }
-//             if (needDoFlush) {
-//                 /*
-//                  * If using a nondefault strategy, and writing the buffer
-//                  * would require a WAL flush, let the strategy decide whether
-//                  * to go ahead and write/reuse the buffer or to choose another
-//                  * victim.	We need lock to inspect the page LSN, so this
-//                  * can't be done inside StrategyGetBuffer.
-//                  */
-//                 // if (strategy != NULL) {
-//                 //     XLogRecPtr lsn;
-
-//                 //     /* Read the LSN while holding buffer header lock */
-//                 //     buf_state = LockBufHdr(buf);
-//                 //     lsn = BufferGetLSN(buf);
-//                 //     UnlockBufHdr(buf, buf_state);
-
-//                 //     if (XLogNeedsFlush(lsn) && StrategyRejectBuffer(strategy, buf)) {
-//                 //         /* Drop lock/pin and loop around for another buffer */
-//                 //         LWLockRelease(buf->content_lock);
-//                 //         UnpinBuffer(buf, true);
-//                 //         continue;
-//                 //     }
-//                 // }
-
-//                 /* OK, do the I/O */
-//                 TRACE_POSTGRESQL_BUFFER_WRITE_DIRTY_START(fork_num, block_num, smgr->smgr_rnode.node.spcNode,
-//                                                           smgr->smgr_rnode.node.dbNode, smgr->smgr_rnode.node.relNode);
-
-//                 /* during initdb, not need flush dw file */
-//                 if (dw_enabled() && pg_atomic_read_u32(&g_instance.ckpt_cxt_ctl->current_page_writer_count) > 0) {
-//                     if (!free_space_enough(buf->buf_id)) {
-//                         LWLockRelease(buf->content_lock);
-//                         UnpinBuffer(buf, true);
-//                         continue;
-//                     }
-//                     uint32 pos = 0;
-//                     pos = first_version_dw_single_flush(buf);
-//                     t_thrd.proc->dw_pos = pos;
-//                     FlushBuffer(buf, NULL);
-//                     g_instance.dw_single_cxt.single_flush_state[pos] = true;
-//                     t_thrd.proc->dw_pos = -1;
-//                 } else {
-//                     FlushBuffer(buf, NULL);
-//                 }
-
-//                 LWLockRelease(buf->content_lock);
-
-//                 ScheduleBufferTagForWriteback(t_thrd.storage_cxt.BackendWritebackContext, &buf->tag);
-
-//                 TRACE_POSTGRESQL_BUFFER_WRITE_DIRTY_DONE(fork_num, block_num, smgr->smgr_rnode.node.spcNode,
-//                                                          smgr->smgr_rnode.node.dbNode, smgr->smgr_rnode.node.relNode);
-//             } else {
-//                 /*
-//                  * Someone else has locked the buffer, so give it up and loop
-//                  * back to get another one.
-//                  */
-//                 UnpinBuffer(buf, true);
-//                 continue;
-//             }
-//         }
-
-//         if (old_flags & BM_TAG_VALID) {
-//             old_tag = ((BufferDesc *)buf)->tag;
-//             old_hash = BufTableHashCode(&old_tag);
-//         } else {
-//             old_hash = 0;
-//         }
-//         /*
-//          * Need to lock the buffer header too in order to change its tag.
-//          */
-//         buf_state = LockBufHdr(buf);
-//         old_flags = buf_state & BUF_FLAG_MASK;
-//         if(BUF_STATE_GET_REFCOUNT(buf_state) == 1 && !(old_flags & BM_DIRTY) 
-//             && !(old_flags & BM_IS_META)){
-//                 break;
-//         }
-//         UnlockBufHdr(buf, buf_state);
-//         UnpinBuffer(buf, true);
-//     }
-    
-// #ifdef USE_ASSERT_CHECKING
-//     PageCheckWhenChosedElimination(buf, old_flags);
-// #endif
-
-
-//     ((BufferDesc *)buf)->tag = new_tag;
-//     buf_state &= ~(BM_VALID | BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR | BM_PERMANENT |
-//                    BUF_USAGECOUNT_MASK);
-//     if (relpersistence == RELPERSISTENCE_PERMANENT || fork_num == INIT_FORKNUM ||
-//         ((relpersistence == RELPERSISTENCE_TEMP) && STMT_RETRY_ENABLED)) {
-//         buf_state |= BM_TAG_VALID | BM_PERMANENT | BUF_USAGECOUNT_ONE;
-//     } else {
-//         buf_state |= BM_TAG_VALID | BUF_USAGECOUNT_ONE;
-//     }
-
-//     BufferMapUpdate(buffer_cxt, victim_buffer_cxt, buf, old_flags, old_tag, old_hash, new_tag, new_hash, from_free_list);
-    
-//     UnlockBufHdr(buf, buf_state);
-
-//     /* set Physical segment file. */
-//     if (pblk != NULL) {
-//         Assert(PhyBlockIsValid(*pblk));
-//         buf->extra->seg_fileno = pblk->relNode;
-//         buf->extra->seg_blockno = pblk->block;
-//         if (ENABLE_DMS) {
-//             MarkReadPblk(buf->buf_id, pblk);
-//         }
-//     } else {
-//         buf->extra->seg_fileno = EXTENT_INVALID;
-//         buf->extra->seg_blockno = InvalidBlockNumber;
-//     }
-
-//     /*
-//      * Buffer contents are currently invalid.  Try to get the io_in_progress
-//      * lock.  If StartBufferIO returns false, then someone else managed to
-//      * read it before we did, so there's nothing left for BufferAlloc() to do.
-//      */
-//     if (StartBufferIO(buf, true)) {
-//         *found = FALSE;
-//     } else {
-//         *found = TRUE;
-//     }
-
-//     if(*found)
-//         buffer_cxt->real_buffer.hits++;
-//     else
-//         buffer_cxt->real_buffer.misses++;
-    
-//     /* Update ref buffer cxt */
-//     UpdateRefBuffer(new_hash, &new_tag, buffer_cxt);
-//     if(strategy && (strategy->btype == BAS_VACUUM || strategy->btype == BAS_REPAIR) ){
-//         buffer_cxt->total_not_normal++;
-//         buffer_cxt->total_not_normal_hits += *found ? 1 : 0;
-//     }else{
-//         buffer_cxt->total_normal++;
-//         buffer_cxt->total_normal_hits += *found ? 1 : 0;
-//     }
-//     pthread_mutex_unlock(&g_tenant_info.tenant_map_lock);
-//     return buf;
-// }
-
 static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
                                BufferAccessStrategy strategy, bool *found, const XLogPhyBlock *pblk){
     #if ENABLE_MULTI_TENANTCY
@@ -3785,8 +3368,12 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
 static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
                                BufferAccessStrategy strategy, bool *found, const XLogPhyBlock *pblk)
 {
+    Assert(t_thrd.thrd_hist_HTAB);
+    Assert(t_thrd.thrd_tenant_map_HTAB);
+    Assert(t_thrd.thrd_tenant_buffer_cxt);
+    Assert(t_thrd.thrd_ref_HTAB);
 
-    if(g_tenant_info.update_count++ % 1000000 == 0){
+    if(pg_atomic_add_fetch_u64(&g_tenant_info.update_count, 1) % LOG_INTERVAL == 0){
         show_tenant_status();
     }
     Assert(!IsSegmentPhysicalRelNode(smgr->smgr_rnode.node));
@@ -3802,6 +3389,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     BufferDesc *buf = NULL;
     bool valid = false;
     uint32 buf_state;
+    bool from_free_list = false;
 
     /* Get thrd's buffer cxt */
     tenant_buffer_cxt* buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
@@ -3991,6 +3579,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
              */
             LockTwoLWLock(new_partition_lock, old_partition_lock);
         } else {
+            from_free_list = true;
             /* if it wasn't valid, we need only the new partition */
             (void)LWLockAcquire(new_partition_lock, LW_EXCLUSIVE);
             /* these just keep the compiler quiet about uninit variables */
@@ -4095,19 +3684,40 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     
     /* Evict others*/
     if(victim_buffer_cxt != buffer_cxt){
+        
+        /* Lock the victim buffer */
+        pthread_mutex_t* first_lock = victim_buffer_cxt->tenant_oid < buffer_cxt->tenant_oid ? 
+        &victim_buffer_cxt->tenant_buffer_lock : &buffer_cxt->tenant_buffer_lock;
+        pthread_mutex_t* second_lock = victim_buffer_cxt->tenant_oid < buffer_cxt->tenant_oid ?
+        &buffer_cxt->tenant_buffer_lock : &victim_buffer_cxt->tenant_buffer_lock;
+        pthread_mutex_lock(first_lock);
+        pthread_mutex_lock(second_lock);
+        
         /* Evict from victim list */
         (BufferDesc *) evict_prev = ((BufferDesc *)buf)->prev;
         (BufferDesc *) evict_next = ((BufferDesc *)buf)->next;
         evict_prev->next = evict_next;
         evict_next->prev = evict_prev;
-        victim_buffer_cxt->real_buffer.curr_size--;
+        victim_buffer_cxt->curr_real_size--;
 
         /* Insert into buffer_cxt */
         buffer_cxt->dummy_tail.prev->next = buf;
         ((BufferDesc *)buf)->prev = buffer_cxt->dummy_tail.prev;
         ((BufferDesc *)buf)->next = &buffer_cxt->dummy_tail;
         buffer_cxt->dummy_tail.prev = buf;
-        buffer_cxt->real_buffer.curr_size++;
+        buffer_cxt->curr_real_size++;
+        ((BufferDesc *)buf)->tenantOid = buffer_cxt->tenant_oid;
+
+
+        pthread_mutex_unlock(second_lock);
+        pthread_mutex_unlock(first_lock);
+    
+    }else{
+        pthread_mutex_lock(&buffer_cxt->tenant_buffer_lock);
+        if(from_free_list){
+            buffer_cxt->curr_real_size++;
+        }
+        pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
     }
     /* Otherwise We'll just need to reset the tag */
 
