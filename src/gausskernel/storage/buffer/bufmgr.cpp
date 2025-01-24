@@ -3187,7 +3187,6 @@ void UpdateHitRateStat(uint32 access_hash, BufferTag *access_tag, bool found){
     pthread_spin_unlock(&buffer_cxt->hit_stat_lock);
 }
 void InsertToHist(BufferTag* access_tag , uint32 access_hash){
-    Assert(access_hash == BufTableHashCode(access_tag));
     pthread_mutex_lock(&g_tenant_info.hist_lock);
     if(g_tenant_info.curr_hist_size == g_tenant_info.max_hist_size){
         /* Remove tail */        
@@ -3205,9 +3204,8 @@ void InsertToHist(BufferTag* access_tag , uint32 access_hash){
         Assert(g_tenant_info.curr_hist_size>=0 && g_tenant_info.curr_hist_size <= g_tenant_info.max_hist_size);
     }
     /* Insert evict buf to hist node */
-    Assert(access_hash == BufTableHashCode(access_tag));
     buffer_node *new_hist_node = (buffer_node *)buf_hash_operate<HASH_ENTER>((HTAB*)t_thrd.thrd_hist_HTAB, 
-        access_tag, access_hash, NULL);
+    access_tag, access_hash, NULL);
     new_hist_node->key_hash = access_hash;
     g_tenant_info.hist_dummy_head.next->prev = new_hist_node;
     new_hist_node->next = g_tenant_info.hist_dummy_head.next;
@@ -3219,7 +3217,6 @@ void InsertToHist(BufferTag* access_tag , uint32 access_hash){
 }
 bool DeleteFromHist(BufferTag* access_tag , uint32 access_hash){
     bool found_descs = false;
-    Assert(access_hash == BufTableHashCode(access_tag));
     pthread_mutex_lock(&g_tenant_info.hist_lock);
     buffer_node *hist_node = (buffer_node *)buf_hash_operate<HASH_REMOVE>((HTAB*)t_thrd.thrd_hist_HTAB, 
     access_tag, access_hash, &found_descs);
@@ -3260,7 +3257,15 @@ void UpdateWeight(BufferTag *access_tag, uint32 access_hash){
         double sla_factor = (double)buffer_cxt->sla / max_sla;
         double pre_val = buffer_cxt->weight;
         total_w -= buffer_cxt->weight;
-        buffer_cxt->weight = zero + buffer_cxt->weight * exp(-1.0 * hrd * sla_factor);        
+        buffer_cxt->weight = zero + buffer_cxt->weight * exp(-1.0 * hrd * sla_factor);
+        // ereport(WARNING, (errmsg("%s Before:%.2f, Decrease factor:%.2f, Hrd:%.3f, After:%.2f"
+        //     , buffer_cxt->tenant_name
+        //     , pre_val
+        //     , exp(-1.0 * hrd * sla_factor)
+        //     , hrd
+        //     , buffer_cxt->weight)
+        //     )    
+        // );        
         total_w += buffer_cxt->weight;
 
         /* global reweight */
@@ -3768,7 +3773,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
         ((BufferDesc *)buf)->tenantOid = buffer_cxt->tenant_oid;
         pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
     }
-    
+
 #if !ENABLE_FIXED
     if(!from_free_list){
         InsertToHist(&old_tag, old_hash);
