@@ -370,7 +370,7 @@ extern void LocalBufferFlushAllBuffer();
 
 #define MINIMAL_BUFFER_SIZE 10240
 #define ENABLE_MULTI_TENANTCY 1
-#define ENABLE_BUFFER_ADJUST 1
+#define ENABLE_FIXED 0
 #define MULTITENANT_RESET_ENABLE 1
 #define ENABLE_HIST 1
 #define TENANT_NAME_LEN 32
@@ -425,7 +425,11 @@ typedef struct tenant_buffer_cxt{
     uint32 tenant_oid;
     double weight{1.0};
     
-    /* Stat */
+    /* Other static */
+    pg_atomic_uint64 reweight_count{0};
+    pg_atomic_uint64 pick_free_count{0};
+    pg_atomic_uint64 pick_self_count{0};
+    pg_atomic_uint64 pick_other_count{0};
 } tenant_buffer_cxt;
 typedef struct tenant_name_mapping{
     //key

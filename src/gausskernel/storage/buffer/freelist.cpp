@@ -431,6 +431,7 @@ BufferDesc* GetBufFreeList(BufferAccessStrategy strategy, uint32* buf_state, ten
 }
 BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt)
 {
+    tenant_buffer_cxt* self = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
     BufferDesc *buf = NULL;
     int bgwproc_no;
     uint32 local_buf_state = 0; /* to avoid repeated (de-)referencing */
@@ -458,23 +459,46 @@ BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_s
         pthread_spin_unlock(&g_tenant_info.free_list_lock);
     }else{
         pthread_spin_lock(&g_tenant_info.free_list_lock);
+        pthread_spin_lock(&buffer_cxt->hit_stat_lock);
         if(g_tenant_info.tenant_free_taken < (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE)){
             g_tenant_info.tenant_free_taken++;
             take_from_free_list = true;
         }
+        pthread_spin_unlock(&buffer_cxt->hit_stat_lock);
         pthread_spin_unlock(&g_tenant_info.free_list_lock);
+    }
+
+#if ENABLE_FIXED
+    pthread_mutex_lock(&buffer_cxt->tenant_buffer_lock);
+    take_from_free_list = take_from_free_list && buffer_cxt->curr_real_size < buffer_cxt->max_real_size;
+    pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
+#endif
+
+    if(take_from_free_list){
+        buf = GetBufFreeList(strategy, buf_state, buffer_cxt);
+        if(buf != NULL){
+            pg_atomic_fetch_add_u64(&(self->pick_free_count), 1);
+            pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
+            return buf;
+        }
     }
     
     if(take_from_free_list){
         /* Fetch from global free buffer pool */
         buf = GetBufFreeList(strategy, buf_state, buffer_cxt);
         if(buf != NULL){
+            pg_atomic_fetch_add_u64(&(self->pick_free_count), 1);
             return buf;
         }
     }
 EVICT:
     /* Fetch from tenant's buffer pool */
     BufferDesc* ans =  ClockSweepBufferEvict(strategy, buf_state, buffer_cxt);
+    if(buffer_cxt == self){
+        pg_atomic_fetch_add_u64(&(self->pick_self_count), 1);
+    }else{
+        pg_atomic_fetch_add_u64(&(self->pick_other_count), 1);
+    }
     return ans;
 }
 

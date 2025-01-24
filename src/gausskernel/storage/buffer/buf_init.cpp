@@ -146,19 +146,22 @@ tenant_buffer_cxt* GetThrdTenant(const char* name){
             ereport(WARNING,
             (errmsg("Tenant [%s] added, Id: [%u], Promised mem: [%u mb][%u blk] , SLA: [%u]", name, tenant_id, promised_memory, ref_capacity, sla)));
             ereport(WARNING,
-            (errmsg("Current Total Promised:[%u] Actual[%u] Active Tenant Num[%u]", g_tenant_info.total_promised, NORMAL_SHARED_BUFFER_NUM, g_tenant_info.tenant_num)));
+            (errmsg("Current Total Promised:[%u] Actual[%u] Active Tenant Num[%u]", g_tenant_info.total_promised, NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE, g_tenant_info.tenant_num)));
             pthread_mutex_lock(&g_tenant_info.tenant_stat_lock);
             {
                 uint64 total_actual = (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE);
-                uint64 total_promised = (g_tenant_info.total_promised - MINIMAL_BUFFER_SIZE);
+                uint64 total_promised = (g_tenant_info.total_promised);
                 for(uint i = 0; i < g_tenant_info.tenant_num; ++i){
                     /* Every time new tenant in, reset the weight */
                     g_tenant_info.tenant_buffer_cxt_array[i].weight = 1.0 / g_tenant_info.tenant_num;
-#if !ENABLE_BUFFER_ADJUST
+#if ENABLE_FIXED
+                    pthread_mutex_lock(&buffer_cxt->tenant_buffer_lock);
+                    g_tenant_info.tenant_buffer_cxt_array[i].max_real_size = (total_actual * g_tenant_info.tenant_buffer_cxt_array[i].max_ref_size) / total_promised;
+                    pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
                     ereport(WARNING, (errmsg("Tenant[%s] Promised:[%u] Actual[%u] Active Tenant Num[%u]"
                     , g_tenant_info.tenant_buffer_cxt_array[i].tenant_name
-                    , g_tenant_info.tenant_buffer_cxt_array[i].real_buffer.max_capacity
-                    , g_tenant_info.tenant_buffer_cxt_array[i].limit_max
+                    , g_tenant_info.tenant_buffer_cxt_array[i].max_ref_size
+                    , g_tenant_info.tenant_buffer_cxt_array[i].max_real_size
                     , g_tenant_info.tenant_num)));
 #endif
                 }
@@ -249,7 +252,6 @@ static void InitTenantHist(bool first_init){
         g_tenant_info.hist_dummy_tail.prev = &g_tenant_info.hist_dummy_head;
         g_tenant_info.hist_dummy_tail.next = NULL;
         g_tenant_info.max_hist_size = NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE;
-        g_tenant_info.max_hist_size = 1;
         g_tenant_info.curr_hist_size = 0;
     }
 }

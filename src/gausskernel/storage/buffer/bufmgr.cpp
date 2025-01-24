@@ -3070,13 +3070,13 @@ void show_tenant_status(){
     pthread_mutex_lock(&g_tenant_info.tenant_stat_lock);
     ereport(WARNING, (errmsg("=====Tenant Weight Info[Alloc count:%u][MTPR Enable:%s][Tenant free alloc:%u]====="
         , g_tenant_info.update_count
-        , ENABLE_BUFFER_ADJUST ? "Yes": "No"
+        , !ENABLE_FIXED ? "Yes": "No"
         , g_tenant_info.tenant_free_taken)));
     for(uint32 i = 0; i < g_tenant_info.tenant_num; i++){
                 pthread_spin_lock(&g_tenant_info.tenant_buffer_cxt_array[i].hit_stat_lock);
                 tenant_buffer_cxt* temp = &g_tenant_info.tenant_buffer_cxt_array[i];
                 
-                ereport(WARNING, (errmsg("Tenant:[%s], weight:[%f], sla:[%u], HRD = [%f], Real[H/M:%u/%u] = [%.2f%] Ref[H/M:%u/%u] = [%.2f%] Curr size:[%u]", 
+                ereport(WARNING, (errmsg("T:[%s], W:[%f], SLA:[%u], HRD:[%f], Rel[H/M:%u/%u][%.2f%] Ref[H/M:%u/%u][%.2f%] Size:[%u] Pick[Free/Self/Others:%lu/%lu/%lu] Reweight:%lu", 
                     temp->tenant_name, 
                     temp->weight,
                     temp->sla,
@@ -3087,7 +3087,12 @@ void show_tenant_status(){
                     temp->ref_hits,
                     temp->ref_misses,
                     100.0 * (double)(temp->ref_hits) / (double)(temp->ref_hits + temp->ref_misses),
-                    temp->curr_ref_size))
+                    temp->curr_real_size,
+                    pg_atomic_read_u64(&temp->pick_free_count),
+                    pg_atomic_read_u64(&temp->pick_self_count),
+                    pg_atomic_read_u64(&temp->pick_other_count),
+                    pg_atomic_read_u64(&temp->reweight_count)
+                    ))
                 );
 
                 total_hit += temp->real_hits;
@@ -3236,6 +3241,7 @@ void UpdateWeight(BufferTag *access_tag, uint32 access_hash){
     tenant_buffer_cxt* buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
     bool found_descs = DeleteFromHist(access_tag, access_hash);
     if(found_descs){
+        pg_atomic_add_fetch_u64(&buffer_cxt->reweight_count, 1);
         pthread_spin_lock(&buffer_cxt->hit_stat_lock);
         double hrd = GetTenantHRD(buffer_cxt);
         pthread_spin_unlock(&buffer_cxt->hit_stat_lock);
@@ -3431,7 +3437,9 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     new_partition_lock = BufMappingPartitionLock(new_hash);
 
     /* Before we even lock anything we'll update weight first */
+#if !ENABLE_FIXED
     UpdateWeight(&new_tag, new_hash);
+#endif
 
     /* see if the block is in the buffer pool already */
     (void)LWLockAcquire(new_partition_lock, LW_SHARED);
@@ -3486,8 +3494,12 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
      * buffer.	Remember to unlock the mapping lock while doing the work.
      */
     LWLockRelease(new_partition_lock);
+#if ENABLE_FIXED
+    tenant_buffer_cxt* victim_buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
+#else
     /* We first find victim to evict */
     tenant_buffer_cxt* victim_buffer_cxt = GetVictimTenant();
+#endif
     Assert(victim_buffer_cxt);
     /* Loop here in case we have to try another victim buffer */
     for (;;) {
@@ -3756,10 +3768,12 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
         ((BufferDesc *)buf)->tenantOid = buffer_cxt->tenant_oid;
         pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
     }
-
+    
+#if !ENABLE_FIXED
     if(!from_free_list){
         InsertToHist(&old_tag, old_hash);
     }
+#endif
     /* Otherwise We'll just need to reset the tag */
 
     /*
