@@ -384,6 +384,7 @@ enum BufferType{
 };
 typedef struct buffer_node {
     BufferTag key;
+    uint32 key_hash;
     int buffer_id;
     struct buffer_node* prev;
     struct buffer_node* next;
@@ -446,8 +447,8 @@ typedef struct tenant_info{
     pthread_mutex_t hist_lock;
     buffer_node hist_dummy_head;
     buffer_node hist_dummy_tail;
-    uint64 max_hist_size{0};
-    uint64 curr_hist_size{0};
+    uint64 max_hist_size;
+    uint64 curr_hist_size;
 
     /* Tenant map lock */
     pthread_mutex_t tenant_map_lock;

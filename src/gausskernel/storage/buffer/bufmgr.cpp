@@ -3181,26 +3181,64 @@ void UpdateHitRateStat(uint32 access_hash, BufferTag *access_tag, bool found){
         buffer_cxt->real_misses++;
     pthread_spin_unlock(&buffer_cxt->hit_stat_lock);
 }
-void UpdateWeight(BufferTag *access_tag, uint32 access_hash){
-    bool found_descs = false;
-    tenant_buffer_cxt* buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
+void InsertToHist(BufferTag* access_tag , uint32 access_hash){
+    Assert(access_hash == BufTableHashCode(access_tag));
     pthread_mutex_lock(&g_tenant_info.hist_lock);
-    buffer_node *hist_node = (buffer_node *)buf_hash_operate<HASH_FIND>((HTAB*)t_thrd.thrd_hist_HTAB, 
+    if(g_tenant_info.curr_hist_size == g_tenant_info.max_hist_size){
+        /* Remove tail */        
+        buffer_node* tail = g_tenant_info.hist_dummy_tail.prev;
+        Assert(tail != &g_tenant_info.hist_dummy_head);
+
+        buffer_node* prev = tail->prev;
+        
+        prev->next = &g_tenant_info.hist_dummy_tail;
+        g_tenant_info.hist_dummy_tail.prev = prev;
+        
+        g_tenant_info.curr_hist_size--;
+        void * delete_ele = (void *)buf_hash_operate<HASH_REMOVE>((HTAB*)t_thrd.thrd_hist_HTAB, 
+        &tail->key, BufTableHashCode(&tail->key), NULL);
+        Assert(g_tenant_info.curr_hist_size>=0 && g_tenant_info.curr_hist_size <= g_tenant_info.max_hist_size);
+    }
+    /* Insert evict buf to hist node */
+    Assert(access_hash == BufTableHashCode(access_tag));
+    buffer_node *new_hist_node = (buffer_node *)buf_hash_operate<HASH_ENTER>((HTAB*)t_thrd.thrd_hist_HTAB, 
+        access_tag, access_hash, NULL);
+    new_hist_node->key_hash = access_hash;
+    g_tenant_info.hist_dummy_head.next->prev = new_hist_node;
+    new_hist_node->next = g_tenant_info.hist_dummy_head.next;
+    g_tenant_info.hist_dummy_head.next = new_hist_node;
+    new_hist_node->prev = &g_tenant_info.hist_dummy_head;
+    g_tenant_info.curr_hist_size++;
+    Assert(g_tenant_info.curr_hist_size>=0 && g_tenant_info.curr_hist_size <= g_tenant_info.max_hist_size);
+    pthread_mutex_unlock(&g_tenant_info.hist_lock);
+}
+bool DeleteFromHist(BufferTag* access_tag , uint32 access_hash){
+    bool found_descs = false;
+    Assert(access_hash == BufTableHashCode(access_tag));
+    pthread_mutex_lock(&g_tenant_info.hist_lock);
+    buffer_node *hist_node = (buffer_node *)buf_hash_operate<HASH_REMOVE>((HTAB*)t_thrd.thrd_hist_HTAB, 
     access_tag, access_hash, &found_descs);
     if(found_descs){
-            bool del;
+            if(g_tenant_info.curr_hist_size == 0){
+                Assert(0);
+            }
+            Assert(hist_node->key_hash == access_hash);
             hist_node->next->prev = hist_node->prev;
             hist_node->prev->next = hist_node->next;
-            buf_hash_operate<HASH_REMOVE>((HTAB*)t_thrd.thrd_hist_HTAB, access_tag, access_hash, &del);
+            hist_node->key_hash = UINT32_MAX;
             g_tenant_info.curr_hist_size--;
     }
+    Assert(g_tenant_info.curr_hist_size >= 0 && g_tenant_info.curr_hist_size <= g_tenant_info.max_hist_size);
     pthread_mutex_unlock(&g_tenant_info.hist_lock);
-
-    pthread_spin_lock(&buffer_cxt->hit_stat_lock);
-    double hrd = GetTenantHRD(buffer_cxt);
-    pthread_spin_lock(&buffer_cxt->hit_stat_lock);
-
+    return found_descs;
+}
+void UpdateWeight(BufferTag *access_tag, uint32 access_hash){
+    tenant_buffer_cxt* buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
+    bool found_descs = DeleteFromHist(access_tag, access_hash);
     if(found_descs){
+        pthread_spin_lock(&buffer_cxt->hit_stat_lock);
+        double hrd = GetTenantHRD(buffer_cxt);
+        pthread_spin_unlock(&buffer_cxt->hit_stat_lock);
         const double zero = 0.0000001;
         double total_w = 0;
         uint32 max_sla = 0;
@@ -3692,10 +3730,11 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
         victim_buffer_cxt->curr_real_size--;
 
         /* Insert into buffer_cxt */
-        buffer_cxt->real_dummy_tail.next = buf;
-        ((BufferDesc *)buf)->prev = buffer_cxt->real_dummy_tail.prev;
+        BufferDesc * tail = buffer_cxt->real_dummy_tail.prev;
+        ((BufferDesc *)buf)->prev = tail;
+        tail->next = (BufferDesc *)buf;
         ((BufferDesc *)buf)->next = &buffer_cxt->real_dummy_tail;
-        buffer_cxt->real_dummy_tail.prev = buf;
+        buffer_cxt->real_dummy_tail.prev = (BufferDesc *)buf;
         buffer_cxt->curr_real_size++;
         ((BufferDesc *)buf)->tenantOid = buffer_cxt->tenant_oid;
 
@@ -3706,9 +3745,20 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     }else{
         pthread_mutex_lock(&buffer_cxt->tenant_buffer_lock);
         if(from_free_list){
+            /* Insert into buffer_cxt */
+            BufferDesc * tail = buffer_cxt->real_dummy_tail.prev;
+            ((BufferDesc *)buf)->prev = tail;
+            tail->next = (BufferDesc *)buf;
+            ((BufferDesc *)buf)->next = &buffer_cxt->real_dummy_tail;
+            buffer_cxt->real_dummy_tail.prev = (BufferDesc *)buf;
             buffer_cxt->curr_real_size++;
         }
+        ((BufferDesc *)buf)->tenantOid = buffer_cxt->tenant_oid;
         pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
+    }
+
+    if(!from_free_list){
+        InsertToHist(&old_tag, old_hash);
     }
     /* Otherwise We'll just need to reset the tag */
 

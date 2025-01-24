@@ -446,6 +446,7 @@ BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_s
      * the rate of buffer consumption.	Note that buffers recycled by a
      * strategy object are intentionally not counted here.
      */
+    
     (void)pg_atomic_fetch_add_u32(&t_thrd.storage_cxt.StrategyControl->numBufferAllocs, 1);
     bool take_from_free_list = false;
     if(buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt){

@@ -1607,7 +1607,7 @@ void* buf_hash_operate(HTAB* hashp, const BufferTag* keyPtr, uint32 hashvalue, b
 #endif
     }
 
-    if (action == HASH_ENTER || action == HASH_FIND || action == HASH_REMOVE) {
+    if (foundPtr && (action == HASH_ENTER || action == HASH_FIND || action == HASH_REMOVE)) {
         *foundPtr = (bool)(currBucket != NULL);
     }
     /*

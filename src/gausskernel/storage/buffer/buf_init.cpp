@@ -214,6 +214,10 @@ void InitNonTenantBuffer(){
         g_tenant_info.non_tenant_buffer_cxt.real_dummy_head.prev = NULL;
         g_tenant_info.non_tenant_buffer_cxt.real_dummy_tail.prev = &g_tenant_info.non_tenant_buffer_cxt.real_dummy_head;
         g_tenant_info.non_tenant_buffer_cxt.real_dummy_tail.next = NULL;
+        /* Tenant 's mutex */
+        pthread_mutex_init(&g_tenant_info.non_tenant_buffer_cxt.tenant_buffer_lock, NULL);
+        pthread_mutex_init(&g_tenant_info.non_tenant_buffer_cxt.tenant_ref_buffer_lock, NULL);
+        pthread_spin_init(&g_tenant_info.non_tenant_buffer_cxt.hit_stat_lock, NULL);
     }
 }
 void InitBufferPool(bool *found_descs){
@@ -229,29 +233,33 @@ void InitBufferPool(bool *found_descs){
         }
     }
 }
-static void InitTenantHist(){
-    bool found_descs = false;
+static void InitTenantHist(bool first_init){
     HASHCTL hctl1;
     memset_s(&hctl1, sizeof(HASHCTL), 0, sizeof(HASHCTL));
     hctl1.keysize = sizeof(BufferTag);//tag hash
     hctl1.entrysize = sizeof(buffer_node);//lru node
     hctl1.hash = tag_hash;
     t_thrd.thrd_hist_HTAB = ShmemInitHash("Hist", 
-    NORMAL_SHARED_BUFFER_NUM, NORMAL_SHARED_BUFFER_NUM, &hctl1, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
-    if(!found_descs){
+    NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE, 
+    NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE, 
+    &hctl1, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
+    if(first_init){
         g_tenant_info.hist_dummy_head.next = &g_tenant_info.hist_dummy_tail;
         g_tenant_info.hist_dummy_head.prev = NULL;
         g_tenant_info.hist_dummy_tail.prev = &g_tenant_info.hist_dummy_head;
         g_tenant_info.hist_dummy_tail.next = NULL;
-        g_tenant_info.max_hist_size = NORMAL_SHARED_BUFFER_NUM;
+        g_tenant_info.max_hist_size = NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE;
+        g_tenant_info.max_hist_size = 1;
         g_tenant_info.curr_hist_size = 0;
     }
 }
-static void InitTenantBufferLock(){
-    pthread_spin_init(&g_tenant_info.free_list_lock, NULL);
-    pthread_mutex_init(&g_tenant_info.hist_lock, NULL);
-    pthread_mutex_init(&g_tenant_info.tenant_stat_lock, NULL);
-    pthread_mutex_init(&g_tenant_info.tenant_map_lock, NULL);
+static void InitTenantBufferLock(bool first_init){
+    if(first_init){
+        pthread_spin_init(&g_tenant_info.free_list_lock, NULL);
+        pthread_mutex_init(&g_tenant_info.hist_lock, NULL);
+        pthread_mutex_init(&g_tenant_info.tenant_stat_lock, NULL);
+        pthread_mutex_init(&g_tenant_info.tenant_map_lock, NULL);
+    }
 }
 void InitTenantMap(){
     HASHCTL hctl;
@@ -270,13 +278,12 @@ void InitMultiTenantBufferPool(void){
     bool found_descs = false;  
     /* Free pool init */
     InitBufferPool(&found_descs);
-    if(!found_descs){
-        /* Lock only init once */
-        InitTenantBufferLock();
-    }
+    
+    /* Lock only init once */
+    InitTenantBufferLock(!found_descs);
 
     /* Evict history list should be fifo */
-    InitTenantHist();
+    InitTenantHist(!found_descs);
 
     /* Non-Tenant Buffer */
     InitNonTenantBuffer();
