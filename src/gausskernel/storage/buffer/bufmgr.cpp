@@ -3393,6 +3393,14 @@ tenant_buffer_cxt* GetVictimTenant(){
         return (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
     }
     
+    tenant_buffer_cxt* self = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
+    pthread_spin_lock(&((tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt)->hit_stat_lock);
+    bool need_steal = self->real_misses > self->ref_misses;
+    pthread_spin_unlock(&((tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt)->hit_stat_lock);
+    if(!need_steal){
+        return (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
+    }
+
     /* Pick victim */
     bool do_reset = false;
     pthread_mutex_lock(&g_tenant_info.tenant_stat_lock);

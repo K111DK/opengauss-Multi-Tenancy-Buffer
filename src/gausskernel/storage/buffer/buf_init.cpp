@@ -213,6 +213,8 @@ void InitNonTenantBuffer(){
         entry->tenant_cxt = &g_tenant_info.non_tenant_buffer_cxt;
         g_tenant_info.non_tenant_buffer_cxt.max_real_size = MINIMAL_BUFFER_SIZE;
         g_tenant_info.non_tenant_buffer_cxt.curr_real_size = 0;
+        g_tenant_info.non_tenant_buffer_cxt.max_ref_size = MINIMAL_BUFFER_SIZE;
+        g_tenant_info.non_tenant_buffer_cxt.curr_ref_size = 0;
         g_tenant_info.non_tenant_buffer_cxt.real_dummy_head.next = &g_tenant_info.non_tenant_buffer_cxt.real_dummy_tail;
         g_tenant_info.non_tenant_buffer_cxt.real_dummy_head.prev = NULL;
         g_tenant_info.non_tenant_buffer_cxt.real_dummy_tail.prev = &g_tenant_info.non_tenant_buffer_cxt.real_dummy_head;

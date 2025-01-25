@@ -467,11 +467,20 @@ BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_s
         pthread_spin_unlock(&buffer_cxt->hit_stat_lock);
         pthread_spin_unlock(&g_tenant_info.free_list_lock);
     }
-
 #if ENABLE_FIXED
     pthread_mutex_lock(&buffer_cxt->tenant_buffer_lock);
     take_from_free_list = take_from_free_list && buffer_cxt->curr_real_size < buffer_cxt->max_real_size;
     pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
+#else
+    pthread_mutex_lock(&buffer_cxt->tenant_buffer_lock);
+    pthread_spin_lock(&buffer_cxt->hit_stat_lock);
+    uint32 active_tenant_num = g_tenant_info.tenant_num == 0 ? 1 : g_tenant_info.tenant_num;
+    bool tempo_satisfy = buffer_cxt->real_misses <= buffer_cxt->ref_misses &&
+        buffer_cxt->curr_real_size >= ((NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE) / (active_tenant_num * active_tenant_num));
+    pthread_spin_unlock(&buffer_cxt->hit_stat_lock);
+    pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
+    if(tempo_satisfy)
+        take_from_free_list = false;
 #endif
 
     if(take_from_free_list){
