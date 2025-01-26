@@ -155,9 +155,9 @@ tenant_buffer_cxt* GetThrdTenant(const char* name){
                     /* Every time new tenant in, reset the weight */
                     g_tenant_info.tenant_buffer_cxt_array[i].weight = 1.0 / g_tenant_info.tenant_num;
 #if ENABLE_FIXED
-                    pthread_mutex_lock(&buffer_cxt->tenant_buffer_lock);
+                    pthread_mutex_lock(&g_tenant_info.tenant_buffer_cxt_array[i].tenant_buffer_lock);
                     g_tenant_info.tenant_buffer_cxt_array[i].max_real_size = (total_actual * g_tenant_info.tenant_buffer_cxt_array[i].max_ref_size) / total_promised;
-                    pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
+                    pthread_mutex_unlock(&g_tenant_info.tenant_buffer_cxt_array[i].tenant_buffer_lock);
                     ereport(WARNING, (errmsg("Tenant[%s] Promised:[%u] Actual[%u] Active Tenant Num[%u]"
                     , g_tenant_info.tenant_buffer_cxt_array[i].tenant_name
                     , g_tenant_info.tenant_buffer_cxt_array[i].max_ref_size
@@ -189,6 +189,7 @@ void InitTenantPrivateCxt(){
     }
     if(kill_db){
         show_tenant_status();
+        Assert(0);
     }
     tenant_buffer_cxt* thrd_tenant = NULL;
     const char* curr_thrd_name = name_valid ? u_sess->proc_cxt.MyProcPort->user_name : NON_TENANT_NAME;
