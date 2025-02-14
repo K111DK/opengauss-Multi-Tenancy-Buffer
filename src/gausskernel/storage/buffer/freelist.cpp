@@ -448,18 +448,18 @@ BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_s
      * strategy object are intentionally not counted here.
      */
     bool tempo_satisfy = false;
-#if ENABLE_FIXED
-    pthread_mutex_lock(&buffer_cxt->tenant_buffer_lock);
-    tempo_satisfy = buffer_cxt->curr_real_size >= buffer_cxt->max_real_size;
-    pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
-#else
-    pthread_mutex_lock(&buffer_cxt->tenant_buffer_lock);
-    pthread_spin_lock(&buffer_cxt->hit_stat_lock);
-    tempo_satisfy = buffer_cxt->real_misses < buffer_cxt->ref_misses &&
-    buffer_cxt->curr_real_size > buffer_cxt->max_ref_size;
-    pthread_spin_unlock(&buffer_cxt->hit_stat_lock);
-    pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
-#endif
+    if (ENABLE_FIXED){
+        pthread_mutex_lock(&buffer_cxt->tenant_buffer_lock);
+        tempo_satisfy = buffer_cxt->curr_real_size >= buffer_cxt->max_real_size;
+        pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
+    }else{
+        pthread_mutex_lock(&buffer_cxt->tenant_buffer_lock);
+        pthread_spin_lock(&buffer_cxt->hit_stat_lock);
+        tempo_satisfy = buffer_cxt->real_misses < buffer_cxt->ref_misses &&
+        buffer_cxt->curr_real_size > buffer_cxt->max_ref_size;
+        pthread_spin_unlock(&buffer_cxt->hit_stat_lock);
+        pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
+    }
     
     (void)pg_atomic_fetch_add_u32(&t_thrd.storage_cxt.StrategyControl->numBufferAllocs, 1);
     bool take_from_free_list = false;

@@ -3450,9 +3450,8 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     new_partition_lock = BufMappingPartitionLock(new_hash);
 
     /* Before we even lock anything we'll update weight first */
-#if !ENABLE_FIXED
-    UpdateWeight(&new_tag, new_hash);
-#endif
+    if(!ENABLE_FIXED)
+        UpdateWeight(&new_tag, new_hash);
 
     /* see if the block is in the buffer pool already */
     (void)LWLockAcquire(new_partition_lock, LW_SHARED);
@@ -3506,13 +3505,15 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
      * Didn't find it in the buffer pool.  We'll have to initialize a new
      * buffer.	Remember to unlock the mapping lock while doing the work.
      */
-    LWLockRelease(new_partition_lock);
-#if ENABLE_FIXED
     tenant_buffer_cxt* victim_buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
-#else
-    /* We first find victim to evict */
-    tenant_buffer_cxt* victim_buffer_cxt = GetVictimTenant();
-#endif
+    LWLockRelease(new_partition_lock);
+    
+    if(ENABLE_FIXED)
+        victim_buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
+    else
+        /* We first find victim to evict */
+        victim_buffer_cxt = GetVictimTenant();
+
     Assert(victim_buffer_cxt);
     /* Loop here in case we have to try another victim buffer */
     for (;;) {
@@ -3782,11 +3783,11 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
         pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
     }
 
-#if !ENABLE_FIXED
-    if(!from_free_list){
-        InsertToHist(&old_tag, old_hash);
+    if(!ENABLE_FIXED){
+        if(!from_free_list){
+            InsertToHist(&old_tag, old_hash);
+        }
     }
-#endif
     /* Otherwise We'll just need to reset the tag */
 
     /*
@@ -3855,11 +3856,10 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
 }
 static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
                                BufferAccessStrategy strategy, bool *found, const XLogPhyBlock *pblk){
-    #if ENABLE_MULTI_TENANTCY
+    if(ENABLE_MULTI_TENANTCY)
         return TenantBufferAlloc(smgr, relpersistence, fork_num, block_num, strategy, found, pblk);
-    #else
+    else
         return BufferAllocInternal(smgr, relpersistence, fork_num, block_num, strategy, found, pblk);
-    #endif
 }
 /*
  * InvalidateBuffer -- mark a shared buffer invalid and return it to the

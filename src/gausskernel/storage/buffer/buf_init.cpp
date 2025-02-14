@@ -151,19 +151,21 @@ tenant_buffer_cxt* GetThrdTenant(const char* name){
             {
                 uint64 total_actual = (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE);
                 uint64 total_promised = (g_tenant_info.total_promised);
+
+                
                 for(uint i = 0; i < g_tenant_info.tenant_num; ++i){
                     /* Every time new tenant in, reset the weight */
                     g_tenant_info.tenant_buffer_cxt_array[i].weight = 1.0 / g_tenant_info.tenant_num;
-#if ENABLE_FIXED
-                    pthread_mutex_lock(&g_tenant_info.tenant_buffer_cxt_array[i].tenant_buffer_lock);
-                    g_tenant_info.tenant_buffer_cxt_array[i].max_real_size = (total_actual * g_tenant_info.tenant_buffer_cxt_array[i].max_ref_size) / total_promised;
-                    pthread_mutex_unlock(&g_tenant_info.tenant_buffer_cxt_array[i].tenant_buffer_lock);
-                    ereport(WARNING, (errmsg("Tenant[%s] Promised:[%u] Actual[%u] Active Tenant Num[%u]"
-                    , g_tenant_info.tenant_buffer_cxt_array[i].tenant_name
-                    , g_tenant_info.tenant_buffer_cxt_array[i].max_ref_size
-                    , g_tenant_info.tenant_buffer_cxt_array[i].max_real_size
-                    , g_tenant_info.tenant_num)));
-#endif
+                    if(ENABLE_FIXED){
+                        pthread_mutex_lock(&g_tenant_info.tenant_buffer_cxt_array[i].tenant_buffer_lock);
+                        g_tenant_info.tenant_buffer_cxt_array[i].max_real_size = (total_actual * g_tenant_info.tenant_buffer_cxt_array[i].max_ref_size) / total_promised;
+                        pthread_mutex_unlock(&g_tenant_info.tenant_buffer_cxt_array[i].tenant_buffer_lock);
+                        ereport(WARNING, (errmsg("Tenant[%s] Promised:[%u] Actual[%u] Active Tenant Num[%u]"
+                        , g_tenant_info.tenant_buffer_cxt_array[i].tenant_name
+                        , g_tenant_info.tenant_buffer_cxt_array[i].max_ref_size
+                        , g_tenant_info.tenant_buffer_cxt_array[i].max_real_size
+                        , g_tenant_info.tenant_num)));
+                    }
                 }
             }
             pthread_mutex_unlock(&g_tenant_info.tenant_stat_lock);
@@ -317,10 +319,10 @@ void InitBufferPool(void)
                         TOTAL_BUFFER_NUM * sizeof(BufferDescExtra) + PG_CACHE_LINE_SIZE,
                         &found_buf_extra));
 
-#if ENABLE_MULTI_TENANTCY
+    if(ENABLE_MULTI_TENANTCY){
         /* We make sure this won't exec twice */
         InitMultiTenantBufferPool();
-#endif
+    }
 
 
     /* Init candidate buffer list and candidate buffer free map */
