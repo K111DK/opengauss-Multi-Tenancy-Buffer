@@ -3067,20 +3067,25 @@ tenant_info g_tenant_info;
 void show_tenant_status(){
     uint64 total_hit = 0;
     uint64 total_miss = 0;
+    double total_cost = 0.0;
     pthread_mutex_lock(&g_tenant_info.tenant_stat_lock);
     ereport(WARNING, (errmsg("=====Tenant Weight Info[Alloc count:%u][MTPR Enable:%s][Tenant free alloc:%u]====="
         , g_tenant_info.update_count
         , !ENABLE_FIXED ? "Yes": "No"
         , g_tenant_info.tenant_free_taken)));
+    ereport(WARNING, (errmsg("Non-tenant [H/M:%lu/%lu] Free Taken:%lu"
+    , g_tenant_info.non_tenant_buffer_cxt.real_hits
+    , g_tenant_info.non_tenant_buffer_cxt.real_misses
+    , g_tenant_info.non_tenant_free_taken)));
     for(uint32 i = 0; i < g_tenant_info.tenant_num; i++){
                 pthread_spin_lock(&g_tenant_info.tenant_buffer_cxt_array[i].hit_stat_lock);
                 tenant_buffer_cxt* temp = &g_tenant_info.tenant_buffer_cxt_array[i];
-                
+                double temp_hrd = GetTenantHRD(temp);
                 ereport(WARNING, (errmsg("T:[%s], W:[%f], SLA:[%u], HRD:[%f], Rel[H/M:%u/%u][%.2f%] Ref[H/M:%u/%u][%.2f%] Size:[%u] Pick[Free/Self/Others:%lu/%lu/%lu] Reweight:%lu", 
                     temp->tenant_name, 
                     temp->weight,
                     temp->sla,
-                    GetTenantHRD(temp),
+                    temp_hrd,
                     temp->real_hits,
                     temp->real_misses,
                     100.0 * (double)(temp->real_hits) / (double)(temp->real_hits + temp->real_misses),
@@ -3097,6 +3102,7 @@ void show_tenant_status(){
 
                 total_hit += temp->real_hits;
                 total_miss += temp->real_misses;
+                total_cost += temp_hrd  * temp->sla;
                 pthread_spin_unlock(&g_tenant_info.tenant_buffer_cxt_array[i].hit_stat_lock);
     }
     pthread_mutex_unlock(&g_tenant_info.tenant_stat_lock);
@@ -3105,6 +3111,7 @@ void show_tenant_status(){
                                     total_miss,
                                     100.0 *( (double)total_hit / (double) (total_hit + total_miss) )
                                     )));
+    ereport(WARNING, (errmsg("Total SLA Cost = %f", total_cost)));
 }
 #include "utils/dynahash.h"
 /* Make sure we held hit stat lock */
