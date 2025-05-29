@@ -368,9 +368,10 @@ extern void FlushBuffer(void* buf, SMgrRelation reln, ReadBufferMethod flushmeth
 extern void LocalBufferFlushAllBuffer();
 
 
-#define MINIMAL_BUFFER_SIZE 10240
+#define MINIMAL_BUFFER_SIZE 256
 #define ENABLE_MULTI_TENANTCY (g_instance.attr.attr_storage.enable_multi_tenant)
 #define ENABLE_FIXED (!g_instance.attr.attr_storage.enable_mtrp)
+#define ENABLE_COST_TEST (g_instance.attr.attr_storage.enable_cost_test)
 #define MULTITENANT_RESET_ENABLE 1
 #define ENABLE_HIST 1
 #define TENANT_NAME_LEN 32

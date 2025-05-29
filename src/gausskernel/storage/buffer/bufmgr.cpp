@@ -3457,7 +3457,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     new_partition_lock = BufMappingPartitionLock(new_hash);
 
     /* Before we even lock anything we'll update weight first */
-    if(!ENABLE_FIXED)
+    if(!ENABLE_FIXED || ENABLE_COST_TEST)
         UpdateWeight(&new_tag, new_hash);
 
     /* see if the block is in the buffer pool already */
@@ -3504,7 +3504,9 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
             buf->extra->seg_blockno = pblk->block;
             MarkReadPblk(buf->buf_id, pblk);
         }
-        UpdateHitRateStat(new_hash, &new_tag, *found);
+
+        if(!ENABLE_FIXED || ENABLE_COST_TEST)
+            UpdateHitRateStat(new_hash, &new_tag, *found);
         return buf;
     }
 
@@ -3515,12 +3517,15 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     tenant_buffer_cxt* victim_buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
     LWLockRelease(new_partition_lock);
     
-    if(ENABLE_FIXED)
+    if(ENABLE_FIXED){
         victim_buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
-    else
+        if(ENABLE_COST_TEST){
+            GetVictimTenant();
+        }
+    }else{
         /* We first find victim to evict */
         victim_buffer_cxt = GetVictimTenant();
-
+    }
     Assert(victim_buffer_cxt);
     /* Loop here in case we have to try another victim buffer */
     for (;;) {
@@ -3790,7 +3795,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
         pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
     }
 
-    if(!ENABLE_FIXED){
+    if(!ENABLE_FIXED || ENABLE_COST_TEST){
         if(!from_free_list){
             InsertToHist(&old_tag, old_hash);
         }
@@ -3852,13 +3857,14 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
      * Buffer contents are currently invalid.  Try to get the io_in_progress
      * lock.  If StartBufferIO returns false, then someone else managed to
      * read it before we did, so there's nothing left for BufferAlloc() to do.
-     */
+     */1
     if (StartBufferIO(buf, true)) {
         *found = FALSE;
     } else {
         *found = TRUE;
     }
-    UpdateHitRateStat(new_hash, &new_tag, *found);
+    if(!ENABLE_FIXED || ENABLE_COST_TEST)
+        UpdateHitRateStat(new_hash, &new_tag, *found);
     return buf;
 }
 static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,

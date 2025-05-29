@@ -214,6 +214,7 @@ typedef struct knl_instance_attr_storage {
     /* Mtrp */
     bool enable_multi_tenant;
     bool enable_mtrp;
+    bool enable_cost_test;
 } knl_instance_attr_storage;
 
 #endif /* SRC_INCLUDE_KNL_KNL_INSTANCE_ATTR_STORAGE_H_ */
