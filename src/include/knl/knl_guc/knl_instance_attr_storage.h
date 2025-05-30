@@ -215,6 +215,13 @@ typedef struct knl_instance_attr_storage {
     bool enable_multi_tenant;
     bool enable_mtrp;
     bool enable_cost_test;
+    int max_tenant;
+    bool enable_update_weight;
+    bool enable_update_struct;
+    bool enable_sampling;
+    bool enable_log;
+    int64 log_interval;
+    int extra_mem_factor;
 } knl_instance_attr_storage;
 
 #endif /* SRC_INCLUDE_KNL_KNL_INSTANCE_ATTR_STORAGE_H_ */

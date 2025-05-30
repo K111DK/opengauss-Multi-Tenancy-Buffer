@@ -372,13 +372,18 @@ extern void LocalBufferFlushAllBuffer();
 #define ENABLE_MULTI_TENANTCY (g_instance.attr.attr_storage.enable_multi_tenant)
 #define ENABLE_FIXED (!g_instance.attr.attr_storage.enable_mtrp)
 #define ENABLE_COST_TEST (g_instance.attr.attr_storage.enable_cost_test)
+#define ENABLE_UPDATE_WEIGHT (g_instance.attr.attr_storage.enable_update_weight)
+#define ENABLE_UPDATE_STRUCT (g_instance.attr.attr_storage.enable_update_struct)
+#define ENABLE_SAMPLING (g_instance.attr.attr_storage.enable_sampling)
+#define EXTRA_MEM_FACTOR (g_instance.attr.attr_storage.extra_mem_factor)
+#define ENABLE_LOG (g_instance.attr.attr_storage.enable_log)
 #define MULTITENANT_RESET_ENABLE 1
 #define ENABLE_HIST 1
 #define TENANT_NAME_LEN 32
-#define MAX_TENANT 32
+#define MAX_TENANT 128
 #define HIST_NAME "HIST"
 #define NON_TENANT_NAME "NON_TENANT"
-#define LOG_INTERVAL 1000000
+#define LOG_INTERVAL (g_instance.attr.attr_storage.log_interval)
 enum BufferType{
     LRU = 0,
     CLOCK,
@@ -470,8 +475,9 @@ typedef struct tenant_info{
     /* Update count */
     pg_atomic_uint64 update_count{0};
     uint64 total_promised{0};
-
-
+    
+    /* For cost test */
+    tenant_buffer_cxt shadow_cxt;
 } tenant_info;
 /* */
 extern tenant_info g_tenant_info;

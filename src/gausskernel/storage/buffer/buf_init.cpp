@@ -102,11 +102,11 @@ tenant_buffer_cxt* GetThrdTenant(const char* name){
             g_tenant_info.tenant_num++;
             thrd_tenant = new_tenant;
             
-            //Tenant name format: T[0-9][0-9](tenant_id) + _ + [0-9][0-9][0-9][0-9](promised_memory in MB) + _ + [0-9][0-9](SLA)
+            //Tenant name format: T[0-9][0-9][0-9](tenant_id) + _ + [0-9][0-9][0-9][0-9](promised_memory in MB) + _ + [0-9][0-9](SLA)
             strcpy_s(new_tenant->tenant_name, TENANT_NAME_LEN, name);
-            uint32 tenant_id = (name[1] - '0') * 10 + (name[2] - '0');
-            uint32 promised_memory = (name[4] - '0') * 1000 + (name[5] - '0') * 100 + (name[6] - '0') * 10 + (name[7] - '0');
-            uint32 sla = (name[9] - '0') * 10 + (name[10] - '0');
+            uint32 tenant_id = (name[1] - '0') * 100 + (name[2] - '0') * 10 + (name[3] - '0');
+            uint32 promised_memory = (name[5] - '0') * 1000 + (name[6] - '0') * 100 + (name[7] - '0') * 10 + (name[8] - '0');
+            uint32 sla = (name[10] - '0') * 10 + (name[11] - '0');
             uint32 ref_capacity = ( promised_memory * 1024 * 1024) / BLCKSZ;
             g_tenant_info.total_promised += ref_capacity;
 
@@ -298,7 +298,37 @@ void InitMultiTenantBufferPool(void){
     /* Init tenant buffer */
     InitTenantPrivateCxt();    
 }
-
+void InitTenantShadowBuffer(void){
+    tenant_buffer_cxt* shadow_tenant = &g_tenant_info.shadow_cxt;
+    int ret = memset_s(&shadow_tenant->ref_hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
+    securec_check(ret, "\0", "\0");
+    shadow_tenant->ref_hctl.keysize = sizeof(BufferTag);//tag hash
+    shadow_tenant->ref_hctl.entrysize = sizeof(buffer_node);//lru node
+    shadow_tenant->ref_hctl.hash = tag_hash;
+    shadow_tenant->ref_dummy_head.next = &shadow_tenant->ref_dummy_tail;
+    shadow_tenant->ref_dummy_head.prev = NULL;
+    shadow_tenant->ref_dummy_tail.prev = &shadow_tenant->ref_dummy_head;
+    shadow_tenant->ref_dummy_tail.next = NULL;
+    shadow_tenant->max_ref_size = NORMAL_SHARED_BUFFER_NUM;
+    shadow_tenant->curr_ref_size = 0;
+    pthread_mutex_init(&shadow_tenant->tenant_buffer_lock, NULL);
+    pthread_mutex_init(&shadow_tenant->tenant_ref_buffer_lock, NULL);
+    pthread_spin_init(&shadow_tenant->hit_stat_lock, NULL);
+}
+void InitCostTest(bool first){
+    if(first){
+        g_tenant_info.tenant_num = g_instance.attr.attr_storage.max_tenant;
+        for(int i = 0; i < g_instance.attr.attr_storage.max_tenant; ++i){
+            g_tenant_info.tenant_buffer_cxt_array[i].weight = (float) 1.0 / g_instance.attr.attr_storage.max_tenant;
+        }
+        /* Shadow LRU */
+        InitTenantShadowBuffer();
+    }
+    /* Lock */
+    InitTenantBufferLock(first);
+    /* Evict history list should be fifo */
+    InitTenantHist(first);
+}
 
 void InitBufferPool(void)
 {
@@ -322,6 +352,10 @@ void InitBufferPool(void)
     if(ENABLE_MULTI_TENANTCY){
         /* We make sure this won't exec twice */
         InitMultiTenantBufferPool();
+    }
+    if(!ENABLE_MULTI_TENANTCY && ENABLE_COST_TEST){
+        /* Do cost test */
+        InitCostTest(!found_descs);
     }
 
 
@@ -460,7 +494,6 @@ Size BufferShmemSize(void)
 
     /* size of buffer descriptors */
     size = add_size(size, mul_size(TOTAL_BUFFER_NUM, sizeof(BufferDescPadded)));
-    size = add_size(size, mul_size(64 * TOTAL_BUFFER_NUM, sizeof(buffer_node)));
     size = add_size(size, PG_CACHE_LINE_SIZE);
     size = add_size(size, mul_size(TOTAL_BUFFER_NUM, sizeof(BufferDescExtra)));
     size = add_size(size, PG_CACHE_LINE_SIZE);
@@ -481,6 +514,8 @@ Size BufferShmemSize(void)
 
     /* size of candidate free map */
     size = add_size(size, mul_size(TOTAL_BUFFER_NUM, sizeof(bool)));
+
+    size = add_size(size, mul_size(EXTRA_MEM_FACTOR * TOTAL_BUFFER_NUM, sizeof(buffer_node)));
 
     /* size of dms buf ctrl and buffer align */
     if (ENABLE_DMS) {
