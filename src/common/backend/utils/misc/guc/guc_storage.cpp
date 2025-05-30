@@ -1265,6 +1265,18 @@ static void InitStorageConfigureNamesBool()
             NULL,
             NULL
         },
+        {{"enable_hist",
+            PGC_POSTMASTER,
+            NODE_ALL,
+            RESOURCES_MEM,
+            gettext_noop("whether enable hist"),
+            NULL},
+            &g_instance.attr.attr_storage.enable_hist,
+            true,
+            NULL,
+            NULL,
+            NULL
+        },
         {{"enable_log",
             PGC_POSTMASTER,
             NODE_ALL,

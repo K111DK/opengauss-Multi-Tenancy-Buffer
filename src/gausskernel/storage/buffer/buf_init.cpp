@@ -251,13 +251,15 @@ static void InitTenantHist(bool first_init){
     NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE, 
     NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE, 
     &hctl1, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
+    g_tenant_info.fifo_pool = (fifo_ele *)
+    ShmemInitStruct("FIFOHISTBuffers", NORMAL_SHARED_BUFFER_NUM * sizeof(fifo_ele), &first_init);
+    
     if(first_init){
-        g_tenant_info.hist_dummy_head.next = &g_tenant_info.hist_dummy_tail;
-        g_tenant_info.hist_dummy_head.prev = NULL;
-        g_tenant_info.hist_dummy_tail.prev = &g_tenant_info.hist_dummy_head;
-        g_tenant_info.hist_dummy_tail.next = NULL;
         g_tenant_info.max_hist_size = NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE;
         g_tenant_info.curr_hist_size = 0;
+        MemSet((char*)g_tenant_info.fifo_pool, 0, NORMAL_SHARED_BUFFER_NUM * sizeof(fifo_ele));
+        INIT_CANDIDATE_LIST(g_tenant_info.fifo_list, g_tenant_info.fifo_pool, 
+            NORMAL_SHARED_BUFFER_NUM * 9 / 10, 0 ,0);
     }
 }
 static void InitTenantBufferLock(bool first_init){
@@ -516,6 +518,8 @@ Size BufferShmemSize(void)
     size = add_size(size, mul_size(TOTAL_BUFFER_NUM, sizeof(bool)));
 
     size = add_size(size, mul_size(EXTRA_MEM_FACTOR * TOTAL_BUFFER_NUM, sizeof(buffer_node)));
+
+    size = add_size(size, mul_size(TOTAL_BUFFER_NUM, sizeof(fifo_ele)));
 
     /* size of dms buf ctrl and buffer align */
     if (ENABLE_DMS) {

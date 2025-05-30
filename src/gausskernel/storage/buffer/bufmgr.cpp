@@ -2800,58 +2800,43 @@ void UpdateHitRateStat(uint32 access_hash, BufferTag *access_tag, bool found){
         buffer_cxt->real_misses++;
     pthread_spin_unlock(&buffer_cxt->hit_stat_lock);
 }
-void InsertToHist(BufferTag* access_tag , uint32 access_hash){
-    pthread_mutex_lock(&g_tenant_info.hist_lock);
-    if(g_tenant_info.curr_hist_size == g_tenant_info.max_hist_size){
-        /* Remove tail */        
-        buffer_node* tail = g_tenant_info.hist_dummy_tail.prev;
-        Assert(tail != &g_tenant_info.hist_dummy_head);
-
-        buffer_node* prev = tail->prev;
-        
-        prev->next = &g_tenant_info.hist_dummy_tail;
-        g_tenant_info.hist_dummy_tail.prev = prev;
-        
-        g_tenant_info.curr_hist_size--;
-        void * delete_ele = (void *)buf_hash_operate<HASH_REMOVE>((HTAB*)t_thrd.thrd_hist_HTAB, 
-        &tail->key, BufTableHashCode(&tail->key), NULL);
-        Assert(g_tenant_info.curr_hist_size>=0 && g_tenant_info.curr_hist_size <= g_tenant_info.max_hist_size);
+bool InsertToHist(FIFO_queue * list, BufferTag* access_tag , uint32 access_hash){
+    uint32 list_size = list->cand_list_size;
+    uint32 tail_loc;
+    pg_memory_barrier();
+    volatile uint64 head = pg_atomic_read_u64(&list->head);
+    pg_memory_barrier();
+    volatile uint64 tail = pg_atomic_read_u64(&list->tail);
+    if (unlikely(tail - head >= list_size)) {
+        return false;
     }
-    /* Insert evict buf to hist node */
-    buffer_node *new_hist_node = (buffer_node *)buf_hash_operate<HASH_ENTER>((HTAB*)t_thrd.thrd_hist_HTAB, 
-    access_tag, access_hash, NULL);
-    new_hist_node->key_hash = access_hash;
-    g_tenant_info.hist_dummy_head.next->prev = new_hist_node;
-    new_hist_node->next = g_tenant_info.hist_dummy_head.next;
-    g_tenant_info.hist_dummy_head.next = new_hist_node;
-    new_hist_node->prev = &g_tenant_info.hist_dummy_head;
-    g_tenant_info.curr_hist_size++;
-    Assert(g_tenant_info.curr_hist_size>=0 && g_tenant_info.curr_hist_size <= g_tenant_info.max_hist_size);
-    pthread_mutex_unlock(&g_tenant_info.hist_lock);
+    tail_loc = tail % list_size;
+    list->cand_buf_list[tail_loc].hashcode = access_hash;
+    list->cand_buf_list[tail_loc].tag = *access_tag;
+    (void)pg_atomic_fetch_add_u64(&list->tail, 1);
+    return true;
 }
-bool DeleteFromHist(BufferTag* access_tag , uint32 access_hash){
-    bool found_descs = false;
-    pthread_mutex_lock(&g_tenant_info.hist_lock);
-    buffer_node *hist_node = (buffer_node *)buf_hash_operate<HASH_REMOVE>((HTAB*)t_thrd.thrd_hist_HTAB, 
-    access_tag, access_hash, &found_descs);
-    if(found_descs){
-            if(g_tenant_info.curr_hist_size == 0){
-                Assert(0);
-            }
-            Assert(hist_node->key_hash == access_hash);
-            hist_node->next->prev = hist_node->prev;
-            hist_node->prev->next = hist_node->next;
-            hist_node->key_hash = UINT32_MAX;
-            g_tenant_info.curr_hist_size--;
+bool DeleteFromHist(FIFO_queue * list, fifo_ele * ele){
+    uint32 list_size = list->cand_list_size;
+    uint32 head_loc;
+    while (true) {
+        pg_memory_barrier();
+        uint64 head = pg_atomic_read_u64(&list->head);
+        pg_memory_barrier();
+        volatile uint64 tail = pg_atomic_read_u64(&list->tail);
+        if (unlikely(head >= tail)) {
+            return false;       /* candidate list is empty */
+        }
+        head_loc = head % list_size;
+        *ele = list->cand_buf_list[head_loc];
+        if (pg_atomic_compare_exchange_u64(&list->head, &head, head + 1)) {
+            return true;
+        }
     }
-    Assert(g_tenant_info.curr_hist_size >= 0 && g_tenant_info.curr_hist_size <= g_tenant_info.max_hist_size);
-    pthread_mutex_unlock(&g_tenant_info.hist_lock);
-    return found_descs;
 }
-void UpdateWeight(BufferTag *access_tag, uint32 access_hash){
+void UpdateWeight(bool found_in_hist){
     tenant_buffer_cxt* buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
-    bool found_descs = DeleteFromHist(access_tag, access_hash);
-    if(found_descs){
+    if(found_in_hist){
         pg_atomic_add_fetch_u64(&buffer_cxt->reweight_count, 1);
         pthread_spin_lock(&buffer_cxt->hit_stat_lock);
         double hrd = GetTenantHRD(buffer_cxt);
@@ -2872,14 +2857,6 @@ void UpdateWeight(BufferTag *access_tag, uint32 access_hash){
         double pre_val = buffer_cxt->weight;
         total_w -= buffer_cxt->weight;
         buffer_cxt->weight = zero + buffer_cxt->weight * exp(-1.0 * hrd * sla_factor);
-        // ereport(WARNING, (errmsg("%s Before:%.2f, Decrease factor:%.2f, Hrd:%.3f, After:%.2f"
-        //     , buffer_cxt->tenant_name
-        //     , pre_val
-        //     , exp(-1.0 * hrd * sla_factor)
-        //     , hrd
-        //     , buffer_cxt->weight)
-        //     )    
-        // );        
         total_w += buffer_cxt->weight;
 
         /* global reweight */
@@ -3055,17 +3032,14 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
 
     /* Get thrd's buffer cxt */
     tenant_buffer_cxt* buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
-
+    tenant_buffer_cxt* victim_buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
+    
     /* create a tag so we can lookup the buffer */
     INIT_BUFFERTAG(new_tag, smgr->smgr_rnode.node, fork_num, block_num);
 
     /* determine its hash code and partition lock ID */
     new_hash = BufTableHashCode(&new_tag);
     new_partition_lock = BufMappingPartitionLock(new_hash);
-
-    /* Before we even lock anything we'll update weight first */
-    if(!ENABLE_FIXED || ENABLE_COST_TEST && ENABLE_UPDATE_WEIGHT)
-        UpdateWeight(&new_tag, new_hash);
 
     /* see if the block is in the buffer pool already */
     (void)LWLockAcquire(new_partition_lock, LW_SHARED);
@@ -3116,13 +3090,22 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
             UpdateHitRateStat(new_hash, &new_tag, *found);
         return buf;
     }
-
     /*
      * Didn't find it in the buffer pool.  We'll have to initialize a new
      * buffer.	Remember to unlock the mapping lock while doing the work.
      */
-    tenant_buffer_cxt* victim_buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
     LWLockRelease(new_partition_lock);
+    
+    /* Before we even lock anything we'll update weight first */
+    bool found_in_hist = buf_id == HIT_IN_HIST;
+    if(found_in_hist){
+        (void)LWLockAcquire(new_partition_lock, LW_EXCLUSIVE);
+        BufTableDelete(&new_tag, new_hash);
+        LWLockRelease(new_partition_lock);
+    }
+
+    if(!ENABLE_FIXED || ENABLE_COST_TEST && ENABLE_UPDATE_WEIGHT)
+        UpdateWeight(found_in_hist);
     
     if(ENABLE_FIXED){
         victim_buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
@@ -3402,11 +3385,6 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
         pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
     }
 
-    if(!ENABLE_FIXED || ENABLE_COST_TEST && ENABLE_UPDATE_WEIGHT){
-        if(!from_free_list){
-            InsertToHist(&old_tag, old_hash);
-        }
-    }
     /* Otherwise We'll just need to reset the tag */
 
     /*
@@ -3440,12 +3418,25 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     }
 
     if (old_flags & BM_TAG_VALID) {
-        BufTableDelete(&old_tag, old_hash);
+        
+        if(!ENABLE_MULTI_TENANTCY){
+            BufTableDelete(&old_tag, old_hash);
+        }
+        
+        if(!ENABLE_FIXED || ENABLE_COST_TEST && ENABLE_HIST){
+            /* If new hash is from hist */
+            BufferLookupEnt *result = NULL;
+            result = (BufferLookupEnt *)buf_hash_operate<HASH_FIND>(t_thrd.storage_cxt.SharedBufHash,
+            &old_tag, old_hash, NULL);
+            if (!SECUREC_UNLIKELY(result == NULL)) {
+                result->is_in_hist = true;   
+            }
+        }
+
         if (old_partition_lock != new_partition_lock) {
-            LWLockRelease(old_partition_lock);
+                LWLockRelease(old_partition_lock);
         }
     }
-
     /* set Physical segment file. */
     if (pblk != NULL) {
         Assert(PhyBlockIsValid(*pblk));
@@ -3460,6 +3451,18 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     }
     LWLockRelease(new_partition_lock);
 
+    if(old_flags & BM_TAG_VALID && (!ENABLE_FIXED || ENABLE_COST_TEST && ENABLE_HIST)){
+        while(!InsertToHist(&g_tenant_info.fifo_list, &old_tag, old_hash)){
+            fifo_ele * ele;
+            DeleteFromHist(&g_tenant_info.fifo_list, ele);
+            if (ele != NULL) {
+                LWLock* partition_lock = BufMappingPartitionLock(ele->hashcode);
+                LWLockAcquire(partition_lock, LW_EXCLUSIVE);
+                BufTableDelete(&ele->tag, ele->hashcode);
+                LWLockRelease(partition_lock);
+            } 
+        }
+    }
     /*
      * Buffer contents are currently invalid.  Try to get the io_in_progress
      * lock.  If StartBufferIO returns false, then someone else managed to
@@ -3545,13 +3548,6 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
     new_hash = BufTableHashCode(&new_tag);
     new_partition_lock = BufMappingPartitionLock(new_hash);
 
-    if(ENABLE_COST_TEST){
-        bool found_in_hist = DeleteFromHist(&new_tag, new_hash);
-        if(found_in_hist){
-            COST_TEST_REWEIGHT();
-        }
-        COST_TEST_SAMPLING();
-    }
     /* see if the block is in the buffer pool already */
     (void)LWLockAcquire(new_partition_lock, LW_SHARED);
     pgstat_report_waitevent(WAIT_EVENT_BUF_HASH_SEARCH);
@@ -3597,9 +3593,6 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
             MarkReadPblk(buf->buf_id, pblk);
         }
 
-        if(ENABLE_COST_TEST){
-            UpdateHitRateStat(new_hash, &new_tag, *found);
-        }
         return buf;
     }
 
@@ -3883,8 +3876,6 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
     }
 
     UnlockBufHdr(buf, buf_state);
-    if(ENABLE_COST_TEST)
-        InsertToHist(&old_tag, old_hash);
 
     if (ENABLE_DMS) {
         GetDmsBufCtrl(buf->buf_id)->lock_mode = DMS_LOCK_NULL;

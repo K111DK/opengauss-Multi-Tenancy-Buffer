@@ -220,6 +220,7 @@ typedef struct knl_instance_attr_storage {
     bool enable_update_struct;
     bool enable_sampling;
     bool enable_log;
+    bool enable_hist;
     int64 log_interval;
     int extra_mem_factor;
 } knl_instance_attr_storage;

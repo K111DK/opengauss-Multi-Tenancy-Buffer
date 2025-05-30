@@ -114,6 +114,7 @@ typedef struct buftagnohbkt {
 typedef struct {
     BufferTag key; /* Tag of a disk page */
     int id;        /* Associated buffer ID */
+    bool is_in_hist;
 } BufferLookupEnt;
 
 #define CLEAR_BUFFERTAG(a)               \
@@ -375,10 +376,11 @@ extern void LocalBufferFlushAllBuffer();
 #define ENABLE_UPDATE_WEIGHT (g_instance.attr.attr_storage.enable_update_weight)
 #define ENABLE_UPDATE_STRUCT (g_instance.attr.attr_storage.enable_update_struct)
 #define ENABLE_SAMPLING (g_instance.attr.attr_storage.enable_sampling)
+#define ENABLE_HIST (g_instance.attr.attr_storage.enable_hist)
 #define EXTRA_MEM_FACTOR (g_instance.attr.attr_storage.extra_mem_factor)
 #define ENABLE_LOG (g_instance.attr.attr_storage.enable_log)
 #define MULTITENANT_RESET_ENABLE 1
-#define ENABLE_HIST 1
+#define HIT_IN_HIST -2
 #define TENANT_NAME_LEN 32
 #define MAX_TENANT 128
 #define HIST_NAME "HIST"
@@ -443,8 +445,35 @@ typedef struct tenant_name_mapping{
     //oid
     tenant_buffer_cxt* tenant_cxt;
 }tenant_name_mapping;
+
+typedef struct fifo_ele {
+    uint32 hashcode;
+    BufferTag tag; /* ID of page contained in buffer */
+}fifo_ele;
+
+typedef struct FIFO_queue {
+    fifo_ele *cand_buf_list;
+    volatile int cand_list_size;
+    pg_atomic_uint64 head;
+    pg_atomic_uint64 tail;
+    volatile int buf_id_start;
+    int32 next_scan_loc;
+    int32 next_scan_ratio_loc;
+} FIFO_queue;
+
+
 typedef struct tenant_info{   
-    
+
+    /* History list */
+    fifo_ele* fifo_pool;
+    FIFO_queue fifo_list;
+    pthread_mutex_t hist_lock;
+    buffer_node hist_dummy_head;
+    buffer_node hist_dummy_tail;
+    uint64 max_hist_size;
+    uint64 curr_hist_size;
+
+
     /* Free list */
     pthread_spinlock_t free_list_lock;
     Buffer* buffer_pool;
@@ -452,13 +481,6 @@ typedef struct tenant_info{
     /* <= NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_NUM*/
     uint64 tenant_free_taken{0};
     uint64 non_tenant_free_taken{0};
-
-    /* History list */
-    pthread_mutex_t hist_lock;
-    buffer_node hist_dummy_head;
-    buffer_node hist_dummy_tail;
-    uint64 max_hist_size;
-    uint64 curr_hist_size;
 
     /* Tenant map lock */
     pthread_mutex_t tenant_map_lock;

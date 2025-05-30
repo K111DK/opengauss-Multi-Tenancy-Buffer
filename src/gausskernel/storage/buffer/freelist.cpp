@@ -569,7 +569,7 @@ Size StrategyShmemSize(void)
     Size size = 0;
 
     /* size of lookup hash table ... see comment in StrategyInitialize */
-    size = add_size(size, BufTableShmemSize(TOTAL_BUFFER_NUM + NUM_BUFFER_PARTITIONS));
+    size = add_size(size, BufTableShmemSize( 2 * (TOTAL_BUFFER_NUM + NUM_BUFFER_PARTITIONS) ));
 
     /* size of the shared replacement strategy control block */
     size = add_size(size, MAXALIGN(sizeof(BufferStrategyControl)));
@@ -598,8 +598,10 @@ void StrategyInitialize(bool init)
      * happening in each partition concurrently, so we could need as many as
      * NBuffers + NUM_BUFFER_PARTITIONS entries.
      */
-    InitBufTable(TOTAL_BUFFER_NUM + NUM_BUFFER_PARTITIONS);
-
+    if(ENABLE_MULTI_TENANTCY)
+        InitBufTable(2 * (TOTAL_BUFFER_NUM + NUM_BUFFER_PARTITIONS) );
+    else
+        InitBufTable(TOTAL_BUFFER_NUM + NUM_BUFFER_PARTITIONS);
     /*
      * Get or create the shared strategy control block
      */
