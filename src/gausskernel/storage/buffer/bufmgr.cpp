@@ -3101,14 +3101,8 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     if(!ENABLE_FIXED || ENABLE_COST_TEST && ENABLE_UPDATE_WEIGHT)
         UpdateWeight(true);
     
-    if(!ENABLE_FIXED){
-        victim_buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
-        if(ENABLE_COST_TEST && ENABLE_SAMPLING)
-            GetVictimTenant();
-    }else{
-        /* We first find victim to evict */
+    if(!ENABLE_FIXED || ENABLE_COST_TEST && ENABLE_SAMPLING)
         victim_buffer_cxt = GetVictimTenant();
-    }
     /* Loop here in case we have to try another victim buffer */
     for (;;) {
         bool needGetLock = false;
@@ -3433,12 +3427,12 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
         /* */
         bool found;
         pthread_mutex_lock(&g_tenant_info.lockArray[new_hash % NUM_BUFFER_PARTITIONS]);
-        buf_hash_operate<HASH_REMOVE>(t_thrd.thrd_hist_HTAB, new_tag, new_hash, &found);
+        buf_hash_operate<HASH_REMOVE>((HTAB*)t_thrd.thrd_hist_HTAB, &new_tag, new_hash, &found);
         pthread_mutex_unlock(&g_tenant_info.lockArray[new_hash % NUM_BUFFER_PARTITIONS]);
 
         if(old_flags & BM_TAG_VALID){
             pthread_mutex_lock(&g_tenant_info.lockArray[old_hash % NUM_BUFFER_PARTITIONS]);
-            buf_hash_operate<HASH_ENTER>(t_thrd.thrd_hist_HTAB, old_tag, old_hash, &found);
+            buf_hash_operate<HASH_ENTER>((HTAB*)t_thrd.thrd_hist_HTAB, &old_tag, old_hash, &found);
             pthread_mutex_unlock(&g_tenant_info.lockArray[old_hash % NUM_BUFFER_PARTITIONS]);
         }
         while(!InsertToHist(&g_tenant_info.fifo_list, &old_tag, old_hash)){
@@ -3446,7 +3440,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
             DeleteFromHist(&g_tenant_info.fifo_list, ele);
             if (ele != NULL) {
                 pthread_mutex_lock(&g_tenant_info.lockArray[ele->hashcode % NUM_BUFFER_PARTITIONS]);
-                buf_hash_operate<HASH_REMOVE>(t_thrd.thrd_hist_HTAB, &ele->tag, ele->hashcode, &found);
+                buf_hash_operate<HASH_REMOVE>((HTAB*)t_thrd.thrd_hist_HTAB, &ele->tag, ele->hashcode, &found);
                 pthread_mutex_unlock(&g_tenant_info.lockArray[ele->hashcode % NUM_BUFFER_PARTITIONS]);
             } 
         }
