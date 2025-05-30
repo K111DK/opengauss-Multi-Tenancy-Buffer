@@ -114,7 +114,6 @@ typedef struct buftagnohbkt {
 typedef struct {
     BufferTag key; /* Tag of a disk page */
     int id;        /* Associated buffer ID */
-    bool is_in_hist;
 } BufferLookupEnt;
 
 #define CLEAR_BUFFERTAG(a)               \
@@ -465,6 +464,7 @@ typedef struct FIFO_queue {
 typedef struct tenant_info{   
 
     /* History list */
+    pthread_mutex_t lockArray[NUM_BUFFER_PARTITIONS];
     fifo_ele* fifo_pool;
     FIFO_queue fifo_list;
     pthread_mutex_t hist_lock;

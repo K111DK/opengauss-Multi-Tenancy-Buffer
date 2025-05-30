@@ -92,10 +92,6 @@ int BufTableLookup(BufferTag *tag, uint32 hashcode)
     if (SECUREC_UNLIKELY(result == NULL)) {
         return -1;
     }
-    if(result->is_in_hist){
-        result->is_in_hist = false; /* remove from history */
-        return HIT_IN_HIST;
-    }
     return result->id;
 }
 
@@ -124,7 +120,6 @@ int BufTableInsert(BufferTag *tag, uint32 hashcode, int buf_id)
     }
 
     result->id = buf_id;
-    result->is_in_hist = false; /* not in history by default */
 
     return -1;
 }
@@ -141,7 +136,7 @@ void BufTableDelete(BufferTag *tag, uint32 hashcode)
 
     result = (BufferLookupEnt *)buf_hash_operate<HASH_REMOVE>(t_thrd.storage_cxt.SharedBufHash, tag, hashcode, NULL);
 
-    if (result == NULL && !ENABLE_MULTI_TENANTCY) { /* shouldn't happen */
+    if (result == NULL) { /* shouldn't happen */
         ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), (errmsg("shared buffer hash table corrupted."))));
     }
 }

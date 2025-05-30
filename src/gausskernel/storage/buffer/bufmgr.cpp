@@ -3097,26 +3097,18 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     LWLockRelease(new_partition_lock);
     
     /* Before we even lock anything we'll update weight first */
-    bool found_in_hist = buf_id == HIT_IN_HIST;
-    if(found_in_hist){
-        (void)LWLockAcquire(new_partition_lock, LW_EXCLUSIVE);
-        BufTableDelete(&new_tag, new_hash);
-        LWLockRelease(new_partition_lock);
-    }
 
     if(!ENABLE_FIXED || ENABLE_COST_TEST && ENABLE_UPDATE_WEIGHT)
-        UpdateWeight(found_in_hist);
+        UpdateWeight(true);
     
-    if(ENABLE_FIXED){
+    if(!ENABLE_FIXED){
         victim_buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
-        if(ENABLE_COST_TEST && ENABLE_SAMPLING){
+        if(ENABLE_COST_TEST && ENABLE_SAMPLING)
             GetVictimTenant();
-        }
     }else{
         /* We first find victim to evict */
         victim_buffer_cxt = GetVictimTenant();
     }
-    Assert(victim_buffer_cxt);
     /* Loop here in case we have to try another victim buffer */
     for (;;) {
         bool needGetLock = false;
@@ -3418,21 +3410,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     }
 
     if (old_flags & BM_TAG_VALID) {
-        
-        if(!ENABLE_MULTI_TENANTCY){
-            BufTableDelete(&old_tag, old_hash);
-        }
-        
-        if(!ENABLE_FIXED || ENABLE_COST_TEST && ENABLE_HIST){
-            /* If new hash is from hist */
-            BufferLookupEnt *result = NULL;
-            result = (BufferLookupEnt *)buf_hash_operate<HASH_FIND>(t_thrd.storage_cxt.SharedBufHash,
-            &old_tag, old_hash, NULL);
-            if (!SECUREC_UNLIKELY(result == NULL)) {
-                result->is_in_hist = true;   
-            }
-        }
-
+        BufTableDelete(&old_tag, old_hash);
         if (old_partition_lock != new_partition_lock) {
                 LWLockRelease(old_partition_lock);
         }
@@ -3451,15 +3429,25 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     }
     LWLockRelease(new_partition_lock);
 
-    if(old_flags & BM_TAG_VALID && (!ENABLE_FIXED || ENABLE_COST_TEST && ENABLE_HIST)){
+    if((!ENABLE_FIXED || ENABLE_COST_TEST && ENABLE_HIST)){
+        /* */
+        bool found;
+        pthread_mutex_lock(&g_tenant_info.lockArray[new_hash % NUM_BUFFER_PARTITIONS]);
+        buf_hash_operate<HASH_REMOVE>(t_thrd.thrd_hist_HTAB, new_tag, new_hash, &found);
+        pthread_mutex_unlock(&g_tenant_info.lockArray[new_hash % NUM_BUFFER_PARTITIONS]);
+
+        if(old_flags & BM_TAG_VALID){
+            pthread_mutex_lock(&g_tenant_info.lockArray[old_hash % NUM_BUFFER_PARTITIONS]);
+            buf_hash_operate<HASH_ENTER>(t_thrd.thrd_hist_HTAB, old_tag, old_hash, &found);
+            pthread_mutex_unlock(&g_tenant_info.lockArray[old_hash % NUM_BUFFER_PARTITIONS]);
+        }
         while(!InsertToHist(&g_tenant_info.fifo_list, &old_tag, old_hash)){
             fifo_ele * ele;
             DeleteFromHist(&g_tenant_info.fifo_list, ele);
             if (ele != NULL) {
-                LWLock* partition_lock = BufMappingPartitionLock(ele->hashcode);
-                LWLockAcquire(partition_lock, LW_EXCLUSIVE);
-                BufTableDelete(&ele->tag, ele->hashcode);
-                LWLockRelease(partition_lock);
+                pthread_mutex_lock(&g_tenant_info.lockArray[ele->hashcode % NUM_BUFFER_PARTITIONS]);
+                buf_hash_operate<HASH_REMOVE>(t_thrd.thrd_hist_HTAB, &ele->tag, ele->hashcode, &found);
+                pthread_mutex_unlock(&g_tenant_info.lockArray[ele->hashcode % NUM_BUFFER_PARTITIONS]);
             } 
         }
     }

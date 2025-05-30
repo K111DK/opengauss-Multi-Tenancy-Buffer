@@ -247,19 +247,23 @@ static void InitTenantHist(bool first_init){
     hctl1.keysize = sizeof(BufferTag);//tag hash
     hctl1.entrysize = sizeof(buffer_node);//lru node
     hctl1.hash = tag_hash;
+    hctl1.num_partitions = NUM_BUFFER_PARTITIONS;
     t_thrd.thrd_hist_HTAB = ShmemInitHash("Hist", 
-    NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE, 
-    NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE, 
-    &hctl1, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
+    NORMAL_SHARED_BUFFER_NUM, 
+    NORMAL_SHARED_BUFFER_NUM, 
+    &hctl1, HASH_ELEM | HASH_FUNCTION | HASH_PARTITION);
     g_tenant_info.fifo_pool = (fifo_ele *)
     ShmemInitStruct("FIFOHISTBuffers", NORMAL_SHARED_BUFFER_NUM * sizeof(fifo_ele), &first_init);
-    
     if(first_init){
-        g_tenant_info.max_hist_size = NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE;
+        int i = 0;
+        for(i=0 ; i < NUM_BUFFER_PARTITIONS; i++){
+            pthread_mutex_init(&g_tenant_info.lockArray[i], NULL);
+        }
+        g_tenant_info.max_hist_size = NORMAL_SHARED_BUFFER_NUM;
         g_tenant_info.curr_hist_size = 0;
         MemSet((char*)g_tenant_info.fifo_pool, 0, NORMAL_SHARED_BUFFER_NUM * sizeof(fifo_ele));
         INIT_CANDIDATE_LIST(g_tenant_info.fifo_list, g_tenant_info.fifo_pool, 
-            NORMAL_SHARED_BUFFER_NUM * 9 / 10, 0 ,0);
+            NORMAL_SHARED_BUFFER_NUM, 0 ,0);
     }
 }
 static void InitTenantBufferLock(bool first_init){
