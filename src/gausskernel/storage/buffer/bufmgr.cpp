@@ -2988,7 +2988,7 @@ tenant_buffer_cxt* GetVictimTenant(){
     pthread_spin_lock(&((tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt)->hit_stat_lock);
     bool need_steal = self->real_misses > self->ref_misses;
     pthread_spin_unlock(&((tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt)->hit_stat_lock);
-    if(!need_steal){
+    if(!need_steal && !ENABLE_COST_TEST && !ENABLE_SAMPLING){
         return (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
     }
 
