@@ -223,6 +223,12 @@ typedef struct BufferDesc {
     struct BufferDesc* next; /* link in freelist of buffers */
     struct BufferDesc* prev;
     uint32 tenantOid;
+    pg_atomic_uint32 write_count;
+    pg_atomic_uint32 flush_count;
+    pg_atomic_uint64 pre_flush_ts;
+    pg_atomic_uint64 pre_write_ts;
+    bool is_twb_buffer; /* is this buffer in TWB? */
+    bool is_twb_candidate;
 #ifdef USE_ASSERT_CHECKING
     volatile uint64 lsn_dirty;
 #endif
@@ -501,8 +507,35 @@ typedef struct tenant_info{
     /* For cost test */
     tenant_buffer_cxt shadow_cxt;
 } tenant_info;
+
+
+#define ENABLE_TWB (g_instance.attr.attr_storage.enable_twb)
+#define TWB_SIZE (g_instance.attr.attr_storage.twb_size)
+typedef struct TWB {
+    
+    uint32 twb_size;
+    pg_atomic_uint32 twb_used;
+    bool need_flushing;
+    /* twb lock */
+    pthread_spin_lock twb_lock;
+    
+    /* store twb clean pages */
+    CandidateList twb_free_list;
+
+    /* store twb dirty pages */
+    CandidateList twb_dirty_list;
+    
+    /* store the dirty buffer id that to be flushed */
+    Buffer * dirty_buffer;
+
+    /* twb buffer HTAB init */
+    void * twb_hash_table;
+
+}TWB;
+
 /* */
 extern tenant_info g_tenant_info;
+extern TWB g_twb_info;
 extern BufferDesc *TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt);
 extern void show_tenant_status();
 double GetTenantHRD(tenant_buffer_cxt* buffer_cxt);
@@ -510,4 +543,5 @@ double GetTenantHRD(tenant_buffer_cxt* buffer_cxt);
 /* new */
 extern void ThrdGetRefBufferIndex(tenant_buffer_cxt* buffer_cxt);
 extern bool UpdateRefBuffer(uint32 access_hash, BufferTag *access_tag);
+extern void BufWriteStatReset(BufferDesc *buf);
 #endif /* BUFMGR_INTERNALS_H */

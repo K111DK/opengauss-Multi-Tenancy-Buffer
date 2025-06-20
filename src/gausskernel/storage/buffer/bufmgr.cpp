@@ -2670,6 +2670,7 @@ void PageCheckWhenChosedElimination(const BufferDesc *buf, uint32 oldFlags)
  *
  * No locks are held either at entry or exit.
  */
+TWB g_twb_info;
 tenant_info g_tenant_info;
 void show_tenant_status(){
     uint64 total_hit = 0;
@@ -3585,6 +3586,7 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
     LWLockRelease(new_partition_lock);
     /* Loop here in case we have to try another victim buffer */
     bool from_clean = false;
+    bool from_twb_free = false;
     for (;;) {
         from_clean = false;
         bool needGetLock = false;
@@ -3653,7 +3655,41 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
                 LWLockAcquire(buf->content_lock, LW_SHARED);
                 needDoFlush = true;
             }
-            if (needDoFlush) {
+            /* Buffer is dirty and we had pinned it */
+            if(needDoFlush && ENABLE_TWB){
+                    Buffer swap_free_buf;
+                    uint32 curr_dirty_size = get_thread_candidate_nums(&g_twb_info.twb_dirty_list);
+                    bool has_free = candidate_buf_pop(&g_twb_info.twb_free_list, &swap_free_buf);
+                    bool can_use_twb = has_free && !buf->is_twb_buffer && curr_dirty_size < g_twb_info.twb_dirty_size;
+                    /* Only when we got free twb buffer to replace and this buf isn't in twb */
+                    if(can_use_twb){
+                        /* Add buf to twb dirty buf*/
+                        buf->is_twb_buffer = true;
+                        buf->is_twb_candidate = false;
+                        candidate_buf_push(&g_twb_info.twb_dirty_list, buf->buf_id);
+                        from_twb_free = true;
+                        
+                        /* Delete it from Hashtable */
+                        uint32 buf_hash = BufTableHashCode(&buf->tag);
+                        LWLock *partition_lock = BufMappingPartitionLock(buf_hash);
+                        LWLockAcquire(partition_lock, LW_EXCLUSIVE);
+                        BufTableDelete(&buf->tag, buf_hash);
+                        LWLockRelease(partition_lock);
+                        
+                        /* Unlock dirty buf */
+                        UnpinBuffer(buf, true);
+
+                        /* Get swaped buf and lock it */
+                        buf = GetBufferDescriptor(swap_free_buf);
+                        buf->is_twb_buffer = false;
+                        buf->is_twb_candidate = false;
+                        LockBufHdr(buf);
+                    
+                    }else{
+                        UnpinBuffer(buf, true);
+                        continue;
+                    }
+            } else if (needDoFlush) {
                 /*
                  * If using a nondefault strategy, and writing the buffer
                  * would require a WAL flush, let the strategy decide whether
@@ -3718,7 +3754,7 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
          * To change the association of a valid buffer, we'll need to have
          * exclusive lock on both the old and new mapping partitions.
          */
-        if (old_flags & BM_TAG_VALID) {
+        if (old_flags & BM_TAG_VALID && !from_twb_free) {
             /*
              * Need to compute the old tag's hashcode and partition lock ID.
              * XXX is it worth storing the hashcode in BufferDesc so we need
@@ -3847,6 +3883,7 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
      * checkpoints, except for their "init" forks, which need to be treated
      * just like permanent relations.
      */
+    BufWriteStatReset(buf);
     ((BufferDesc *)buf)->tag = new_tag;
     buf_state &= ~(BM_VALID | BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR | BM_PERMANENT |
                    BUF_USAGECOUNT_MASK);
@@ -4061,6 +4098,12 @@ static void recheck_page_content(const BufferDesc *buf_desc)
  * exclusive lock, then somebody could be in process of writing the buffer,
  * leading to risk of bad data written to disk.)
  */
+
+void RecordDirty(BufferDesc *buf){
+    pg_atomic_fetch_add_u32(&buf->write_count, 1);
+    pg_atomic_write_u64(&buf->pre_write_ts, get_time_ms());
+}
+
 void MarkBufferDirty(Buffer buffer)
 {
     BufferDesc *buf_desc = NULL;
@@ -4110,6 +4153,7 @@ void MarkBufferDirty(Buffer buffer)
 
     UnlockBufHdr(buf_desc, buf_state);
 
+    RecordDirty(buf_desc);
     if (SS_REFORM_REFORMER) {
         dms_buf_ctrl_t* buf_ctrl = GetDmsBufCtrl(buf_desc->buf_id);
         buf_ctrl->state &= ~BUF_DIRTY_NEED_FLUSH;
@@ -5484,6 +5528,11 @@ char* PageDataEncryptForBuffer(Page page, BufferDesc *bufdesc, bool is_segbuf)
     return bufToWrite;
 }
 
+void RecordFlush(void *buf){
+    pg_atomic_write_u32(&((BufferDesc *)buf)->write_count, 0);
+    pg_atomic_add_fetch_u32(&((BufferDesc *)buf)->flush_count, 1);
+    pg_atomic_write_u64(&((BufferDesc *)buf)->pre_flush_ts, get_time_ms());
+}
 /*
  * Physically write out a shared buffer.
  * NOTE: this actually just passes the buffer contents to the kernel; the
@@ -5675,6 +5724,7 @@ void FlushBuffer(void *buf, SMgrRelation reln, ReadBufferMethod flushmethod, boo
     TRACE_POSTGRESQL_BUFFER_FLUSH_DONE(bufferinfo.blockinfo.forknum, bufferinfo.blockinfo.blkno,
                                        bufferinfo.blockinfo.rnode.spcNode, bufferinfo.blockinfo.rnode.dbNode,
                                        bufferinfo.blockinfo.rnode.relNode);
+    RecordFlush(buf);
 
     /* Pop the error context stack, if it was set before */
     if (t_thrd.role != PAGEWRITER_THREAD && t_thrd.role != BGWRITER) {

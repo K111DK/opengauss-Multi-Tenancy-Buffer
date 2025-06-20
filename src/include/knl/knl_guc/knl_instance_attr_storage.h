@@ -216,6 +216,7 @@ typedef struct knl_instance_attr_storage {
     bool enable_mtrp;
     bool enable_cost_test;
     int max_tenant;
+    int flush_max_write_count;
     bool enable_update_weight;
     bool enable_update_struct;
     bool enable_sampling;
@@ -223,6 +224,11 @@ typedef struct knl_instance_attr_storage {
     bool enable_hist;
     int64 log_interval;
     int extra_mem_factor;
+
+    /* TWB shit */
+    bool enable_twb;
+    int twb_size;
+
 } knl_instance_attr_storage;
 
 #endif /* SRC_INCLUDE_KNL_KNL_INSTANCE_ATTR_STORAGE_H_ */

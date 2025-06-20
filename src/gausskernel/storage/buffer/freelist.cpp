@@ -269,6 +269,8 @@ retry:
     int try_get_loc_times = max_buffer_can_use;
     for (;;) {
         buf = GetBufferDescriptor(ClockSweepTick(max_buffer_can_use));
+        if (buf->is_twb_buffer || buf->is_twb_candidate)
+            continue;
         /*
          * If the buffer is pinned, we cannot use it.
          */

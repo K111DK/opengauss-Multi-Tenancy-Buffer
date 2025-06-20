@@ -2141,6 +2141,12 @@ static void incre_ckpt_pgwr_flush_dirty_list(WritebackContext *wb_context, uint3
             continue;
         }
         buf_desc = GetBufferDescriptor(buf_id);
+        if(ENABLE_TWB && (buf_desc->is_twb_buffer || buf_desc->is_twb_candidate)){
+            buf_desc->is_twb_candidate = true;
+            buf_desc->is_twb_buffer = false;
+            candidate_buf_push(&g_twb_info.twb_free_list, buf_id);
+            continue;
+        }
         push_to_candidate_list(buf_desc);
     }
 
@@ -2379,6 +2385,7 @@ static uint32 get_candidate_buf_and_flush_list(uint32 start, uint32 end, uint32 
     bool check_not_need_flush = false;
     bool check_usecount = false;
     int thread_id = t_thrd.pagewriter_cxt.pagewriter_id;
+    int max_write_count;
     PageWriterProc *pgwr = &g_instance.ckpt_cxt_ctl->pgwr_procs.writer_proc[thread_id];
     CkptSortItem *dirty_buf_list = pgwr->dirty_buf_list;
 
@@ -2386,9 +2393,32 @@ static uint32 get_candidate_buf_and_flush_list(uint32 start, uint32 end, uint32 
 
     max_flush_num = ((FULL_CKPT && !RecoveryInProgress()) ? 0 : max_flush_num);
 
+    int64 max_twb_flushed = get_thread_candidate_nums(&g_twb_info.twb_dirty_list) / 4;
+    if(ENABLE_TWB){
+        Buffer* twb_dirty;
+        int64 curr_twb_flushed = 0;
+        while(candidate_buf_pop(&g_twb_info.twb_dirty_list, &twb_dirty)
+            && curr_twb_flushed++ < max_twb_flushed
+            && need_flush_num < max_flush_num) {
+            BufferDesc * twb_desc = GetBufferDescriptor(*twb_dirty);
+            item = &dirty_buf_list[need_flush_num++];
+            item->buf_id = twb_desc->buf_id;
+            item->tsId = twb_desc->tag.rnode.spcNode;
+            item->relNode = twb_desc->tag.rnode.relNode;
+            item->bucketNode = twb_desc->tag.rnode.bucketNode;
+            item->forkNum = twb_desc->tag.forkNum;
+            item->blockNum = twb_desc->tag.blockNum;
+            if (IsSegmentFileNode(twb_desc->tag.rnode) 
+                || IS_COMPRESSED_RNODE(twb_desc->tag.rnode, twb_desc->tag.forkNum)) {
+                *contain_hashbucket = true;
+            }
+        }
+    }
     for (uint32 buf_id = start; buf_id < end; buf_id++) {
         buf_desc = GetBufferDescriptor(buf_id);
         local_buf_state = pg_atomic_read_u32(&buf_desc->state);
+        if(ENABLE_TWB && (buf_desc->is_twb_candidate || buf_desc->is_twb_buffer))
+            continue;
 
         /* during recovery, check the data page whether not properly marked as dirty */
         if (RecoveryInProgress() && check_buffer_dirty_flag(buf_desc)) {
@@ -2434,6 +2464,11 @@ static uint32 get_candidate_buf_and_flush_list(uint32 start, uint32 end, uint32 
         check_not_need_flush = (need_flush_num >= max_flush_num || (!RecoveryInProgress()
             && XLogNeedsFlush(BufferGetLSN(buf_desc))));
         if (check_not_need_flush) {
+            goto UNLOCK;
+        }
+
+        max_write_count = g_instance.attr.attr_storage.flush_max_write_count;
+        if(max_write_count != -1 && pg_atomic_read_u32(&buf_desc->write_count) > (uint32)max_write_count) {
             goto UNLOCK;
         }
 

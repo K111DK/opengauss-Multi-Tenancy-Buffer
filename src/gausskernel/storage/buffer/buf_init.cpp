@@ -335,7 +335,50 @@ void InitCostTest(bool first){
     /* Evict history list should be fifo */
     InitTenantHist(first);
 }
+void BufWriteStatReset(BufferDesc *buf){
+    pg_atomic_init_u32(&buf->write_count, 0);
+    pg_atomic_init_u32(&buf->flush_count, 0);
+    pg_atomic_init_u64(&buf->pre_flush_ts, 0);
+    pg_atomic_init_u64(&buf->pre_write_ts, 0);
+}
+void TWB_init(){
+    bool first;
+    /* Basic info */
+    g_twb_info.need_flushing = false;
+    g_twb_info.twb_size = TWB_SIZE;
+    pg_atomic_init_u32(&g_twb_info.twb_used, 0);
 
+    /* Init twb flush array */
+    bool found_twb_info = false;
+    g_twb_info.dirty_buffer = (Buffer *)CACHELINEALIGN(
+    ShmemInitStruct("TWB Dirty Buffer",
+    TWB_SIZE * sizeof(Buffer) + PG_CACHE_LINE_SIZE, &found_twb_info));
+
+    /* Init twb hash table */
+    HASHCTL hctl1;
+    memset_s(&hctl1, sizeof(HASHCTL), 0, sizeof(HASHCTL));
+    hctl1.keysize = sizeof(BufferTag);//tag hash
+    hctl1.entrysize = sizeof(int);//lru node
+    hctl1.hash = tag_hash;
+    g_twb_info.twb_hash_table = ShmemInitHash("TWB Hash tbl", TWB_SIZE, TWB_SIZE, &hctl1, HASH_ELEM | HASH_FUNCTION);
+    
+    /* Init twb free list */
+    Buffer * twb_free_buf_pool = (Buffer *)CACHELINEALIGN(
+    ShmemInitStruct("twb free list", TWB_SIZE * sizeof(Buffer), &first));
+    MemSet((char*)twb_free_buf_pool, 0, TWB_SIZE * sizeof(Buffer));
+    INIT_CANDIDATE_LIST(g_twb_info.twb_free_list, twb_free_buf_pool, 
+    TWB_SIZE, 0 ,0);
+    for(Buffer i = TOTAL_BUFFER_NUM - TWB_SIZE; i < TOTAL_BUFFER_NUM; i++) {
+        candidate_buf_push(&g_twb_info.twb_free_list, i);
+    }
+
+    /* Init twb dirty list */
+    Buffer * twb_dirty_buf_pool = (Buffer *)CACHELINEALIGN(
+    ShmemInitStruct("twb dirty list", TWB_SIZE * sizeof(Buffer), &first));
+    MemSet((char*)twb_dirty_buf_pool, 0, TWB_SIZE * sizeof(Buffer));
+    INIT_CANDIDATE_LIST(&g_twb_info.twb_dirty_list, twb_dirty_buf_pool,
+    TWB_SIZE, 0 ,0);
+}
 void InitBufferPool(void)
 {
     bool found_bufs = false;
@@ -355,6 +398,8 @@ void InitBufferPool(void)
                         TOTAL_BUFFER_NUM * sizeof(BufferDescExtra) + PG_CACHE_LINE_SIZE,
                         &found_buf_extra));
 
+    if(!found_descs && ENABLE_TWB)
+        TWB_init();
     if(ENABLE_MULTI_TENANTCY){
         /* We make sure this won't exec twice */
         InitMultiTenantBufferPool();
@@ -461,7 +506,12 @@ void InitBufferPool(void)
             buf->prev = NULL;
             buf->next = NULL;
             buf->tenantOid = UINT32_MAX;
-
+            buf->is_twb_buffer = false;
+            buf->is_twb_candidate = false;
+            if(ENABLE_TWB && buf->buf_id >= TOTAL_BUFFER_NUM - TWB_SIZE) {
+                buf->is_twb_candidate = true;
+            }
+            BufWriteStatReset(buf);
         }
         g_instance.bgwriter_cxt.rel_hashtbl_lock = LWLockAssign(LWTRANCHE_UNLINK_REL_TBL);
         g_instance.bgwriter_cxt.rel_one_fork_hashtbl_lock = LWLockAssign(LWTRANCHE_UNLINK_REL_FORK_TBL);
@@ -499,13 +549,13 @@ Size BufferShmemSize(void)
     Size size = 0;
 
     /* size of buffer descriptors */
-    size = add_size(size, mul_size(TOTAL_BUFFER_NUM, sizeof(BufferDescPadded)));
+    size = add_size(size, mul_size(TOTAL_BUFFER_NUM + TWB_SIZE, sizeof(BufferDescPadded)));
     size = add_size(size, PG_CACHE_LINE_SIZE);
-    size = add_size(size, mul_size(TOTAL_BUFFER_NUM, sizeof(BufferDescExtra)));
+    size = add_size(size, mul_size(TOTAL_BUFFER_NUM + TWB_SIZE, sizeof(BufferDescExtra)));
     size = add_size(size, PG_CACHE_LINE_SIZE);
 
     /* size of data pages */
-    size = add_size(size, mul_size((NORMAL_SHARED_BUFFER_NUM + SEGMENT_BUFFER_NUM), BLCKSZ));
+    size = add_size(size, mul_size((NORMAL_SHARED_BUFFER_NUM + SEGMENT_BUFFER_NUM + TWB_SIZE), BLCKSZ));
 #ifdef __aarch64__
     size = add_size(size, PG_CACHE_LINE_SIZE);
 #endif
@@ -513,17 +563,17 @@ Size BufferShmemSize(void)
     size = add_size(size, StrategyShmemSize());
 
     /* size of checkpoint sort array in bufmgr.c */
-    size = add_size(size, mul_size(TOTAL_BUFFER_NUM, sizeof(CkptSortItem)));
+    size = add_size(size, mul_size(TOTAL_BUFFER_NUM + TWB_SIZE, sizeof(CkptSortItem)));
 
     /* size of candidate buffers */
-    size = add_size(size, mul_size(TOTAL_BUFFER_NUM, sizeof(Buffer)));
+    size = add_size(size, mul_size(TOTAL_BUFFER_NUM + TWB_SIZE, sizeof(Buffer)));
 
     /* size of candidate free map */
-    size = add_size(size, mul_size(TOTAL_BUFFER_NUM, sizeof(bool)));
+    size = add_size(size, mul_size(TOTAL_BUFFER_NUM + TWB_SIZE, sizeof(bool)));
 
-    size = add_size(size, mul_size(EXTRA_MEM_FACTOR * TOTAL_BUFFER_NUM, sizeof(buffer_node)));
+    size = add_size(size, mul_size(EXTRA_MEM_FACTOR * TOTAL_BUFFER_NUM + TWB_SIZE, sizeof(buffer_node)));
 
-    size = add_size(size, mul_size(TOTAL_BUFFER_NUM, sizeof(fifo_ele)));
+    size = add_size(size, mul_size(TOTAL_BUFFER_NUM + TWB_SIZE, sizeof(fifo_ele)));
 
     /* size of dms buf ctrl and buffer align */
     if (ENABLE_DMS) {
