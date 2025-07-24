@@ -37,7 +37,6 @@
 #define IsSegmentBufferID(id) ((id) >= SegmentBufferStartID)
 #define IsNvmBufferID(id) ((id) >= NvmBufferStartID && (id) < SegmentBufferStartID)
 #define IsNormalBufferID(id) ((id) >= 0 && (id) < NvmBufferStartID)
-
 #define USE_CKPT_THREAD_SYNC (!g_instance.attr.attr_storage.enableIncrementalCheckpoint ||  \
                                IsBootstrapProcessingMode() ||                               \
                                pg_atomic_read_u32(&g_instance.ckpt_cxt_ctl->current_page_writer_count) < 1)

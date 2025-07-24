@@ -205,7 +205,9 @@ typedef struct BufferDescExtra {
 
     volatile bool aio_in_progress; /* indicate aio is in progress */
 } BufferDescExtra;
-
+#define TWB_CANDIDATE (1U)
+#define TWB_BUFFERED (1U << 1)
+#define LRUC_CANDIDATE (1U << 2)
 typedef struct BufferDesc {
     BufferTag tag; /* ID of page contained in buffer */
     int buf_id;    /* buffer's index number (from 0) */
@@ -227,8 +229,7 @@ typedef struct BufferDesc {
     pg_atomic_uint32 flush_count;
     pg_atomic_uint64 pre_flush_ts;
     pg_atomic_uint64 pre_write_ts;
-    bool is_twb_buffer; /* is this buffer in TWB? */
-    bool is_twb_candidate;
+    pg_atomic_uint32 flush_state;
 #ifdef USE_ASSERT_CHECKING
     volatile uint64 lsn_dirty;
 #endif
@@ -512,12 +513,13 @@ typedef struct tenant_info{
 #define ENABLE_TWB (g_instance.attr.attr_storage.enable_twb)
 #define TWB_SIZE (g_instance.attr.attr_storage.twb_size)
 typedef struct TWB {
-    
+    pg_atomic_uint32 total_fg_stall;
+    pg_atomic_uint32 total_twb_flushed;
     uint32 twb_size;
     pg_atomic_uint32 twb_used;
     bool need_flushing;
     /* twb lock */
-    pthread_spin_lock twb_lock;
+    pthread_spinlock_t twb_lock;
     
     /* store twb clean pages */
     CandidateList twb_free_list;
@@ -533,9 +535,25 @@ typedef struct TWB {
 
 }TWB;
 
+
+#define ENABLE_LRUC (g_instance.attr.attr_storage.enable_lruc)
+#define MAX_LRUC_SCAN_LEN (g_instance.attr.attr_storage.max_lruc_scan_len)
+typedef struct LRUC {
+    pg_atomic_uint32 total_fg_stall;
+    pg_atomic_uint32 total_lurc_flushed;
+    /* store twb dirty pages */
+    CandidateList lruc_dirty_list;
+    
+    /* store the dirty buffer id that to be flushed */
+    Buffer * dirty_buffer;
+} LRUC;
+
+
+
 /* */
 extern tenant_info g_tenant_info;
 extern TWB g_twb_info;
+extern LRUC g_lruc_info;
 extern BufferDesc *TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt);
 extern void show_tenant_status();
 double GetTenantHRD(tenant_buffer_cxt* buffer_cxt);

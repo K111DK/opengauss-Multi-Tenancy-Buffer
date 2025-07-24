@@ -132,7 +132,66 @@ static bool ReadBuffer_common_ReadBlock(SMgrRelation smgr, char relpersistence, 
 static Buffer ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum, BlockNumber blockNum,
     ReadBufferMode mode, BufferAccessStrategy strategy, bool *hit, const XLogPhyBlock *pblk);
 static void TerminateBufferIO_common(BufferDesc *buf, bool clear_dirty, uint32 set_flag_bits);
+/**
+ * @Description: Push buffer bufId to thread threadId's candidate list.
+ * @in: buf_id, buffer id which need push to the list
+ * @in: thread_id, pagewriter thread id.
+ */
+static void candidate_buf_push_twb(CandidateList *list, int buf_id)
+{
+    uint32 list_size = list->cand_list_size;
+    uint32 tail_loc;
 
+    pg_memory_barrier();
+    volatile uint64 head = pg_atomic_read_u64(&list->head);
+    pg_memory_barrier();
+    volatile uint64 tail = pg_atomic_read_u64(&list->tail);
+
+    if (unlikely(tail - head >= list_size)) {
+        return;
+    }
+    tail_loc = tail % list_size;
+    list->cand_buf_list[tail_loc] = buf_id;
+    (void)pg_atomic_fetch_add_u64(&list->tail, 1);
+}
+
+/**
+ * @Description: Pop a buffer from the head of thread threadId's candidate list and store the buffer in buf_id.
+ * @in: buf_id, store the buffer id from the list.
+ * @in: thread_id, pagewriter thread id
+ */
+bool candidate_buf_pop_twb(CandidateList *list, int *buf_id)
+{
+    uint32 list_size = list->cand_list_size;
+    uint32 head_loc;
+
+    while (true) {
+        pg_memory_barrier();
+        uint64 head = pg_atomic_read_u64(&list->head);
+        pg_memory_barrier();
+        volatile uint64 tail = pg_atomic_read_u64(&list->tail);
+
+        if (unlikely(head >= tail)) {
+            return false;       /* candidate list is empty */
+        }
+
+        head_loc = head % list_size;
+        *buf_id = list->cand_buf_list[head_loc];
+        if (pg_atomic_compare_exchange_u64(&list->head, &head, head + 1)) {
+            return true;
+        }
+    }
+}
+
+static int64 get_thread_candidate_nums_twb(CandidateList *list)
+{
+    volatile uint64 head = pg_atomic_read_u64(&list->head);
+    pg_memory_barrier();
+    volatile uint64 tail = pg_atomic_read_u64(&list->tail);
+    int64 curr_cand_num = tail - head;
+    Assert(curr_cand_num >= 0);
+    return curr_cand_num;
+}
 /*
  * Ensure that the the PrivateRefCountArray has sufficient space to store one
  * more entry. This has to be called before using NewPrivateRefCountEntry() to
@@ -2671,6 +2730,7 @@ void PageCheckWhenChosedElimination(const BufferDesc *buf, uint32 oldFlags)
  * No locks are held either at entry or exit.
  */
 TWB g_twb_info;
+LRUC g_lruc_info;
 tenant_info g_tenant_info;
 void show_tenant_status(){
     uint64 total_hit = 0;
@@ -3530,7 +3590,7 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
     /* determine its hash code and partition lock ID */
     new_hash = BufTableHashCode(&new_tag);
     new_partition_lock = BufMappingPartitionLock(new_hash);
-
+TWB_RETRY:
     /* see if the block is in the buffer pool already */
     (void)LWLockAcquire(new_partition_lock, LW_SHARED);
     pgstat_report_waitevent(WAIT_EVENT_BUF_HASH_SEARCH);
@@ -3542,10 +3602,27 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
          * buffer pool, and check to see if the correct data has been loaded
          * into the buffer.
          */
+
         buf = GetBufferDescriptor(buf_id);
+        /* Which was not supposed to be found in TWB buffered */
+        if(ENABLE_TWB){
+            uint32 flush_state = pg_atomic_read_u32(&buf->flush_state);
+            if(flush_state & TWB_BUFFERED){
+                /* This shit is being flushed now */
+                if(ENABLE_LOG)
+                ereport(WARNING, (errmsg("FG hit TWB Buf %d, sleep 1ms, total stall %d, is dirty %u, curr dirty queue size %u", buf_id, 
+                        pg_atomic_add_fetch_u32(&g_twb_info.total_fg_stall, 1),
+                        pg_atomic_read_u32(&buf->state) & BM_DIRTY,
+                        get_thread_candidate_nums_twb(&g_twb_info.twb_dirty_list))));
+                LWLockRelease(new_partition_lock);
+                /* Wait for flushed */
+                pg_usleep(100000);
+                goto TWB_RETRY;   
+            }
+        }
+
 
         valid = PinBuffer(buf, strategy);
-
         /* Can release the mapping lock as soon as we've pinned it */
         LWLockRelease(new_partition_lock);
 
@@ -3576,6 +3653,9 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
             MarkReadPblk(buf->buf_id, pblk);
         }
 
+        if(ENABLE_LRUC && *found){
+            pg_atomic_write_u32(&buf->flush_state, 0U);
+        }
         return buf;
     }
 
@@ -3587,6 +3667,7 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
     /* Loop here in case we have to try another victim buffer */
     bool from_clean = false;
     bool from_twb_free = false;
+    int lruc_sacn_len = 0;
     for (;;) {
         from_clean = false;
         bool needGetLock = false;
@@ -3626,6 +3707,7 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
          * after re-locking the buffer header.
          */
         if (old_flags & BM_DIRTY) {
+            Assert(pg_atomic_read_u32(&buf->flush_state)==0U);
             /* backend should not flush dirty pages if working version less than DW_SUPPORT_NEW_SINGLE_FLUSH */
             if (!backend_can_flush_dirty_page()) {
                 UnpinBuffer(buf, true);
@@ -3656,36 +3738,45 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
                 needDoFlush = true;
             }
             /* Buffer is dirty and we had pinned it */
-            if(needDoFlush && ENABLE_TWB){
+            if(needDoFlush && ENABLE_LRUC && (lruc_sacn_len++ < MAX_LRUC_SCAN_LEN)){
+
+                if(candidate_buf_push_twb(&g_lruc_info.lruc_dirty_list, buf->buf_id)){
+                    /* It's only a hint */
+                    pg_atomic_write_u32(&buf->flush_state, LRUC_CANDIDATE);
+                }
+                UnpinBuffer(buf, true);
+                continue;
+            
+            } else if(needDoFlush && ENABLE_TWB){
                     Buffer swap_free_buf;
-                    uint32 curr_dirty_size = get_thread_candidate_nums(&g_twb_info.twb_dirty_list);
-                    bool has_free = candidate_buf_pop(&g_twb_info.twb_free_list, &swap_free_buf);
-                    bool can_use_twb = has_free && !buf->is_twb_buffer && curr_dirty_size < g_twb_info.twb_dirty_size;
+                    uint32 curr_dirty_size = get_thread_candidate_nums_twb(&g_twb_info.twb_dirty_list);
+                    bool has_free = candidate_buf_pop_twb(&g_twb_info.twb_free_list, &swap_free_buf);
+                    bool can_use_twb = has_free && (pg_atomic_read_u32(&buf->flush_state)==0U) 
+                    && curr_dirty_size < g_twb_info.twb_size;
                     /* Only when we got free twb buffer to replace and this buf isn't in twb */
                     if(can_use_twb){
+                        if(ENABLE_LOG)
+                            ereport(WARNING, (errmsg("dirty %d buf push to twb, got clean buf %d, curr_dirty_size %u", 
+                            buf->buf_id, swap_free_buf, curr_dirty_size)));
                         /* Add buf to twb dirty buf*/
-                        buf->is_twb_buffer = true;
-                        buf->is_twb_candidate = false;
-                        candidate_buf_push(&g_twb_info.twb_dirty_list, buf->buf_id);
+                        pg_atomic_write_u32(&buf->flush_state, TWB_BUFFERED);
+                        candidate_buf_push_twb(&g_twb_info.twb_dirty_list, buf->buf_id);
                         from_twb_free = true;
-                        
-                        /* Delete it from Hashtable */
-                        uint32 buf_hash = BufTableHashCode(&buf->tag);
-                        LWLock *partition_lock = BufMappingPartitionLock(buf_hash);
-                        LWLockAcquire(partition_lock, LW_EXCLUSIVE);
-                        BufTableDelete(&buf->tag, buf_hash);
-                        LWLockRelease(partition_lock);
-                        
+                        LWLockRelease(buf->content_lock);
                         /* Unlock dirty buf */
                         UnpinBuffer(buf, true);
 
                         /* Get swaped buf and lock it */
                         buf = GetBufferDescriptor(swap_free_buf);
-                        buf->is_twb_buffer = false;
-                        buf->is_twb_candidate = false;
+                        /* Swap free should be candidate */
+                        Assert(pg_atomic_read_u32(&buf->flush_state) & TWB_CANDIDATE);
+                        pg_atomic_write_u32(&buf->flush_state, 0);
                         LockBufHdr(buf);
+                        PinBuffer_Locked(buf);
                     
                     }else{
+
+                        LWLockRelease(buf->content_lock);
                         UnpinBuffer(buf, true);
                         continue;
                     }
@@ -3901,7 +3992,7 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
         GetDmsBufCtrl(buf->buf_id)->been_loaded = false;
     }
 
-    if (old_flags & BM_TAG_VALID) {
+    if (old_flags & BM_TAG_VALID && !from_twb_free) {
         BufTableDelete(&old_tag, old_hash);
         if (old_partition_lock != new_partition_lock) {
             LWLockRelease(old_partition_lock);
@@ -5151,7 +5242,21 @@ uint32 SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext* wb_c
     }
 
     ScheduleBufferTagForWriteback(wb_context, &tag);
-
+    if(pg_atomic_read_u32(&buf_desc->flush_state) & TWB_BUFFERED){
+        uint32 total_flushed = pg_atomic_add_fetch_u32(&g_twb_info.total_twb_flushed, 1);
+        /* Delete it from Hashtable */
+        if(ENABLE_LOG)
+            ereport(WARNING, (errmsg("TWB Buf %d flushed, total flushed %u", buf_desc->buf_id, total_flushed)));
+        uint32 buf_hash = BufTableHashCode(&buf_desc->tag);
+        LWLock *partition_lock = BufMappingPartitionLock(buf_hash);
+        LWLockAcquire(partition_lock, LW_EXCLUSIVE);
+        pg_atomic_write_u32(&buf_desc->flush_state, TWB_CANDIDATE);
+        BufTableDelete(&buf_desc->tag, buf_hash);
+        LWLockRelease(partition_lock);
+        candidate_buf_push_twb(&g_twb_info.twb_free_list, buf_desc->buf_id);
+    }else{
+        pg_atomic_write_u32(&buf_desc->flush_state, 0U);
+    }
     return (result | BUF_WRITTEN);
 }
 

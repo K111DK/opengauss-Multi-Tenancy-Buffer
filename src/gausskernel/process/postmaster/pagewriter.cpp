@@ -304,6 +304,8 @@ void incre_ckpt_pagewriter_cxt_init()
     g_instance.ckpt_cxt_ctl->page_writer_sub_can_exit = false;
 
     uint32 dirty_list_size = MAX_DIRTY_LIST_FLUSH_NUM / thread_num;
+    if(ENABLE_LRUC)
+        dirty_list_size = TOTAL_BUFFER_NUM / thread_num;
 
     /* init thread dw cxt  and dirty list */
     for (int i = 0; i < thread_num; i++) {
@@ -2141,10 +2143,7 @@ static void incre_ckpt_pgwr_flush_dirty_list(WritebackContext *wb_context, uint3
             continue;
         }
         buf_desc = GetBufferDescriptor(buf_id);
-        if(ENABLE_TWB && (buf_desc->is_twb_buffer || buf_desc->is_twb_candidate)){
-            buf_desc->is_twb_candidate = true;
-            buf_desc->is_twb_buffer = false;
-            candidate_buf_push(&g_twb_info.twb_free_list, buf_id);
+        if(ENABLE_TWB && pg_atomic_read_u32(&buf_desc->flush_state) & TWB_CANDIDATE){
             continue;
         }
         push_to_candidate_list(buf_desc);
@@ -2374,6 +2373,160 @@ static void incre_ckpt_pgwr_scan_buf_pool(WritebackContext *wb_context)
  * @out: Return the number of dirty buffers and dirty buffer list and this batch buffer
  *      whether hashbucket is included.
  */
+static uint32 twb_try_flush_buf(uint32 max_flush_num, bool *contain_hashbucket){
+    uint32 need_flush_num = 0;
+    uint32 candidates = 0;
+    BufferDesc *buf_desc = NULL;
+    uint32 local_buf_state;
+    CkptSortItem* item = NULL;
+    bool check_not_need_flush = false;
+    bool check_usecount = false;
+    int thread_id = t_thrd.pagewriter_cxt.pagewriter_id;
+    int max_write_count;
+    PageWriterProc *pgwr = &g_instance.ckpt_cxt_ctl->pgwr_procs.writer_proc[thread_id];
+    CkptSortItem *dirty_buf_list = pgwr->dirty_buf_list;
+
+    ResourceOwnerEnlargeBuffers(t_thrd.utils_cxt.CurrentResourceOwner);
+
+    int64 max_twb_flushed = get_thread_candidate_nums(&g_twb_info.twb_dirty_list) / g_instance.attr.attr_storage.pagewriter_thread_num + 1;
+    /* force to write whole twb */
+    int buf_id;
+    while(candidate_buf_pop(&g_twb_info.twb_dirty_list, &buf_id)) {
+            if(ENABLE_LOG && ENABLE_TWB)
+                ereport(WARNING, 
+                (errmsg("TWB POP buf_id is %d", buf_id)));
+            buf_desc = GetBufferDescriptor(buf_id);
+            local_buf_state = pg_atomic_read_u32(&buf_desc->state);
+            Assert(pg_atomic_read_u32(&buf_desc->flush_state) & TWB_BUFFERED);
+            /* during recovery, check the data page whether not properly marked as dirty */
+            if (RecoveryInProgress() && check_buffer_dirty_flag(buf_desc)) {
+                if (need_flush_num < max_twb_flushed) {
+                    local_buf_state = LockBufHdr(buf_desc);
+                    goto PUSH_DIRTY;
+                } else {
+                    continue;
+                }
+            }
+            /* Dirty read, pinned buffer, skip */
+            if (BUF_STATE_GET_REFCOUNT(local_buf_state) > 0) {
+                continue;
+            }
+
+            local_buf_state = LockBufHdr(buf_desc);
+            if (BUF_STATE_GET_REFCOUNT(local_buf_state) > 0) {
+                goto UNLOCK;
+            }
+
+            check_usecount = NEED_CONSIDER_USECOUNT && BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0;
+            if (check_usecount) {
+                local_buf_state -= BUF_USAGECOUNT_ONE;
+                goto UNLOCK;
+            }
+
+            /* Not dirty, put directly into flushed candidates */
+            if (!(local_buf_state & BM_DIRTY)) {
+                goto UNLOCK;
+            }
+
+            check_not_need_flush = (need_flush_num >= max_twb_flushed || (!RecoveryInProgress()
+                && XLogNeedsFlush(BufferGetLSN(buf_desc))));
+            if (check_not_need_flush) {
+                goto UNLOCK;
+            }
+
+        PUSH_DIRTY:
+            local_buf_state |= BM_CHECKPOINT_NEEDED;
+            item = &dirty_buf_list[need_flush_num++];
+            item->buf_id = buf_id;
+            item->tsId = buf_desc->tag.rnode.spcNode;
+            item->relNode = buf_desc->tag.rnode.relNode;
+            item->bucketNode = buf_desc->tag.rnode.bucketNode;
+            item->forkNum = buf_desc->tag.forkNum;
+            item->blockNum = buf_desc->tag.blockNum;
+            if (IsSegmentFileNode(buf_desc->tag.rnode) || IS_COMPRESSED_RNODE(buf_desc->tag.rnode, buf_desc->tag.forkNum)) {
+                *contain_hashbucket = true;
+            }
+        UNLOCK:
+            UnlockBufHdr(buf_desc, local_buf_state);
+    }
+    return need_flush_num;
+}
+
+static uint32 lruc_try_flush_buf(bool *contain_hashbucket){
+    uint32 need_flush_num = 0;
+    uint32 candidates = 0;
+    BufferDesc *buf_desc = NULL;
+    uint32 local_buf_state;
+    CkptSortItem* item = NULL;
+    bool check_not_need_flush = false;
+    bool check_usecount = false;
+    int thread_id = t_thrd.pagewriter_cxt.pagewriter_id;
+    int max_write_count;
+    PageWriterProc *pgwr = &g_instance.ckpt_cxt_ctl->pgwr_procs.writer_proc[thread_id];
+    CkptSortItem *dirty_buf_list = pgwr->dirty_buf_list;
+    ResourceOwnerEnlargeBuffers(t_thrd.utils_cxt.CurrentResourceOwner);
+    int64 lurc_flushed = get_thread_candidate_nums(&g_lruc_info.lruc_dirty_list) / g_instance.attr.attr_storage.pagewriter_thread_num + 1;
+    /* force to write whole twb */
+    int buf_id;
+    while(candidate_buf_pop(&g_lruc_info.lruc_dirty_list, &buf_id)) {
+            buf_desc = GetBufferDescriptor(buf_id);
+            local_buf_state = pg_atomic_read_u32(&buf_desc->state);
+            if(!(pg_atomic_read_u32(&buf_desc->flush_state) & LRUC_CANDIDATE));
+                continue;
+            /* during recovery, check the data page whether not properly marked as dirty */
+            if (RecoveryInProgress() && check_buffer_dirty_flag(buf_desc)) {
+                if (need_flush_num < lurc_flushed) {
+                    local_buf_state = LockBufHdr(buf_desc);
+                    goto PUSH_DIRTY;
+                } else {
+                    continue;
+                }
+            }
+            /* Dirty read, pinned buffer, skip */
+            if (BUF_STATE_GET_REFCOUNT(local_buf_state) > 0) {
+                continue;
+            }
+
+            local_buf_state = LockBufHdr(buf_desc);
+            if (BUF_STATE_GET_REFCOUNT(local_buf_state) > 0) {
+                goto UNLOCK;
+            }
+
+            check_usecount = NEED_CONSIDER_USECOUNT && BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0;
+            if (check_usecount) {
+                local_buf_state -= BUF_USAGECOUNT_ONE;
+                goto UNLOCK;
+            }
+
+            /* Not dirty, put directly into flushed candidates */
+            if (!(local_buf_state & BM_DIRTY)) {
+                goto UNLOCK;
+            }
+
+            check_not_need_flush = (need_flush_num >= max_twb_flushed || (!RecoveryInProgress()
+                && XLogNeedsFlush(BufferGetLSN(buf_desc))));
+            if (check_not_need_flush) {
+                goto UNLOCK;
+            }
+
+        PUSH_DIRTY:
+            local_buf_state |= BM_CHECKPOINT_NEEDED;
+            item = &dirty_buf_list[need_flush_num++];
+            item->buf_id = buf_id;
+            item->tsId = buf_desc->tag.rnode.spcNode;
+            item->relNode = buf_desc->tag.rnode.relNode;
+            item->bucketNode = buf_desc->tag.rnode.bucketNode;
+            item->forkNum = buf_desc->tag.forkNum;
+            item->blockNum = buf_desc->tag.blockNum;
+            if (IsSegmentFileNode(buf_desc->tag.rnode) || IS_COMPRESSED_RNODE(buf_desc->tag.rnode, buf_desc->tag.forkNum)) {
+                *contain_hashbucket = true;
+            }
+        UNLOCK:
+            UnlockBufHdr(buf_desc, local_buf_state);
+    }
+    return need_flush_num;
+}
+
 static uint32 get_candidate_buf_and_flush_list(uint32 start, uint32 end, uint32 max_flush_num,
     bool *contain_hashbucket)
 {
@@ -2393,31 +2546,16 @@ static uint32 get_candidate_buf_and_flush_list(uint32 start, uint32 end, uint32 
 
     max_flush_num = ((FULL_CKPT && !RecoveryInProgress()) ? 0 : max_flush_num);
 
-    int64 max_twb_flushed = get_thread_candidate_nums(&g_twb_info.twb_dirty_list) / 4;
-    if(ENABLE_TWB){
-        Buffer* twb_dirty;
-        int64 curr_twb_flushed = 0;
-        while(candidate_buf_pop(&g_twb_info.twb_dirty_list, &twb_dirty)
-            && curr_twb_flushed++ < max_twb_flushed
-            && need_flush_num < max_flush_num) {
-            BufferDesc * twb_desc = GetBufferDescriptor(*twb_dirty);
-            item = &dirty_buf_list[need_flush_num++];
-            item->buf_id = twb_desc->buf_id;
-            item->tsId = twb_desc->tag.rnode.spcNode;
-            item->relNode = twb_desc->tag.rnode.relNode;
-            item->bucketNode = twb_desc->tag.rnode.bucketNode;
-            item->forkNum = twb_desc->tag.forkNum;
-            item->blockNum = twb_desc->tag.blockNum;
-            if (IsSegmentFileNode(twb_desc->tag.rnode) 
-                || IS_COMPRESSED_RNODE(twb_desc->tag.rnode, twb_desc->tag.forkNum)) {
-                *contain_hashbucket = true;
-            }
-        }
-    }
+    if(ENABLE_LRUC)
+        return lruc_try_flush_buf(contain_hashbucket);
+
+    if(ENABLE_TWB)
+        need_flush_num += twb_try_flush_buf(max_flush_num, contain_hashbucket);
+
     for (uint32 buf_id = start; buf_id < end; buf_id++) {
         buf_desc = GetBufferDescriptor(buf_id);
         local_buf_state = pg_atomic_read_u32(&buf_desc->state);
-        if(ENABLE_TWB && (buf_desc->is_twb_candidate || buf_desc->is_twb_buffer))
+        if(pg_atomic_read_u32(&buf_desc->flush_state)!=0)
             continue;
 
         /* during recovery, check the data page whether not properly marked as dirty */
@@ -2464,11 +2602,6 @@ static uint32 get_candidate_buf_and_flush_list(uint32 start, uint32 end, uint32 
         check_not_need_flush = (need_flush_num >= max_flush_num || (!RecoveryInProgress()
             && XLogNeedsFlush(BufferGetLSN(buf_desc))));
         if (check_not_need_flush) {
-            goto UNLOCK;
-        }
-
-        max_write_count = g_instance.attr.attr_storage.flush_max_write_count;
-        if(max_write_count != -1 && pg_atomic_read_u32(&buf_desc->write_count) > (uint32)max_write_count) {
             goto UNLOCK;
         }
 

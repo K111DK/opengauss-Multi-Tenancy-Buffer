@@ -229,6 +229,10 @@ typedef struct knl_instance_attr_storage {
     bool enable_twb;
     int twb_size;
 
+    /* LRUC init */
+    bool enable_lruc;
+    int max_lruc_scan_len;
+
 } knl_instance_attr_storage;
 
 #endif /* SRC_INCLUDE_KNL_KNL_INSTANCE_ATTR_STORAGE_H_ */

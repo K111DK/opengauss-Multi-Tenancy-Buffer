@@ -29,7 +29,6 @@
 #include "ddes/dms/ss_common_attr.h"
 
 const int PAGE_QUEUE_SLOT_MULTI_NBUFFERS = 5;
-
 /*
  * Data Structures:
  *		buffers live in a freelist and a lookup data structure.
@@ -344,6 +343,8 @@ void BufWriteStatReset(BufferDesc *buf){
 void TWB_init(){
     bool first;
     /* Basic info */
+    pg_atomic_init_u32(&g_twb_info.total_fg_stall, 0);
+    pg_atomic_init_u32(&g_twb_info.total_twb_flushed, 0);    
     g_twb_info.need_flushing = false;
     g_twb_info.twb_size = TWB_SIZE;
     pg_atomic_init_u32(&g_twb_info.twb_used, 0);
@@ -353,14 +354,6 @@ void TWB_init(){
     g_twb_info.dirty_buffer = (Buffer *)CACHELINEALIGN(
     ShmemInitStruct("TWB Dirty Buffer",
     TWB_SIZE * sizeof(Buffer) + PG_CACHE_LINE_SIZE, &found_twb_info));
-
-    /* Init twb hash table */
-    HASHCTL hctl1;
-    memset_s(&hctl1, sizeof(HASHCTL), 0, sizeof(HASHCTL));
-    hctl1.keysize = sizeof(BufferTag);//tag hash
-    hctl1.entrysize = sizeof(int);//lru node
-    hctl1.hash = tag_hash;
-    g_twb_info.twb_hash_table = ShmemInitHash("TWB Hash tbl", TWB_SIZE, TWB_SIZE, &hctl1, HASH_ELEM | HASH_FUNCTION);
     
     /* Init twb free list */
     Buffer * twb_free_buf_pool = (Buffer *)CACHELINEALIGN(
@@ -368,16 +361,35 @@ void TWB_init(){
     MemSet((char*)twb_free_buf_pool, 0, TWB_SIZE * sizeof(Buffer));
     INIT_CANDIDATE_LIST(g_twb_info.twb_free_list, twb_free_buf_pool, 
     TWB_SIZE, 0 ,0);
-    for(Buffer i = TOTAL_BUFFER_NUM - TWB_SIZE; i < TOTAL_BUFFER_NUM; i++) {
-        candidate_buf_push(&g_twb_info.twb_free_list, i);
+    for(int i = NORMAL_SHARED_BUFFER_NUM - TWB_SIZE; i < NORMAL_SHARED_BUFFER_NUM; i++) {
+        buf_push(&g_twb_info.twb_free_list, i);
     }
 
     /* Init twb dirty list */
     Buffer * twb_dirty_buf_pool = (Buffer *)CACHELINEALIGN(
     ShmemInitStruct("twb dirty list", TWB_SIZE * sizeof(Buffer), &first));
     MemSet((char*)twb_dirty_buf_pool, 0, TWB_SIZE * sizeof(Buffer));
-    INIT_CANDIDATE_LIST(&g_twb_info.twb_dirty_list, twb_dirty_buf_pool,
+    INIT_CANDIDATE_LIST(g_twb_info.twb_dirty_list, twb_dirty_buf_pool,
     TWB_SIZE, 0 ,0);
+    ereport(LOG,(errmsg("TWB init, size: %u", g_twb_info.twb_size)));
+}
+void LRUC_init(){
+    pg_atomic_init_u32(&g_lruc_info.total_fg_stall, 0);
+    pg_atomic_init_u32(&g_lruc_info.total_lruc_flushed, 0);
+    /* Init twb flush array */
+    bool first;
+    bool found_twb_info = false;
+    g_lruc_info.dirty_buffer = (Buffer *)CACHELINEALIGN(
+    ShmemInitStruct("LRUC Dirty Buffer",
+    TWB_SIZE * sizeof(Buffer) + PG_CACHE_LINE_SIZE, &found_twb_info));
+    
+    /* Init lruc dirty list */
+    Buffer * lruc_dirty_buf_pool = (Buffer *)CACHELINEALIGN(
+    ShmemInitStruct("lru-c dirty list", TOTAL_BUFFER_NUM * sizeof(Buffer), &first));
+    MemSet((char*)lruc_dirty_buf_pool, 0, TOTAL_BUFFER_NUM * sizeof(Buffer));
+    INIT_CANDIDATE_LIST(g_lruc_info.lruc_dirty_list, lruc_dirty_buf_pool,
+    TOTAL_BUFFER_NUM, 0 ,0);
+    ereport(LOG,(errmsg("LRUC init")));
 }
 void InitBufferPool(void)
 {
@@ -400,6 +412,10 @@ void InitBufferPool(void)
 
     if(!found_descs && ENABLE_TWB)
         TWB_init();
+
+    if(!found_descs && ENABLE_LRUC)
+        LRUC_init();
+
     if(ENABLE_MULTI_TENANTCY){
         /* We make sure this won't exec twice */
         InitMultiTenantBufferPool();
@@ -506,10 +522,9 @@ void InitBufferPool(void)
             buf->prev = NULL;
             buf->next = NULL;
             buf->tenantOid = UINT32_MAX;
-            buf->is_twb_buffer = false;
-            buf->is_twb_candidate = false;
-            if(ENABLE_TWB && buf->buf_id >= TOTAL_BUFFER_NUM - TWB_SIZE) {
-                buf->is_twb_candidate = true;
+            pg_atomic_write_u32(&buf->flush_state, 0);
+            if(ENABLE_TWB && (buf->buf_id >= NORMAL_SHARED_BUFFER_NUM - TWB_SIZE)) {
+                pg_atomic_write_u32(&buf->flush_state, TWB_CANDIDATE);
             }
             BufWriteStatReset(buf);
         }
@@ -566,7 +581,7 @@ Size BufferShmemSize(void)
     size = add_size(size, mul_size(TOTAL_BUFFER_NUM + TWB_SIZE, sizeof(CkptSortItem)));
 
     /* size of candidate buffers */
-    size = add_size(size, mul_size(TOTAL_BUFFER_NUM + TWB_SIZE, sizeof(Buffer)));
+    size = add_size(size, mul_size(TOTAL_BUFFER_NUM * 5 , sizeof(Buffer)));
 
     /* size of candidate free map */
     size = add_size(size, mul_size(TOTAL_BUFFER_NUM + TWB_SIZE, sizeof(bool)));
