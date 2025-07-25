@@ -2503,8 +2503,7 @@ static uint32 lruc_try_flush_buf(bool *contain_hashbucket){
                 goto UNLOCK;
             }
 
-            check_not_need_flush = (need_flush_num >= max_twb_flushed || (!RecoveryInProgress()
-                && XLogNeedsFlush(BufferGetLSN(buf_desc))));
+            check_not_need_flush = ((!RecoveryInProgress() && XLogNeedsFlush(BufferGetLSN(buf_desc))));
             if (check_not_need_flush) {
                 goto UNLOCK;
             }
@@ -2521,6 +2520,7 @@ static uint32 lruc_try_flush_buf(bool *contain_hashbucket){
             if (IsSegmentFileNode(buf_desc->tag.rnode) || IS_COMPRESSED_RNODE(buf_desc->tag.rnode, buf_desc->tag.forkNum)) {
                 *contain_hashbucket = true;
             }
+            pg_atomic_add_fetch_u32(&g_lruc_info.total_lruc_flushed, 1);
         UNLOCK:
             UnlockBufHdr(buf_desc, local_buf_state);
     }

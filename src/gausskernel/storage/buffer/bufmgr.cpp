@@ -137,7 +137,7 @@ static void TerminateBufferIO_common(BufferDesc *buf, bool clear_dirty, uint32 s
  * @in: buf_id, buffer id which need push to the list
  * @in: thread_id, pagewriter thread id.
  */
-static void candidate_buf_push_twb(CandidateList *list, int buf_id)
+static bool candidate_buf_push_twb(CandidateList *list, int buf_id)
 {
     uint32 list_size = list->cand_list_size;
     uint32 tail_loc;
@@ -148,11 +148,12 @@ static void candidate_buf_push_twb(CandidateList *list, int buf_id)
     volatile uint64 tail = pg_atomic_read_u64(&list->tail);
 
     if (unlikely(tail - head >= list_size)) {
-        return;
+        return false;
     }
     tail_loc = tail % list_size;
     list->cand_buf_list[tail_loc] = buf_id;
     (void)pg_atomic_fetch_add_u64(&list->tail, 1);
+    return true;
 }
 
 /**
@@ -3569,6 +3570,10 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
         return NvmBufferAlloc(smgr, relpersistence, fork_num, block_num, strategy, found, pblk);
     }
 
+    if(ENABLE_LOG && ENABLE_LRUC && pg_atomic_read_u32(&g_lruc_info.total_lruc_flushed) % LOG_INTERVAL == 0){
+        ereport(LOG, (errmsg("LRUC total flushed %u", pg_atomic_read_u32(&g_lruc_info.total_lruc_flushed))));
+    }
+    
     Assert(!IsSegmentPhysicalRelNode(smgr->smgr_rnode.node));
     t_thrd.thrd_tenant_buffer_cxt = &g_tenant_info.shadow_cxt;
 
@@ -3746,7 +3751,6 @@ TWB_RETRY:
                 }
                 UnpinBuffer(buf, true);
                 continue;
-            
             } else if(needDoFlush && ENABLE_TWB){
                     Buffer swap_free_buf;
                     uint32 curr_dirty_size = get_thread_candidate_nums_twb(&g_twb_info.twb_dirty_list);

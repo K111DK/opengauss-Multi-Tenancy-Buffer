@@ -540,7 +540,7 @@ typedef struct TWB {
 #define MAX_LRUC_SCAN_LEN (g_instance.attr.attr_storage.max_lruc_scan_len)
 typedef struct LRUC {
     pg_atomic_uint32 total_fg_stall;
-    pg_atomic_uint32 total_lurc_flushed;
+    pg_atomic_uint32 total_lruc_flushed;
     /* store twb dirty pages */
     CandidateList lruc_dirty_list;
     
