@@ -304,8 +304,8 @@ void incre_ckpt_pagewriter_cxt_init()
     g_instance.ckpt_cxt_ctl->page_writer_sub_can_exit = false;
 
     uint32 dirty_list_size = MAX_DIRTY_LIST_FLUSH_NUM / thread_num;
-    if(ENABLE_LRUC)
-        dirty_list_size = TOTAL_BUFFER_NUM / thread_num;
+    // if(ENABLE_LRUC)
+    //     dirty_list_size = TOTAL_BUFFER_NUM / thread_num;
 
     /* init thread dw cxt  and dirty list */
     for (int i = 0; i < thread_num; i++) {
@@ -2452,7 +2452,7 @@ static uint32 twb_try_flush_buf(uint32 max_flush_num, bool *contain_hashbucket){
     return need_flush_num;
 }
 
-static uint32 lruc_try_flush_buf(bool *contain_hashbucket){
+static uint32 lruc_try_flush_buf(uint32 max_flush_num, bool *contain_hashbucket){
     uint32 need_flush_num = 0;
     uint32 candidates = 0;
     BufferDesc *buf_desc = NULL;
@@ -2465,17 +2465,17 @@ static uint32 lruc_try_flush_buf(bool *contain_hashbucket){
     PageWriterProc *pgwr = &g_instance.ckpt_cxt_ctl->pgwr_procs.writer_proc[thread_id];
     CkptSortItem *dirty_buf_list = pgwr->dirty_buf_list;
     ResourceOwnerEnlargeBuffers(t_thrd.utils_cxt.CurrentResourceOwner);
-    int64 lurc_flushed = get_thread_candidate_nums(&g_lruc_info.lruc_dirty_list) / g_instance.attr.attr_storage.pagewriter_thread_num + 1;
+    int64 lruc_flushed = TOTAL_BUFFER_NUM / g_instance.attr.attr_storage.pagewriter_thread_num;
     /* force to write whole twb */
     int buf_id;
     while(candidate_buf_pop(&g_lruc_info.lruc_dirty_list, &buf_id)) {
             buf_desc = GetBufferDescriptor(buf_id);
             local_buf_state = pg_atomic_read_u32(&buf_desc->state);
-            if(!(pg_atomic_read_u32(&buf_desc->flush_state) & LRUC_CANDIDATE));
-                continue;
+            // if(!(pg_atomic_read_u32(&buf_desc->flush_state) & LRUC_CANDIDATE));
+            //     continue;
             /* during recovery, check the data page whether not properly marked as dirty */
             if (RecoveryInProgress() && check_buffer_dirty_flag(buf_desc)) {
-                if (need_flush_num < lurc_flushed) {
+                if (need_flush_num < max_flush_num) {
                     local_buf_state = LockBufHdr(buf_desc);
                     goto PUSH_DIRTY;
                 } else {
@@ -2500,10 +2500,21 @@ static uint32 lruc_try_flush_buf(bool *contain_hashbucket){
 
             /* Not dirty, put directly into flushed candidates */
             if (!(local_buf_state & BM_DIRTY)) {
+                if (g_instance.ckpt_cxt_ctl->candidate_free_map[buf_id] == false) {
+                    if (buf_id < (uint32)NvmBufferStartID) {
+                        candidate_buf_push(&pgwr->normal_list, buf_id);
+                    } else if (buf_id < (uint32)SegmentBufferStartID) {
+                        candidate_buf_push(&pgwr->nvm_list, buf_id);
+                    } else {
+                        candidate_buf_push(&pgwr->seg_list, buf_id);
+                    }
+                    g_instance.ckpt_cxt_ctl->candidate_free_map[buf_id] = true;
+                    candidates++;
+                }
                 goto UNLOCK;
             }
 
-            check_not_need_flush = ((!RecoveryInProgress() && XLogNeedsFlush(BufferGetLSN(buf_desc))));
+            check_not_need_flush = (need_flush_num >= max_flush_num || (!RecoveryInProgress() && XLogNeedsFlush(BufferGetLSN(buf_desc))));
             if (check_not_need_flush) {
                 goto UNLOCK;
             }
@@ -2547,7 +2558,7 @@ static uint32 get_candidate_buf_and_flush_list(uint32 start, uint32 end, uint32 
     max_flush_num = ((FULL_CKPT && !RecoveryInProgress()) ? 0 : max_flush_num);
 
     if(ENABLE_LRUC)
-        return lruc_try_flush_buf(contain_hashbucket);
+        return lruc_try_flush_buf(max_flush_num, contain_hashbucket);
 
     if(ENABLE_TWB)
         need_flush_num += twb_try_flush_buf(max_flush_num, contain_hashbucket);

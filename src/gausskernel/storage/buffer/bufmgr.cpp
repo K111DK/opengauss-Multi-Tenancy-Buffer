@@ -3658,9 +3658,9 @@ TWB_RETRY:
             MarkReadPblk(buf->buf_id, pblk);
         }
 
-        if(ENABLE_LRUC && *found){
-            pg_atomic_write_u32(&buf->flush_state, 0U);
-        }
+        // if(ENABLE_LRUC && *found){
+        //     pg_atomic_write_u32(&buf->flush_state, 0U);
+        // }
         return buf;
     }
 
@@ -3746,9 +3746,10 @@ TWB_RETRY:
             if(needDoFlush && ENABLE_LRUC && (lruc_sacn_len++ < MAX_LRUC_SCAN_LEN)){
 
                 if(candidate_buf_push_twb(&g_lruc_info.lruc_dirty_list, buf->buf_id)){
-                    /* It's only a hint */
-                    pg_atomic_write_u32(&buf->flush_state, LRUC_CANDIDATE);
+                    // /* It's only a hint */
+                    // pg_atomic_write_u32(&buf->flush_state, LRUC_CANDIDATE);
                 }
+                LWLockRelease(buf->content_lock);
                 UnpinBuffer(buf, true);
                 continue;
             } else if(needDoFlush && ENABLE_TWB){
