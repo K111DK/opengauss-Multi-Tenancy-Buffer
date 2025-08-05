@@ -539,18 +539,19 @@ typedef struct TWB {
 #define ENABLE_LRUC (g_instance.attr.attr_storage.enable_lruc)
 #define MAX_LRUC_SCAN_LEN (g_instance.attr.attr_storage.max_lruc_scan_len)
 typedef struct LRUC {
-    pg_atomic_uint32 total_fg_stall;
-    pg_atomic_uint32 total_lruc_flushed;
     /* store twb dirty pages */
     CandidateList lruc_dirty_list;
     
     /* store the dirty buffer id that to be flushed */
     Buffer * dirty_buffer;
 } LRUC;
-
-
-
+typedef struct buffer_write_info {
+    pg_atomic_uint64 fg_flushed;
+    pg_atomic_uint64 total_fg_fetch_count;
+    pg_atomic_uint64 bg_flushed;
+} buffer_write_info;
 /* */
+extern buffer_write_info g_buffer_write_info;
 extern tenant_info g_tenant_info;
 extern TWB g_twb_info;
 extern LRUC g_lruc_info;

@@ -373,17 +373,9 @@ void TWB_init(){
     TWB_SIZE, 0 ,0);
     ereport(LOG,(errmsg("TWB init, size: %u", g_twb_info.twb_size)));
 }
-void LRUC_init(){
-    pg_atomic_init_u32(&g_lruc_info.total_fg_stall, 0);
-    pg_atomic_init_u32(&g_lruc_info.total_lruc_flushed, 0);
-    /* Init twb flush array */
-    bool first;
-    bool found_twb_info = false;
-    g_lruc_info.dirty_buffer = (Buffer *)CACHELINEALIGN(
-    ShmemInitStruct("LRUC Dirty Buffer",
-    TWB_SIZE * sizeof(Buffer) + PG_CACHE_LINE_SIZE, &found_twb_info));
-    
+void LRUC_init(){ 
     /* Init lruc dirty list */
+    bool first;
     Buffer * lruc_dirty_buf_pool = (Buffer *)CACHELINEALIGN(
     ShmemInitStruct("lru-c dirty list", TOTAL_BUFFER_NUM * sizeof(Buffer), &first));
     MemSet((char*)lruc_dirty_buf_pool, 0, TOTAL_BUFFER_NUM * sizeof(Buffer));
@@ -409,6 +401,11 @@ void InitBufferPool(void)
         ShmemInitStruct("Buffer Descriptors Extra",
                         TOTAL_BUFFER_NUM * sizeof(BufferDescExtra) + PG_CACHE_LINE_SIZE,
                         &found_buf_extra));
+    if(!found_descs){
+        pg_atomic_init_u64(&g_buffer_write_info.bg_flushed, 0);
+        pg_atomic_init_u64(&g_buffer_write_info.fg_flushed, 0);
+        pg_atomic_init_u64(&g_buffer_write_info.total_fg_fetch_count, 0);
+    }
 
     if(!found_descs && ENABLE_TWB)
         TWB_init();

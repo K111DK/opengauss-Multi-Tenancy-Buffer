@@ -2733,6 +2733,7 @@ void PageCheckWhenChosedElimination(const BufferDesc *buf, uint32 oldFlags)
 TWB g_twb_info;
 LRUC g_lruc_info;
 tenant_info g_tenant_info;
+buffer_write_info g_buffer_write_info;
 void show_tenant_status(){
     uint64 total_hit = 0;
     uint64 total_miss = 0;
@@ -3570,9 +3571,6 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
         return NvmBufferAlloc(smgr, relpersistence, fork_num, block_num, strategy, found, pblk);
     }
 
-    if(ENABLE_LOG && ENABLE_LRUC && pg_atomic_read_u32(&g_lruc_info.total_lruc_flushed) % LOG_INTERVAL == 0){
-        ereport(LOG, (errmsg("LRUC total flushed %u", pg_atomic_read_u32(&g_lruc_info.total_lruc_flushed))));
-    }
     
     Assert(!IsSegmentPhysicalRelNode(smgr->smgr_rnode.node));
     t_thrd.thrd_tenant_buffer_cxt = &g_tenant_info.shadow_cxt;
@@ -3668,6 +3666,7 @@ TWB_RETRY:
      * Didn't find it in the buffer pool.  We'll have to initialize a new
      * buffer.	Remember to unlock the mapping lock while doing the work.
      */
+    pg_atomic_add_fetch_u64(&g_buffer_write_info.total_fg_fetch_count, 1);
     LWLockRelease(new_partition_lock);
     /* Loop here in case we have to try another victim buffer */
     bool from_clean = false;
@@ -3712,7 +3711,6 @@ TWB_RETRY:
          * after re-locking the buffer header.
          */
         if (old_flags & BM_DIRTY) {
-            Assert(pg_atomic_read_u32(&buf->flush_state)==0U);
             /* backend should not flush dirty pages if working version less than DW_SUPPORT_NEW_SINGLE_FLUSH */
             if (!backend_can_flush_dirty_page()) {
                 UnpinBuffer(buf, true);
@@ -3745,9 +3743,11 @@ TWB_RETRY:
             /* Buffer is dirty and we had pinned it */
             if(needDoFlush && ENABLE_LRUC && (lruc_sacn_len++ < MAX_LRUC_SCAN_LEN)){
 
-                if(candidate_buf_push_twb(&g_lruc_info.lruc_dirty_list, buf->buf_id)){
-                    // /* It's only a hint */
-                    // pg_atomic_write_u32(&buf->flush_state, LRUC_CANDIDATE);
+                if(!(pg_atomic_read_u32(&buf->flush_state) & LRUC_CANDIDATE)){
+                    /* It's only a hint */
+                    pg_atomic_write_u32(&buf->flush_state, LRUC_CANDIDATE);
+                    pg_memory_barrier();
+                    Assert(candidate_buf_push_twb(&g_lruc_info.lruc_dirty_list, buf->buf_id));
                 }
                 LWLockRelease(buf->content_lock);
                 UnpinBuffer(buf, true);
@@ -3836,6 +3836,7 @@ TWB_RETRY:
 
                 TRACE_POSTGRESQL_BUFFER_WRITE_DIRTY_DONE(fork_num, block_num, smgr->smgr_rnode.node.spcNode,
                                                          smgr->smgr_rnode.node.dbNode, smgr->smgr_rnode.node.relNode);
+                pg_atomic_add_fetch_u64(&g_buffer_write_info.fg_flushed, 1);
             } else {
                 /*
                  * Someone else has locked the buffer, so give it up and loop
@@ -5262,6 +5263,7 @@ uint32 SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext* wb_c
     }else{
         pg_atomic_write_u32(&buf_desc->flush_state, 0U);
     }
+    pg_atomic_write_u32(&buf_desc->flush_state, 0U);
     return (result | BUF_WRITTEN);
 }
 

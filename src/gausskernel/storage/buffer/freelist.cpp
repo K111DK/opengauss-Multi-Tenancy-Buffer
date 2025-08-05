@@ -269,8 +269,6 @@ retry:
     int try_get_loc_times = max_buffer_can_use;
     for (;;) {
         buf = GetBufferDescriptor(ClockSweepTick(max_buffer_can_use));
-        if (pg_atomic_read_u32(&buf->flush_state) != 0)
-            continue;
         /*
          * If the buffer is pinned, we cannot use it.
          */
@@ -911,8 +909,6 @@ static BufferDesc* get_buf_from_candidate_list(BufferAccessStrategy strategy, ui
             Assert(buf_id < SegmentBufferStartID);
             buf = GetBufferDescriptor(buf_id);
             local_buf_state = LockBufHdr(buf);
-            if(pg_atomic_read_u32(&buf->flush_state)!=0U)
-                continue;
 
             if (g_instance.ckpt_cxt_ctl->candidate_free_map[buf_id]) {
                 g_instance.ckpt_cxt_ctl->candidate_free_map[buf_id] = false;

@@ -2468,11 +2468,13 @@ static uint32 lruc_try_flush_buf(uint32 max_flush_num, bool *contain_hashbucket)
     int64 lruc_flushed = TOTAL_BUFFER_NUM / g_instance.attr.attr_storage.pagewriter_thread_num;
     /* force to write whole twb */
     int buf_id;
+    uint32 flush_state;
     while(candidate_buf_pop(&g_lruc_info.lruc_dirty_list, &buf_id)) {
             buf_desc = GetBufferDescriptor(buf_id);
             local_buf_state = pg_atomic_read_u32(&buf_desc->state);
-            // if(!(pg_atomic_read_u32(&buf_desc->flush_state) & LRUC_CANDIDATE));
-            //     continue;
+            flush_state = pg_atomic_read_u32(&buf_desc->flush_state);
+            if(!(flush_state & LRUC_CANDIDATE))
+                continue;
             /* during recovery, check the data page whether not properly marked as dirty */
             if (RecoveryInProgress() && check_buffer_dirty_flag(buf_desc)) {
                 if (need_flush_num < max_flush_num) {
@@ -2498,19 +2500,9 @@ static uint32 lruc_try_flush_buf(uint32 max_flush_num, bool *contain_hashbucket)
                 goto UNLOCK;
             }
 
-            /* Not dirty, put directly into flushed candidates */
+            /* Not dirty, skip */
             if (!(local_buf_state & BM_DIRTY)) {
-                if (g_instance.ckpt_cxt_ctl->candidate_free_map[buf_id] == false) {
-                    if (buf_id < (uint32)NvmBufferStartID) {
-                        candidate_buf_push(&pgwr->normal_list, buf_id);
-                    } else if (buf_id < (uint32)SegmentBufferStartID) {
-                        candidate_buf_push(&pgwr->nvm_list, buf_id);
-                    } else {
-                        candidate_buf_push(&pgwr->seg_list, buf_id);
-                    }
-                    g_instance.ckpt_cxt_ctl->candidate_free_map[buf_id] = true;
-                    candidates++;
-                }
+                pg_atomic_write_u32(&buf_desc->flush_state, 0U);
                 goto UNLOCK;
             }
 
@@ -2531,7 +2523,6 @@ static uint32 lruc_try_flush_buf(uint32 max_flush_num, bool *contain_hashbucket)
             if (IsSegmentFileNode(buf_desc->tag.rnode) || IS_COMPRESSED_RNODE(buf_desc->tag.rnode, buf_desc->tag.forkNum)) {
                 *contain_hashbucket = true;
             }
-            pg_atomic_add_fetch_u32(&g_lruc_info.total_lruc_flushed, 1);
         UNLOCK:
             UnlockBufHdr(buf_desc, local_buf_state);
     }
@@ -2558,7 +2549,7 @@ static uint32 get_candidate_buf_and_flush_list(uint32 start, uint32 end, uint32 
     max_flush_num = ((FULL_CKPT && !RecoveryInProgress()) ? 0 : max_flush_num);
 
     if(ENABLE_LRUC)
-        return lruc_try_flush_buf(max_flush_num, contain_hashbucket);
+        need_flush_num += lruc_try_flush_buf(max_flush_num, contain_hashbucket);
 
     if(ENABLE_TWB)
         need_flush_num += twb_try_flush_buf(max_flush_num, contain_hashbucket);
@@ -2632,12 +2623,28 @@ PUSH_DIRTY:
 UNLOCK:
         UnlockBufHdr(buf_desc, local_buf_state);
     }
-
+EXIT:
     if (u_sess->attr.attr_storage.log_pagewriter) {
         ereport(LOG,
             (errmodule(MOD_INCRE_CKPT),
                 errmsg("get candidate buf %d, thread id is %d", candidates, thread_id)));
     }
+    pg_atomic_add_fetch_u64(&g_buffer_write_info.bg_flushed, need_flush_num);
+    if(thread_id == 1){
+        if(ENABLE_LRUC)
+            ereport(LOG, (errmsg("Taged dirty evict page [%d]", (int)get_thread_candidate_nums(&g_lruc_info.lruc_dirty_list))));
+        ereport(LOG, (errmsg("Dirty[%.2f],BG flushed:[%u],FG flushed:[%u],Stall:[%.2f]"
+        , (float)g_instance.ckpt_cxt_ctl->actual_dirty_page_num / (float)(g_instance.attr.attr_storage.NBuffers)
+        , pg_atomic_read_u64(&g_buffer_write_info.bg_flushed)
+        , pg_atomic_read_u64(&g_buffer_write_info.fg_flushed)
+        , (double)pg_atomic_read_u64(&g_buffer_write_info.fg_flushed) / (double)pg_atomic_read_u64(&g_buffer_write_info.total_fg_fetch_count))));
+    }
+    ereport(LOG, (errmsg("[%s]flush[%u/%u],Got clean:[%d],Candidate:[%d]"
+                , ENABLE_LRUC ? "LRUC" : "NORMAL"
+                , need_flush_num
+                , max_flush_num
+                , candidates
+                , (int)get_thread_candidate_nums(&pgwr->normal_list))));
     return need_flush_num;
 }
 
