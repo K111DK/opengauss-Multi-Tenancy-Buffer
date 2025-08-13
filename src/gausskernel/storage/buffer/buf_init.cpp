@@ -383,6 +383,28 @@ void LRUC_init(){
     TOTAL_BUFFER_NUM, 0 ,0);
     ereport(LOG,(errmsg("LRUC init")));
 }
+void LRU_SNAPSHOT_init(){
+        pg_atomic_init_u64(&g_buffer_write_info.bg_flushed, 0);
+        pg_atomic_init_u64(&g_buffer_write_info.fg_flushed, 0);
+        pg_atomic_init_u64(&g_buffer_write_info.total_fg_fetch_count, 0);
+
+        pthread_mutex_init(&g_buffer_write_info.shadow_lru_cxt.lru_lock, NULL);
+        pg_atomic_init_u32(&g_buffer_write_info.shadow_lru_cxt.free_list_idx, 0);
+        
+        /* LRU init */
+        BufferDesc * head = &g_buffer_write_info.shadow_lru_cxt.lru_head;
+        BufferDesc * tail = &g_buffer_write_info.shadow_lru_cxt.lru_tail;
+        head->prev = NULL;
+        head->next = tail;
+        tail->prev = head;
+        tail->next = NULL;
+        
+        int i;
+        for(i = 0; i < 10; ++i){
+            pg_atomic_init_u64(&g_buffer_write_info.shadow_lru_cxt.pinned_count[i], 0);
+        }
+
+}
 void InitBufferPool(void)
 {
     bool found_bufs = false;
@@ -401,11 +423,8 @@ void InitBufferPool(void)
         ShmemInitStruct("Buffer Descriptors Extra",
                         TOTAL_BUFFER_NUM * sizeof(BufferDescExtra) + PG_CACHE_LINE_SIZE,
                         &found_buf_extra));
-    if(!found_descs){
-        pg_atomic_init_u64(&g_buffer_write_info.bg_flushed, 0);
-        pg_atomic_init_u64(&g_buffer_write_info.fg_flushed, 0);
-        pg_atomic_init_u64(&g_buffer_write_info.total_fg_fetch_count, 0);
-    }
+    if(!found_descs && ENABLE_LRU_SNAPSHOT)
+        LRU_SNAPSHOT_init();
 
     if(!found_descs && ENABLE_TWB)
         TWB_init();

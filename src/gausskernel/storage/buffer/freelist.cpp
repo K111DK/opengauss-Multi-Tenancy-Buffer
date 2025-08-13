@@ -178,6 +178,89 @@ static inline uint32 ClockSweepTick(int max_nbuffer_can_use)
  *  If the fraction is too small, we will increase dynamiclly to avoid elog(ERROR)
  *  in `Startup' process because of ERROR will promote to FATAL.
  */
+BufferDesc* StrategyGetBufferLRU(BufferAccessStrategy strategy, uint32* buf_state){
+
+    BufferDesc *buf = NULL;
+    int bgwproc_no;
+    int try_counter;
+    uint32 local_buf_state = 0; /* to avoid repeated (de-)referencing */
+    StrategyDelayStatus retry_lock_status = { 0, 0 };
+    StrategyDelayStatus retry_buf_status = { 0, 0 };
+    
+    /* Get from free list */
+    if(pg_atomic_read_u32(&g_buffer_write_info.shadow_lru_cxt.free_list_idx) < NORMAL_SHARED_BUFFER_NUM) {
+        uint32 free_idx = pg_atomic_fetch_add_u32(&g_buffer_write_info.shadow_lru_cxt.free_list_idx, 1);
+        if( free_idx < NORMAL_SHARED_BUFFER_NUM) {
+            buf = GetBufferDescriptor(free_idx);
+            local_buf_state = LockBufHdr(buf);
+            Assert(!(local_buf_state & BM_TAG_VALID ));
+            Assert(!(local_buf_state & BM_DIRTY));
+            bool available = BUF_STATE_GET_REFCOUNT(local_buf_state) == 0 
+            && !(local_buf_state & BM_IS_META) 
+            && !(local_buf_state & BM_DIRTY);
+            Assert(available);
+            *buf_state = local_buf_state;
+            Assert(!( (local_buf_state & BUF_FLAG_MASK) & BM_TAG_VALID ));
+            return buf;    
+        }
+    }
+    
+    /* Evict */
+retry:
+    try_counter = int(NORMAL_SHARED_BUFFER_NUM * u_sess->attr.attr_storage.shared_buffers_fraction);
+    int try_get_loc_times = try_counter;
+    BufferDesc *lru_head = &g_buffer_write_info.shadow_lru_cxt.lru_head;
+    BufferDesc *lru_tail = &g_buffer_write_info.shadow_lru_cxt.lru_tail;
+    BufferDesc *next;
+    BufferDesc *prev;
+    Assert(lru_head->next != lru_tail);
+    buf = lru_tail;
+    int scan_depth = 0;
+    pthread_mutex_lock(&g_buffer_write_info.shadow_lru_cxt.lru_lock);
+    for (;;) {
+
+        /* Get prev ele */
+        buf = buf->prev;
+        scan_depth++;
+        Assert(buf);
+        if(buf == lru_head){
+            ereport(WARNING, (errmsg("no unpinned buffers available when StrategyGetBufferLRU, scanned buffer %d", scan_depth)));
+            Assert(0);
+        }
+        /*
+         * If the buffer is pinned, we cannot use it.
+         */
+        if (!retryLockBufHdr(buf, &local_buf_state))
+            continue;
+
+        retry_lock_status.retry_times = 0;
+        if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0 && !(local_buf_state & BM_IS_META) &&
+            (backend_can_flush_dirty_page() || !(local_buf_state & BM_DIRTY))) {
+            
+            /* Found a usable buffer */
+            if (strategy != NULL)
+                AddBufferToRing(strategy, buf);
+            *buf_state = local_buf_state;
+            (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->get_buf_num_clock_sweep, 1);
+            pthread_mutex_unlock(&g_buffer_write_info.shadow_lru_cxt.lru_lock);
+            return buf;
+        } else if (--try_counter == 0) {
+            /*
+             * We've scanned all the buffers without making any state changes,
+             * so all the buffers are pinned (or were when we looked at them).
+             * We could hope that someone will free one eventually, but it's
+             * probably better to fail than to risk getting stuck in an
+             * infinite loop. 
+             */
+            ereport(ERROR, (errmsg("no unpinned buffers available")));
+            Assert(0);
+        }
+        UnlockBufHdr(buf, local_buf_state);
+    }
+    pthread_mutex_unlock(&g_buffer_write_info.shadow_lru_cxt.lru_lock);
+    /* not reached */
+    return NULL;
+}
 BufferDesc* StrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state)
 {
     BufferDesc *buf = NULL;

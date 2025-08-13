@@ -343,6 +343,7 @@ extern void IssuePendingWritebacks(WritebackContext* context);
 extern void ScheduleBufferTagForWriteback(WritebackContext* context, BufferTag* tag);
 
 /* freelist.c */
+extern BufferDesc *StrategyGetBufferLRU(BufferAccessStrategy strategy, uint32 *buf_state);
 extern BufferDesc *StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state);
 
 extern void StrategyFreeBuffer(volatile BufferDesc* buf);
@@ -538,6 +539,7 @@ typedef struct TWB {
 
 #define ENABLE_LRUC (g_instance.attr.attr_storage.enable_lruc)
 #define MAX_LRUC_SCAN_LEN (g_instance.attr.attr_storage.max_lruc_scan_len)
+#define ENABLE_LRU_SNAPSHOT (g_instance.attr.attr_storage.enable_lru_snapshot)
 typedef struct LRUC {
     /* store twb dirty pages */
     CandidateList lruc_dirty_list;
@@ -545,10 +547,23 @@ typedef struct LRUC {
     /* store the dirty buffer id that to be flushed */
     Buffer * dirty_buffer;
 } LRUC;
+
+
+typedef struct shadow_lru {
+    pg_atomic_uint32 free_list_idx;
+    /* shadow lru lock */
+    pthread_mutex_t lru_lock;
+    BufferDesc lru_head;
+    BufferDesc lru_tail;
+    pg_atomic_uint64 pinned_count[10];
+} shadow_lru;
+
+
 typedef struct buffer_write_info {
     pg_atomic_uint64 fg_flushed;
     pg_atomic_uint64 total_fg_fetch_count;
     pg_atomic_uint64 bg_flushed;
+    shadow_lru shadow_lru_cxt;
 } buffer_write_info;
 /* */
 extern buffer_write_info g_buffer_write_info;

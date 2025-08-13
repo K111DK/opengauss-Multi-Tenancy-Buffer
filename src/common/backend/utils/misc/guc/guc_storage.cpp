@@ -1253,6 +1253,18 @@ static void InitStorageConfigureNamesBool()
             NULL,
             NULL
         },
+        {{"enable_lruc_sanpshot",
+            PGC_POSTMASTER,
+            NODE_ALL,
+            RESOURCES_MEM,
+            gettext_noop("whether enable lruc snapshot"),
+            NULL},
+            &g_instance.attr.attr_storage.enable_lru_snapshot,
+            false,
+            NULL,
+            NULL,
+            NULL
+        },
         {{"enable_update_weight",
             PGC_POSTMASTER,
             NODE_ALL,

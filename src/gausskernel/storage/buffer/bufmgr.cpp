@@ -3051,7 +3051,7 @@ tenant_buffer_cxt* GetVictimTenant(){
     pthread_spin_lock(&((tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt)->hit_stat_lock);
     bool need_steal = self->real_misses > self->ref_misses;
     pthread_spin_unlock(&((tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt)->hit_stat_lock);
-    if(!need_steal && !ENABLE_COST_TEST && !ENABLE_SAMPLING){
+    if(!need_steal){
         return (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
     }
 
@@ -3149,7 +3149,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
             MarkReadPblk(buf->buf_id, pblk);
         }
 
-        if(!ENABLE_FIXED || ENABLE_COST_TEST && ENABLE_UPDATE_STRUCT)
+        if(!ENABLE_FIXED)
             UpdateHitRateStat(new_hash, &new_tag, *found);
         return buf;
     }
@@ -3161,11 +3161,17 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     
     /* Before we even lock anything we'll update weight first */
 
-    if(!ENABLE_FIXED || ENABLE_COST_TEST && ENABLE_UPDATE_WEIGHT)
-        UpdateWeight(true);
-    
-    if(!ENABLE_FIXED || ENABLE_COST_TEST && ENABLE_SAMPLING)
+    if(!ENABLE_FIXED){
+        /* Update weight */
+        bool found_descs = false;
+        pthread_mutex_lock(&g_tenant_info.lockArray[new_hash % NUM_BUFFER_PARTITIONS]);
+        buf_hash_operate<HASH_REMOVE>((HTAB*)t_thrd.thrd_hist_HTAB, &new_tag, new_hash, &found_descs);
+        pthread_mutex_unlock(&g_tenant_info.lockArray[new_hash % NUM_BUFFER_PARTITIONS]);
+        UpdateWeight(found_descs);
+
+        /* Get victim */
         victim_buffer_cxt = GetVictimTenant();
+    }
     /* Loop here in case we have to try another victim buffer */
     for (;;) {
         bool needGetLock = false;
@@ -3486,25 +3492,20 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     }
     LWLockRelease(new_partition_lock);
 
-    if((!ENABLE_FIXED || ENABLE_COST_TEST && ENABLE_HIST)){
+    if((!ENABLE_FIXED)){
         /* */
         bool found;
-        pthread_mutex_lock(&g_tenant_info.lockArray[new_hash % NUM_BUFFER_PARTITIONS]);
-        buf_hash_operate<HASH_REMOVE>((HTAB*)t_thrd.thrd_hist_HTAB, &new_tag, new_hash, &found);
-        pthread_mutex_unlock(&g_tenant_info.lockArray[new_hash % NUM_BUFFER_PARTITIONS]);
-
         if(old_flags & BM_TAG_VALID){
             pthread_mutex_lock(&g_tenant_info.lockArray[old_hash % NUM_BUFFER_PARTITIONS]);
             buf_hash_operate<HASH_ENTER>((HTAB*)t_thrd.thrd_hist_HTAB, &old_tag, old_hash, &found);
             pthread_mutex_unlock(&g_tenant_info.lockArray[old_hash % NUM_BUFFER_PARTITIONS]);
         }
         while(!InsertToHist(&g_tenant_info.fifo_list, &old_tag, old_hash)){
-            fifo_ele * ele;
-            DeleteFromHist(&g_tenant_info.fifo_list, ele);
-            if (ele != NULL) {
-                pthread_mutex_lock(&g_tenant_info.lockArray[ele->hashcode % NUM_BUFFER_PARTITIONS]);
-                buf_hash_operate<HASH_REMOVE>((HTAB*)t_thrd.thrd_hist_HTAB, &ele->tag, ele->hashcode, &found);
-                pthread_mutex_unlock(&g_tenant_info.lockArray[ele->hashcode % NUM_BUFFER_PARTITIONS]);
+            fifo_ele ele;
+            if (DeleteFromHist(&g_tenant_info.fifo_list, &ele)) {
+                pthread_mutex_lock(&g_tenant_info.lockArray[ele.hashcode % NUM_BUFFER_PARTITIONS]);
+                buf_hash_operate<HASH_REMOVE>((HTAB*)t_thrd.thrd_hist_HTAB, &ele.tag, ele.hashcode, &found);
+                pthread_mutex_unlock(&g_tenant_info.lockArray[ele.hashcode % NUM_BUFFER_PARTITIONS]);
             } 
         }
     }
@@ -3518,7 +3519,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     } else {
         *found = TRUE;
     }
-    if(!ENABLE_FIXED || ENABLE_COST_TEST && ENABLE_UPDATE_STRUCT)
+    if(!ENABLE_FIXED)
         UpdateHitRateStat(new_hash, &new_tag, *found);
     return buf;
 }
@@ -3564,6 +3565,28 @@ uint32 COST_TEST_SAMPLING(){
     pthread_mutex_unlock(&g_tenant_info.tenant_stat_lock);
     return victim;
 }
+static void InsertToHead(BufferDesc *buf)
+{
+    BufferDesc * head = &g_buffer_write_info.shadow_lru_cxt.lru_head;
+    BufferDesc * tail = &g_buffer_write_info.shadow_lru_cxt.lru_tail;
+    pthread_mutex_lock(&g_buffer_write_info.shadow_lru_cxt.lru_lock);
+
+    /* Remove from the middle */
+    if(buf->prev && buf->next){
+        BufferDesc * prev = buf->prev;
+        BufferDesc * next = buf->next;
+        prev->next = next;
+        next->prev = prev;
+    }
+
+    /* Insert to head */
+    buf->next = (head->next);
+    (head->next)->prev = buf;
+    (head->next) = buf;
+    buf->prev = head;
+    pthread_mutex_unlock(&g_buffer_write_info.shadow_lru_cxt.lru_lock);
+}
+
 static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
                                BufferAccessStrategy strategy, bool *found, const XLogPhyBlock *pblk)
 {
@@ -3656,9 +3679,9 @@ TWB_RETRY:
             MarkReadPblk(buf->buf_id, pblk);
         }
 
-        // if(ENABLE_LRUC && *found){
-        //     pg_atomic_write_u32(&buf->flush_state, 0U);
-        // }
+        if(ENABLE_LRU_SNAPSHOT){
+            InsertToHead(buf);
+        }
         return buf;
     }
 
@@ -3671,7 +3694,7 @@ TWB_RETRY:
     /* Loop here in case we have to try another victim buffer */
     bool from_clean = false;
     bool from_twb_free = false;
-    int lruc_sacn_len = 0;
+    uint32 lruc_scan_len = 0;
     for (;;) {
         from_clean = false;
         bool needGetLock = false;
@@ -3685,10 +3708,13 @@ TWB_RETRY:
          * spinlock still held!
          */
         pgstat_report_waitevent(WAIT_EVENT_BUF_STRATEGY_GET);
-        buf = (BufferDesc *)StrategyGetBuffer(strategy, &buf_state);
+        if(ENABLE_LRU_SNAPSHOT)
+            buf = (BufferDesc *)StrategyGetBufferLRU(strategy, &buf_state);
+        else
+            buf = (BufferDesc *)StrategyGetBuffer(strategy, &buf_state);
         pgstat_report_waitevent(WAIT_EVENT_END);
 
-        Assert(BUF_STATE_GET_REFCOUNT(buf_state) == 0);
+        //Assert(BUF_STATE_GET_REFCOUNT(buf_state) == 0);
 
         /* Must copy buffer flags while we still hold the spinlock */
         old_flags = buf_state & BUF_FLAG_MASK;
@@ -3741,7 +3767,7 @@ TWB_RETRY:
                 needDoFlush = true;
             }
             /* Buffer is dirty and we had pinned it */
-            if(needDoFlush && ENABLE_LRUC && (lruc_sacn_len++ < MAX_LRUC_SCAN_LEN)){
+            if(needDoFlush && ENABLE_LRUC && (lruc_scan_len++ < MAX_LRUC_SCAN_LEN)){
 
                 if(!(pg_atomic_read_u32(&buf->flush_state) & LRUC_CANDIDATE)){
                     /* It's only a hint */
@@ -3962,10 +3988,12 @@ TWB_RETRY:
         LWLockRelease(new_partition_lock);
         UnpinBuffer(buf, true);
     }
-    
 #ifdef USE_ASSERT_CHECKING
     PageCheckWhenChosedElimination(buf, old_flags);
 #endif
+    if(ENABLE_LRU_SNAPSHOT){
+        InsertToHead(buf);
+    }
 
     /*
      * Okay, it's finally safe to rename the buffer.
@@ -3980,7 +4008,7 @@ TWB_RETRY:
      * checkpoints, except for their "init" forks, which need to be treated
      * just like permanent relations.
      */
-    BufWriteStatReset(buf);
+    //BufWriteStatReset(buf);
     ((BufferDesc *)buf)->tag = new_tag;
     buf_state &= ~(BM_VALID | BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR | BM_PERMANENT |
                    BUF_USAGECOUNT_MASK);

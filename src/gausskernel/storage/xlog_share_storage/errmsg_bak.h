@@ -42979,7 +42979,7 @@ static const gsqlerr_err_msg_t g_gsqlerr_errors[] =
 	   "initialize cache memory failed",
 	   "check cache out of memory or system cache"}},
 
-	  {17001, "XX010",
+	  {17001, "XX000",
 	  {"no unpinned buffers available",
 	   "invalid",
 	   "invalid"}},

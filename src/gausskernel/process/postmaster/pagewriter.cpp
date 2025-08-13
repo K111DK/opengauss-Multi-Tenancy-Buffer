@@ -2351,12 +2351,72 @@ static void incre_ckpt_pgwr_scan_candidate_list(WritebackContext *wb_context, Ca
         }
     }
 }
+static void GetClockSnapshot(){
+    uint32 local_buf_state;
+    uint32 pinned = 0;
+    for(int i = 0; i < TOTAL_BUFFER_NUM; i++){
+        BufferDesc* buf = GetBufferDescriptor(i);
+        local_buf_state = pg_atomic_read_u32(&buf->state);
+        /* Pinned buffer, skip */
+        if (BUF_STATE_GET_REFCOUNT(local_buf_state) > 0) {
+            pinned++;
+            continue;
+        }            
+    }
+    ereport(WARNING, (errmsg("Snapshot:Clock has %d pinned buffers, total is %d, percent is %.2f%%", pinned, TOTAL_BUFFER_NUM, (float)pinned * 100 / TOTAL_BUFFER_NUM)));
+}
 
+static void GetLRUSnapshot(){
+    pthread_mutex_lock(&g_buffer_write_info.shadow_lru_cxt.lru_lock);
+    BufferDesc* head = &g_buffer_write_info.shadow_lru_cxt.lru_head;
+    BufferDesc* tail = &g_buffer_write_info.shadow_lru_cxt.lru_tail;
+    BufferDesc* buf = head;
+    uint32 local_buf_state;
+    uint64 pinned[10];
+    for(int i = 0; i < 10; i++) {
+        pinned[i] = 0;
+    }
+    int percentail_idx;
+    int idx = 0;
+    while(buf != tail){
+        buf = buf->next;
+        idx++;
+        percentail_idx = MIN(10 * idx / TOTAL_BUFFER_NUM, 9); 
+        /* We'll check around */
+        local_buf_state = pg_atomic_read_u32(&buf->state);
+        /* Pinned buffer, skip */
+        if (BUF_STATE_GET_REFCOUNT(local_buf_state) > 0) {
+            pinned[percentail_idx]++;
+            pg_atomic_add_fetch_u64(&g_buffer_write_info.shadow_lru_cxt.pinned_count[percentail_idx], 1);
+            continue;
+        }            
+    }
+    pthread_mutex_unlock(&g_buffer_write_info.shadow_lru_cxt.lru_lock);
+    ereport(WARNING, (errmsg("Snapshot:LRU has %d buffers, total is %d", idx, TOTAL_BUFFER_NUM)));
+    int i = 0;
+    for(i = 0; i < 10; i++){
+        ereport(WARNING, (errmsg("[LRU P%d Snapshot]:[%lu/%lu][%.2f] | Global[%lu/%lu][%.2f]"
+                                , 10*(i+1)
+                                , pinned[i]
+                                , TOTAL_BUFFER_NUM / 10
+                                , (float)pinned[i] / (NORMAL_SHARED_BUFFER_NUM / 10)
+                                , g_buffer_write_info.shadow_lru_cxt.pinned_count[i]
+                                , TOTAL_BUFFER_NUM / 10
+                                , (float)g_buffer_write_info.shadow_lru_cxt.pinned_count[i] / (TOTAL_BUFFER_NUM / 10))
+                        )
+                );
+    }
+    
+}
 static void incre_ckpt_pgwr_scan_buf_pool(WritebackContext *wb_context)
 {
     int thread_id = t_thrd.pagewriter_cxt.pagewriter_id;
     PageWriterProc *pgwr = &g_instance.ckpt_cxt_ctl->pgwr_procs.writer_proc[thread_id];
-
+    if(ENABLE_LRU_SNAPSHOT) {
+        if(thread_id == 1)
+            GetLRUSnapshot();
+        return;
+    }
     /* handle the normal\nvm\segment buffer pool */
     incre_ckpt_pgwr_scan_candidate_list(wb_context, &pgwr->normal_list, CAND_LIST_NORMAL);
     incre_ckpt_pgwr_scan_candidate_list(wb_context, &pgwr->nvm_list, CAND_LIST_NVM);
