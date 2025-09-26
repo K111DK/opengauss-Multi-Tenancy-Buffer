@@ -1765,8 +1765,14 @@ Buffer ReadBufferExtended(Relation reln, ForkNumber fork_num, BlockNumber block_
     if (RelationisEncryptEnable(reln)) {
         reln->rd_smgr->encrypt = true;
     }
+    t_thrd.is_index_split_fetch = (reln->rd_rel->relkind == RELKIND_INDEX || 
+                                  reln->rd_rel->relkind == RELKIND_GLOBAL_INDEX);
+    pg_atomic_add_fetch_u64(&g_buffer_write_info.total_fetch, 1);
+    if(t_thrd.is_index_split_fetch)
+        pg_atomic_add_fetch_u64(&g_buffer_write_info.total_index_fetch_count, 1);
     buf = ReadBuffer_common(reln->rd_smgr, reln->rd_rel->relpersistence, fork_num,
                             block_num, mode, strategy, &hit, NULL);
+    t_thrd.is_index_split_fetch = false;                        
     if (hit) {
         pgstat_count_buffer_hit(reln);
     }
@@ -3633,7 +3639,8 @@ TWB_RETRY:
         /* Which was not supposed to be found in TWB buffered */
         if(ENABLE_TWB){
             uint32 flush_state = pg_atomic_read_u32(&buf->flush_state);
-            if(flush_state & TWB_BUFFERED){
+            bool bail_from_twb = pg_atomic_compare_exchange_u32(&buf->flush_state, TWB_BUFFERED, 0U);
+            if(bail_from_twb){
                 /* This shit is being flushed now */
                 if(ENABLE_LOG)
                 ereport(WARNING, (errmsg("FG hit TWB Buf %d, sleep 1ms, total stall %d, is dirty %u, curr dirty queue size %u", buf_id, 
@@ -3679,7 +3686,7 @@ TWB_RETRY:
             MarkReadPblk(buf->buf_id, pblk);
         }
 
-        if(ENABLE_LRU_SNAPSHOT){
+        if(ENABLE_LRU){
             InsertToHead(buf);
         }
         return buf;
@@ -3698,7 +3705,7 @@ TWB_RETRY:
     for (;;) {
         from_clean = false;
         bool needGetLock = false;
-        /*
+        /* 
          * Ensure, while the spinlock's not yet held, that there's a free refcount
          * entry.
          */
@@ -3708,7 +3715,7 @@ TWB_RETRY:
          * spinlock still held!
          */
         pgstat_report_waitevent(WAIT_EVENT_BUF_STRATEGY_GET);
-        if(ENABLE_LRU_SNAPSHOT)
+        if(ENABLE_LRU)
             buf = (BufferDesc *)StrategyGetBufferLRU(strategy, &buf_state);
         else
             buf = (BufferDesc *)StrategyGetBuffer(strategy, &buf_state);
@@ -3767,8 +3774,11 @@ TWB_RETRY:
                 needDoFlush = true;
             }
             /* Buffer is dirty and we had pinned it */
-            if(needDoFlush && ENABLE_LRUC && (lruc_scan_len++ < MAX_LRUC_SCAN_LEN)){
-
+            if(needDoFlush 
+                && ENABLE_LRUC 
+                && (lruc_scan_len++ < MAX_LRUC_SCAN_LEN) 
+                && (!INDEX_SKIP_FLUSH || t_thrd.is_index_split_fetch))
+            {
                 if(!(pg_atomic_read_u32(&buf->flush_state) & LRUC_CANDIDATE)){
                     /* It's only a hint */
                     pg_atomic_write_u32(&buf->flush_state, LRUC_CANDIDATE);
@@ -3782,7 +3792,7 @@ TWB_RETRY:
                     Buffer swap_free_buf;
                     uint32 curr_dirty_size = get_thread_candidate_nums_twb(&g_twb_info.twb_dirty_list);
                     bool has_free = candidate_buf_pop_twb(&g_twb_info.twb_free_list, &swap_free_buf);
-                    bool can_use_twb = has_free && (pg_atomic_read_u32(&buf->flush_state)==0U) 
+                    bool can_use_twb = has_free && ( pg_atomic_read_u32(&buf->flush_state) == 0U ) 
                     && curr_dirty_size < g_twb_info.twb_size;
                     /* Only when we got free twb buffer to replace and this buf isn't in twb */
                     if(can_use_twb){
@@ -3801,12 +3811,10 @@ TWB_RETRY:
                         buf = GetBufferDescriptor(swap_free_buf);
                         /* Swap free should be candidate */
                         Assert(pg_atomic_read_u32(&buf->flush_state) & TWB_CANDIDATE);
-                        pg_atomic_write_u32(&buf->flush_state, 0);
+                        pg_atomic_write_u32(&buf->flush_state, 0U);
                         LockBufHdr(buf);
                         PinBuffer_Locked(buf);
-                    
                     }else{
-
                         LWLockRelease(buf->content_lock);
                         UnpinBuffer(buf, true);
                         continue;
@@ -3863,6 +3871,8 @@ TWB_RETRY:
                 TRACE_POSTGRESQL_BUFFER_WRITE_DIRTY_DONE(fork_num, block_num, smgr->smgr_rnode.node.spcNode,
                                                          smgr->smgr_rnode.node.dbNode, smgr->smgr_rnode.node.relNode);
                 pg_atomic_add_fetch_u64(&g_buffer_write_info.fg_flushed, 1);
+                if(t_thrd.is_index_split_fetch)
+                    pg_atomic_add_fetch_u64(&g_buffer_write_info.index_flushed, 1);
             } else {
                 /*
                  * Someone else has locked the buffer, so give it up and loop
@@ -3991,7 +4001,7 @@ TWB_RETRY:
 #ifdef USE_ASSERT_CHECKING
     PageCheckWhenChosedElimination(buf, old_flags);
 #endif
-    if(ENABLE_LRU_SNAPSHOT){
+    if(ENABLE_LRU){
         InsertToHead(buf);
     }
 
@@ -5276,7 +5286,7 @@ uint32 SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext* wb_c
     }
 
     ScheduleBufferTagForWriteback(wb_context, &tag);
-    if(pg_atomic_read_u32(&buf_desc->flush_state) & TWB_BUFFERED){
+    if(pg_atomic_read_u32(&buf_desc->flush_state) & TWB_IO_PENDING){
         uint32 total_flushed = pg_atomic_add_fetch_u32(&g_twb_info.total_twb_flushed, 1);
         /* Delete it from Hashtable */
         if(ENABLE_LOG)
@@ -5291,7 +5301,6 @@ uint32 SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext* wb_c
     }else{
         pg_atomic_write_u32(&buf_desc->flush_state, 0U);
     }
-    pg_atomic_write_u32(&buf_desc->flush_state, 0U);
     return (result | BUF_WRITTEN);
 }
 

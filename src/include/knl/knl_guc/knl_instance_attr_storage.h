@@ -231,10 +231,11 @@ typedef struct knl_instance_attr_storage {
 
     /* LRUC init */
     bool enable_lruc;
+    bool skip_filter;
     int max_lruc_scan_len;
 
     /* Pinned-based */
-    bool enable_lru_snapshot;
+    bool enable_lru;
 
 } knl_instance_attr_storage;
 

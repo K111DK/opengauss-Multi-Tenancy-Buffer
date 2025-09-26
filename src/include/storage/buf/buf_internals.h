@@ -207,7 +207,8 @@ typedef struct BufferDescExtra {
 } BufferDescExtra;
 #define TWB_CANDIDATE (1U)
 #define TWB_BUFFERED (1U << 1)
-#define LRUC_CANDIDATE (1U << 2)
+#define TWB_IO_PENDING (1u << 2)
+#define LRUC_CANDIDATE (1U << 3)
 typedef struct BufferDesc {
     BufferTag tag; /* ID of page contained in buffer */
     int buf_id;    /* buffer's index number (from 0) */
@@ -539,7 +540,8 @@ typedef struct TWB {
 
 #define ENABLE_LRUC (g_instance.attr.attr_storage.enable_lruc)
 #define MAX_LRUC_SCAN_LEN (g_instance.attr.attr_storage.max_lruc_scan_len)
-#define ENABLE_LRU_SNAPSHOT (g_instance.attr.attr_storage.enable_lru_snapshot)
+#define ENABLE_LRU (g_instance.attr.attr_storage.enable_lru)
+#define INDEX_SKIP_FLUSH (g_instance.attr.attr_storage.skip_filter)
 typedef struct LRUC {
     /* store twb dirty pages */
     CandidateList lruc_dirty_list;
@@ -561,6 +563,9 @@ typedef struct shadow_lru {
 
 typedef struct buffer_write_info {
     pg_atomic_uint64 fg_flushed;
+    pg_atomic_uint64 index_flushed; /* Index split get page meets flush*/
+    pg_atomic_uint64 total_fetch; /* Total BufferAlloc */
+    pg_atomic_uint64 total_index_fetch_count;
     pg_atomic_uint64 total_fg_fetch_count;
     pg_atomic_uint64 bg_flushed;
     shadow_lru shadow_lru_cxt;

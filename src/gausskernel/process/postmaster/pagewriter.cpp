@@ -304,8 +304,6 @@ void incre_ckpt_pagewriter_cxt_init()
     g_instance.ckpt_cxt_ctl->page_writer_sub_can_exit = false;
 
     uint32 dirty_list_size = MAX_DIRTY_LIST_FLUSH_NUM / thread_num;
-    // if(ENABLE_LRUC)
-    //     dirty_list_size = TOTAL_BUFFER_NUM / thread_num;
 
     /* init thread dw cxt  and dirty list */
     for (int i = 0; i < thread_num; i++) {
@@ -2365,58 +2363,10 @@ static void GetClockSnapshot(){
     }
     ereport(WARNING, (errmsg("Snapshot:Clock has %d pinned buffers, total is %d, percent is %.2f%%", pinned, TOTAL_BUFFER_NUM, (float)pinned * 100 / TOTAL_BUFFER_NUM)));
 }
-
-static void GetLRUSnapshot(){
-    pthread_mutex_lock(&g_buffer_write_info.shadow_lru_cxt.lru_lock);
-    BufferDesc* head = &g_buffer_write_info.shadow_lru_cxt.lru_head;
-    BufferDesc* tail = &g_buffer_write_info.shadow_lru_cxt.lru_tail;
-    BufferDesc* buf = head;
-    uint32 local_buf_state;
-    uint64 pinned[10];
-    for(int i = 0; i < 10; i++) {
-        pinned[i] = 0;
-    }
-    int percentail_idx;
-    int idx = 0;
-    while(buf != tail){
-        buf = buf->next;
-        idx++;
-        percentail_idx = MIN(10 * idx / TOTAL_BUFFER_NUM, 9); 
-        /* We'll check around */
-        local_buf_state = pg_atomic_read_u32(&buf->state);
-        /* Pinned buffer, skip */
-        if (BUF_STATE_GET_REFCOUNT(local_buf_state) > 0) {
-            pinned[percentail_idx]++;
-            pg_atomic_add_fetch_u64(&g_buffer_write_info.shadow_lru_cxt.pinned_count[percentail_idx], 1);
-            continue;
-        }            
-    }
-    pthread_mutex_unlock(&g_buffer_write_info.shadow_lru_cxt.lru_lock);
-    ereport(WARNING, (errmsg("Snapshot:LRU has %d buffers, total is %d", idx, TOTAL_BUFFER_NUM)));
-    int i = 0;
-    for(i = 0; i < 10; i++){
-        ereport(WARNING, (errmsg("[LRU P%d Snapshot]:[%lu/%lu][%.2f] | Global[%lu/%lu][%.2f]"
-                                , 10*(i+1)
-                                , pinned[i]
-                                , TOTAL_BUFFER_NUM / 10
-                                , (float)pinned[i] / (NORMAL_SHARED_BUFFER_NUM / 10)
-                                , g_buffer_write_info.shadow_lru_cxt.pinned_count[i]
-                                , TOTAL_BUFFER_NUM / 10
-                                , (float)g_buffer_write_info.shadow_lru_cxt.pinned_count[i] / (TOTAL_BUFFER_NUM / 10))
-                        )
-                );
-    }
-    
-}
 static void incre_ckpt_pgwr_scan_buf_pool(WritebackContext *wb_context)
 {
     int thread_id = t_thrd.pagewriter_cxt.pagewriter_id;
     PageWriterProc *pgwr = &g_instance.ckpt_cxt_ctl->pgwr_procs.writer_proc[thread_id];
-    if(ENABLE_LRU_SNAPSHOT) {
-        if(thread_id == 1)
-            GetLRUSnapshot();
-        return;
-    }
     /* handle the normal\nvm\segment buffer pool */
     incre_ckpt_pgwr_scan_candidate_list(wb_context, &pgwr->normal_list, CAND_LIST_NORMAL);
     incre_ckpt_pgwr_scan_candidate_list(wb_context, &pgwr->nvm_list, CAND_LIST_NVM);
@@ -2457,7 +2407,9 @@ static uint32 twb_try_flush_buf(uint32 max_flush_num, bool *contain_hashbucket){
                 (errmsg("TWB POP buf_id is %d", buf_id)));
             buf_desc = GetBufferDescriptor(buf_id);
             local_buf_state = pg_atomic_read_u32(&buf_desc->state);
-            Assert(pg_atomic_read_u32(&buf_desc->flush_state) & TWB_BUFFERED);
+            if (!pg_atomic_compare_exchange_u32(&buf_desc->flush_state, &(uint32)TWB_CANDIDATE, TWB_IO_PENDING)){
+                continue;
+            }
             /* during recovery, check the data page whether not properly marked as dirty */
             if (RecoveryInProgress() && check_buffer_dirty_flag(buf_desc)) {
                 if (need_flush_num < max_twb_flushed) {
@@ -2589,6 +2541,107 @@ static uint32 lruc_try_flush_buf(uint32 max_flush_num, bool *contain_hashbucket)
     return need_flush_num;
 }
 
+static uint32 lru_tail_loop(uint32 max_flush_num, bool *contain_hashbucket){
+    uint32 need_flush_num = 0;
+    uint32 candidates = 0;
+    BufferDesc *buf_desc = NULL;
+    uint32 local_buf_state;
+    CkptSortItem* item = NULL;
+    bool check_not_need_flush = false;
+    bool check_usecount = false;
+    int thread_id = t_thrd.pagewriter_cxt.pagewriter_id;
+    int max_write_count;
+    PageWriterProc *pgwr = &g_instance.ckpt_cxt_ctl->pgwr_procs.writer_proc[thread_id];
+    CkptSortItem *dirty_buf_list = pgwr->dirty_buf_list;
+    int scan_depth = 0;
+    BufferDesc *lru_head = &g_buffer_write_info.shadow_lru_cxt.lru_head;
+    BufferDesc *lru_tail = &g_buffer_write_info.shadow_lru_cxt.lru_tail;
+    while(scan_depth++ < MAX_LRUC_SCAN_LEN){
+        
+        pthread_mutex_lock(&g_buffer_write_info.shadow_lru_cxt.lru_lock);
+        
+        if(buf_desc->prev == lru_head){
+            pthread_mutex_unlock(&g_buffer_write_info.shadow_lru_cxt.lru_lock);
+            continue;
+        }
+
+        buf_desc = buf_desc->prev;
+        local_buf_state = pg_atomic_read_u32(&buf_desc->state);
+        
+        if(pg_atomic_read_u32(&buf_desc->flush_state) != 0){
+            pthread_mutex_unlock(&g_buffer_write_info.shadow_lru_cxt.lru_lock);
+            continue;
+        }
+
+        /* during recovery, check the data page whether not properly marked as dirty */
+        if (RecoveryInProgress() && check_buffer_dirty_flag(buf_desc)) {
+            if (need_flush_num < max_flush_num) {
+                local_buf_state = LockBufHdr(buf_desc);
+                goto PUSH_DIRTY;
+            } else {
+                pthread_mutex_unlock(&g_buffer_write_info.shadow_lru_cxt.lru_lock);
+                continue;
+            }
+        }
+        /* Dirty read, pinned buffer, skip */
+        if (BUF_STATE_GET_REFCOUNT(local_buf_state) > 0) {
+            pthread_mutex_unlock(&g_buffer_write_info.shadow_lru_cxt.lru_lock);
+            continue;
+        }
+
+        local_buf_state = LockBufHdr(buf_desc);
+        if (BUF_STATE_GET_REFCOUNT(local_buf_state) > 0) {
+            goto UNLOCK;
+        }
+
+        check_usecount = NEED_CONSIDER_USECOUNT && BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0;
+        if (check_usecount) {
+            local_buf_state -= BUF_USAGECOUNT_ONE;
+            goto UNLOCK;
+        }
+
+        /* Not dirty, put directly into flushed candidates */
+        if (!(local_buf_state & BM_DIRTY)) {
+            if (g_instance.ckpt_cxt_ctl->candidate_free_map[buf_id] == false) {
+                if (buf_id < (uint32)NvmBufferStartID) {
+                    candidate_buf_push(&pgwr->normal_list, buf_id);
+                } else if (buf_id < (uint32)SegmentBufferStartID) {
+                    candidate_buf_push(&pgwr->nvm_list, buf_id);
+                } else {
+                    candidate_buf_push(&pgwr->seg_list, buf_id);
+                }
+                g_instance.ckpt_cxt_ctl->candidate_free_map[buf_id] = true;
+                candidates++;
+            }
+            goto UNLOCK;
+        }
+
+        check_not_need_flush = (need_flush_num >= max_flush_num || (!RecoveryInProgress()
+            && XLogNeedsFlush(BufferGetLSN(buf_desc))));
+        if (check_not_need_flush) {
+            goto UNLOCK;
+        }
+
+PUSH_DIRTY:
+        local_buf_state |= BM_CHECKPOINT_NEEDED;
+        item = &dirty_buf_list[need_flush_num++];
+        item->buf_id = buf_id;
+        item->tsId = buf_desc->tag.rnode.spcNode;
+        item->relNode = buf_desc->tag.rnode.relNode;
+        item->bucketNode = buf_desc->tag.rnode.bucketNode;
+        item->forkNum = buf_desc->tag.forkNum;
+        item->blockNum = buf_desc->tag.blockNum;
+        if (IsSegmentFileNode(buf_desc->tag.rnode) || IS_COMPRESSED_RNODE(buf_desc->tag.rnode, buf_desc->tag.forkNum)) {
+            *contain_hashbucket = true;
+        }
+
+UNLOCK:
+        UnlockBufHdr(buf_desc, local_buf_state);
+        pthread_mutex_unlock(&g_buffer_write_info.shadow_lru_cxt.lru_lock);
+    }
+    return need_flush_num;
+}
+
 static uint32 get_candidate_buf_and_flush_list(uint32 start, uint32 end, uint32 max_flush_num,
     bool *contain_hashbucket)
 {
@@ -2608,13 +2661,17 @@ static uint32 get_candidate_buf_and_flush_list(uint32 start, uint32 end, uint32 
 
     max_flush_num = ((FULL_CKPT && !RecoveryInProgress()) ? 0 : max_flush_num);
 
-    if(ENABLE_LRUC)
+    if(ENABLE_LRUC){
         need_flush_num += lruc_try_flush_buf(max_flush_num, contain_hashbucket);
-
-    if(ENABLE_TWB)
+    }else if(ENABLE_TWB){
         need_flush_num += twb_try_flush_buf(max_flush_num, contain_hashbucket);
-
-    for (uint32 buf_id = start; buf_id < end; buf_id++) {
+    }else if(ENABLE_LRU){
+        /* Let only one thread flush this */
+        if(thread_id != 1)
+            return 0;
+        need_flush_num += lru_tail_loop(max_flush_num, contain_hashbucket);
+    }else{
+        for (uint32 buf_id = start; buf_id < end; buf_id++) {
         buf_desc = GetBufferDescriptor(buf_id);
         local_buf_state = pg_atomic_read_u32(&buf_desc->state);
         if(pg_atomic_read_u32(&buf_desc->flush_state)!=0)
@@ -2683,11 +2740,15 @@ PUSH_DIRTY:
 UNLOCK:
         UnlockBufHdr(buf_desc, local_buf_state);
     }
+    }
 EXIT:
     if (u_sess->attr.attr_storage.log_pagewriter) {
-        ereport(LOG,
-            (errmodule(MOD_INCRE_CKPT),
-                errmsg("get candidate buf %d, thread id is %d", candidates, thread_id)));
+        ereport(LOG, (errmsg("[%s]flush[%u/%u],Got clean:[%d],Candidate:[%d]"
+                , ENABLE_LRUC ? "LRUC" : "NORMAL"
+                , need_flush_num
+                , max_flush_num
+                , candidates
+                , (int)get_thread_candidate_nums(&pgwr->normal_list))));
     }
     pg_atomic_add_fetch_u64(&g_buffer_write_info.bg_flushed, need_flush_num);
     if(thread_id == 1){
@@ -2698,13 +2759,10 @@ EXIT:
         , pg_atomic_read_u64(&g_buffer_write_info.bg_flushed)
         , pg_atomic_read_u64(&g_buffer_write_info.fg_flushed)
         , (double)pg_atomic_read_u64(&g_buffer_write_info.fg_flushed) / (double)pg_atomic_read_u64(&g_buffer_write_info.total_fg_fetch_count))));
+        ereport(LOG, (errmsg("Total index stall[%.2f]"
+                    , (double)pg_atomic_read_u64(&g_buffer_write_info.index_flushed) / (double)pg_atomic_read_u64(&g_buffer_write_info.fg_flushed)
+        )));
     }
-    ereport(LOG, (errmsg("[%s]flush[%u/%u],Got clean:[%d],Candidate:[%d]"
-                , ENABLE_LRUC ? "LRUC" : "NORMAL"
-                , need_flush_num
-                , max_flush_num
-                , candidates
-                , (int)get_thread_candidate_nums(&pgwr->normal_list))));
     return need_flush_num;
 }
 
