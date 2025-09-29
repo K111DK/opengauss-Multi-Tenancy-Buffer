@@ -205,7 +205,7 @@ typedef struct BufferDescExtra {
 
     volatile bool aio_in_progress; /* indicate aio is in progress */
 } BufferDescExtra;
-#define TWB_CANDIDATE (1U)
+#define TWB_CANDIDATE 1U
 #define TWB_BUFFERED (1U << 1)
 #define TWB_IO_PENDING (1u << 2)
 #define LRUC_CANDIDATE (1U << 3)
@@ -226,11 +226,12 @@ typedef struct BufferDesc {
     struct BufferDesc* next; /* link in freelist of buffers */
     struct BufferDesc* prev;
     uint32 tenantOid;
-    pg_atomic_uint32 write_count;
-    pg_atomic_uint32 flush_count;
-    pg_atomic_uint64 pre_flush_ts;
-    pg_atomic_uint64 pre_write_ts;
+    // pg_atomic_uint32 write_count;
+    // pg_atomic_uint32 flush_count;
+    // pg_atomic_uint64 pre_flush_ts;
+    // pg_atomic_uint64 pre_write_ts;
     pg_atomic_uint32 flush_state;
+    bool is_index_block;
 #ifdef USE_ASSERT_CHECKING
     volatile uint64 lsn_dirty;
 #endif
@@ -380,7 +381,6 @@ extern void LocalBufferFlushAllBuffer();
 #define MINIMAL_BUFFER_SIZE 256
 #define ENABLE_MULTI_TENANTCY (g_instance.attr.attr_storage.enable_multi_tenant)
 #define ENABLE_FIXED (!g_instance.attr.attr_storage.enable_mtrp)
-#define ENABLE_COST_TEST (g_instance.attr.attr_storage.enable_cost_test)
 #define ENABLE_UPDATE_WEIGHT (g_instance.attr.attr_storage.enable_update_weight)
 #define ENABLE_UPDATE_STRUCT (g_instance.attr.attr_storage.enable_update_struct)
 #define ENABLE_SAMPLING (g_instance.attr.attr_storage.enable_sampling)
@@ -539,15 +539,26 @@ typedef struct TWB {
 
 
 #define ENABLE_LRUC (g_instance.attr.attr_storage.enable_lruc)
+#define ENABLE_TAIL_SCAN (g_instance.attr.attr_storage.enable_tail_scan)
+#define ENABLE_BUFFER_TYPE_SCAN (g_instance.attr.attr_storage.buffer_type_scan)
 #define MAX_LRUC_SCAN_LEN (g_instance.attr.attr_storage.max_lruc_scan_len)
 #define ENABLE_LRU (g_instance.attr.attr_storage.enable_lru)
 #define INDEX_SKIP_FLUSH (g_instance.attr.attr_storage.skip_filter)
+
+#define WRITE_LAT_US (g_instance.attr.attr_storage.write_lat_us)
+#define ENABLE_SIM_LAT (g_instance.attr.attr_storage.enable_sim_lat)
+#define LAT_RATIO (g_instance.attr.attr_storage.lat_ratio)
+#define LAT_TYPE (g_instance.attr.attr_storage.lat_type) // 1 - both 2 - index 3 - data
 typedef struct LRUC {
     /* store twb dirty pages */
     CandidateList lruc_dirty_list;
     
     /* store the dirty buffer id that to be flushed */
     Buffer * dirty_buffer;
+
+    pg_atomic_uint64 scan_total;
+    pg_atomic_uint64 trigger_scan;
+    pg_atomic_uint64 got_clean;
 } LRUC;
 
 
@@ -557,17 +568,31 @@ typedef struct shadow_lru {
     pthread_mutex_t lru_lock;
     BufferDesc lru_head;
     BufferDesc lru_tail;
-    pg_atomic_uint64 pinned_count[10];
+    BufferDesc* lru_c_pointer;
 } shadow_lru;
 
 
 typedef struct buffer_write_info {
+    /* flush */
     pg_atomic_uint64 fg_flushed;
-    pg_atomic_uint64 index_flushed; /* Index split get page meets flush*/
-    pg_atomic_uint64 total_fetch; /* Total BufferAlloc */
-    pg_atomic_uint64 total_index_fetch_count;
-    pg_atomic_uint64 total_fg_fetch_count;
     pg_atomic_uint64 bg_flushed;
+    pg_atomic_uint64 index_flushed; /* Index split get page meets flush*/
+    pg_atomic_uint64 total_index_flushed_new;
+    pg_atomic_uint64 total_data_flushed_new;
+    pg_atomic_uint64 total_index_flushed_old;
+    pg_atomic_uint64 total_data_flushed_old;
+    /* fetch */
+    pg_atomic_uint64 total_fetch; /* Total BufferAlloc */
+    pg_atomic_uint64 total_index_fetch_new;
+    pg_atomic_uint64 total_data_fetch_new;
+    pg_atomic_uint64 total_index_fetch_old;
+    pg_atomic_uint64 total_data_fetch_old;
+    /* miss */
+    pg_atomic_uint64 total_miss;
+    pg_atomic_uint64 total_index_miss_new;
+    pg_atomic_uint64 total_data_miss_new;
+    pg_atomic_uint64 total_index_miss_old;
+    pg_atomic_uint64 total_data_miss_old;
     shadow_lru shadow_lru_cxt;
 } buffer_write_info;
 /* */

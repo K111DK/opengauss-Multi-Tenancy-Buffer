@@ -214,7 +214,6 @@ typedef struct knl_instance_attr_storage {
     /* Mtrp */
     bool enable_multi_tenant;
     bool enable_mtrp;
-    bool enable_cost_test;
     int max_tenant;
     int flush_max_write_count;
     bool enable_update_weight;
@@ -224,6 +223,9 @@ typedef struct knl_instance_attr_storage {
     bool enable_hist;
     int64 log_interval;
     int extra_mem_factor;
+    int write_lat_us;
+    int lat_type; // 1 - both 2 - index 3 - data
+    int lat_ratio; // 1 ~ 100
 
     /* TWB shit */
     bool enable_twb;
@@ -232,11 +234,15 @@ typedef struct knl_instance_attr_storage {
     /* LRUC init */
     bool enable_lruc;
     bool skip_filter;
+    bool enable_sim_lat;
     int max_lruc_scan_len;
 
-    /* Pinned-based */
+    /* LRU */
     bool enable_lru;
+    bool enable_tail_scan;
 
+    /* Others */
+    bool buffer_type_scan;
 } knl_instance_attr_storage;
 
 #endif /* SRC_INCLUDE_KNL_KNL_INSTANCE_ATTR_STORAGE_H_ */

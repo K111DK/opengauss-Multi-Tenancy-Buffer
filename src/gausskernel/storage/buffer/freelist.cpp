@@ -213,14 +213,19 @@ retry:
     BufferDesc *lru_tail = &g_buffer_write_info.shadow_lru_cxt.lru_tail;
     BufferDesc *next;
     BufferDesc *prev;
+    BufferDesc **lruc_ptr = &g_buffer_write_info.shadow_lru_cxt.lru_c_pointer;
     Assert(lru_head->next != lru_tail);
     buf = lru_tail;
     int scan_depth = 0;
     pthread_mutex_lock(&g_buffer_write_info.shadow_lru_cxt.lru_lock);
+    *lruc_ptr = (*lruc_ptr == lru_tail) ? lru_tail->prev : *lruc_ptr;
     for (;;) {
-
-        /* Get prev ele */
-        buf = buf->prev;
+        Assert(*lruc_ptr != lru_head);
+        if(ENABLE_LRUC){
+            buf = *lruc_ptr;
+            *lruc_ptr = (*lruc_ptr)->prev;
+        }else
+            buf = buf->prev;
         scan_depth++;
         Assert(buf);
         if(buf == lru_head){

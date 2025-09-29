@@ -3519,8 +3519,11 @@ typedef struct knl_thrd_context {
     void * thrd_hist_HTAB;
     void * thrd_tenant_map_HTAB;
     void * thrd_tenant_buffer_cxt;
-    bool is_index_split_fetch;
+    
+    bool is_index;
+    bool flush;
 
+    int fetch_type;/* Index | New */
 } knl_thrd_context;
 
 #ifdef ENABLE_MOT

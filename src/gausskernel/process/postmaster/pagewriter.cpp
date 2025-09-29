@@ -2349,20 +2349,6 @@ static void incre_ckpt_pgwr_scan_candidate_list(WritebackContext *wb_context, Ca
         }
     }
 }
-static void GetClockSnapshot(){
-    uint32 local_buf_state;
-    uint32 pinned = 0;
-    for(int i = 0; i < TOTAL_BUFFER_NUM; i++){
-        BufferDesc* buf = GetBufferDescriptor(i);
-        local_buf_state = pg_atomic_read_u32(&buf->state);
-        /* Pinned buffer, skip */
-        if (BUF_STATE_GET_REFCOUNT(local_buf_state) > 0) {
-            pinned++;
-            continue;
-        }            
-    }
-    ereport(WARNING, (errmsg("Snapshot:Clock has %d pinned buffers, total is %d, percent is %.2f%%", pinned, TOTAL_BUFFER_NUM, (float)pinned * 100 / TOTAL_BUFFER_NUM)));
-}
 static void incre_ckpt_pgwr_scan_buf_pool(WritebackContext *wb_context)
 {
     int thread_id = t_thrd.pagewriter_cxt.pagewriter_id;
@@ -2407,7 +2393,7 @@ static uint32 twb_try_flush_buf(uint32 max_flush_num, bool *contain_hashbucket){
                 (errmsg("TWB POP buf_id is %d", buf_id)));
             buf_desc = GetBufferDescriptor(buf_id);
             local_buf_state = pg_atomic_read_u32(&buf_desc->state);
-            if (!pg_atomic_compare_exchange_u32(&buf_desc->flush_state, &(uint32)TWB_CANDIDATE, TWB_IO_PENDING)){
+            if (!(local_buf_state & TWB_CANDIDATE)){
                 continue;
             }
             /* during recovery, check the data page whether not properly marked as dirty */
@@ -2447,6 +2433,7 @@ static uint32 twb_try_flush_buf(uint32 max_flush_num, bool *contain_hashbucket){
             }
 
         PUSH_DIRTY:
+            pg_atomic_write_u32(&buf_desc->flush_state, TWB_IO_PENDING);
             local_buf_state |= BM_CHECKPOINT_NEEDED;
             item = &dirty_buf_list[need_flush_num++];
             item->buf_id = buf_id;
@@ -2556,6 +2543,7 @@ static uint32 lru_tail_loop(uint32 max_flush_num, bool *contain_hashbucket){
     int scan_depth = 0;
     BufferDesc *lru_head = &g_buffer_write_info.shadow_lru_cxt.lru_head;
     BufferDesc *lru_tail = &g_buffer_write_info.shadow_lru_cxt.lru_tail;
+    buf_desc = lru_tail;
     while(scan_depth++ < MAX_LRUC_SCAN_LEN){
         
         pthread_mutex_lock(&g_buffer_write_info.shadow_lru_cxt.lru_lock);
@@ -2566,6 +2554,7 @@ static uint32 lru_tail_loop(uint32 max_flush_num, bool *contain_hashbucket){
         }
 
         buf_desc = buf_desc->prev;
+        int buf_id = buf_desc->buf_id;
         local_buf_state = pg_atomic_read_u32(&buf_desc->state);
         
         if(pg_atomic_read_u32(&buf_desc->flush_state) != 0){
@@ -2625,7 +2614,7 @@ static uint32 lru_tail_loop(uint32 max_flush_num, bool *contain_hashbucket){
 PUSH_DIRTY:
         local_buf_state |= BM_CHECKPOINT_NEEDED;
         item = &dirty_buf_list[need_flush_num++];
-        item->buf_id = buf_id;
+        item->buf_id = buf_desc->buf_id;
         item->tsId = buf_desc->tag.rnode.spcNode;
         item->relNode = buf_desc->tag.rnode.relNode;
         item->bucketNode = buf_desc->tag.rnode.bucketNode;
@@ -2640,6 +2629,55 @@ UNLOCK:
         pthread_mutex_unlock(&g_buffer_write_info.shadow_lru_cxt.lru_lock);
     }
     return need_flush_num;
+}
+
+static void show_flush_and_fetch_stat(){
+    ereport(LOG, (errmsg("Dirty[%.2f],BG:[%u],FG:[%u]"
+        , (float)g_instance.ckpt_cxt_ctl->actual_dirty_page_num / (float)(g_instance.attr.attr_storage.NBuffers)
+        , pg_atomic_read_u64(&g_buffer_write_info.bg_flushed)
+        , pg_atomic_read_u64(&g_buffer_write_info.fg_flushed)
+        )));
+    ereport(LOG, (errmsg("Stall:[%.2f]IndexN:[%.2f]IndexO[%.2f]DataN[%.2f]DataO[%.2f]"
+        , (double)pg_atomic_read_u64(&g_buffer_write_info.fg_flushed) / (double)pg_atomic_read_u64(&g_buffer_write_info.total_miss)
+        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_index_flushed_new) / (double)pg_atomic_read_u64(&g_buffer_write_info.fg_flushed)
+        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_index_flushed_old) / (double)pg_atomic_read_u64(&g_buffer_write_info.fg_flushed)
+        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_data_flushed_new) / (double)pg_atomic_read_u64(&g_buffer_write_info.fg_flushed)
+        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_data_flushed_old) / (double)pg_atomic_read_u64(&g_buffer_write_info.fg_flushed)
+        )));
+    ereport(LOG, (errmsg("[Fetch/Miss]:IndexN[%.2f/%.2f]IndexO[%.2f/%.2f]DataN[%.2f/%.2f]DataO[%.2f/%.2f]"
+        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_index_fetch_new) / (double)pg_atomic_read_u64(&g_buffer_write_info.total_fetch)
+        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_index_miss_new) / (double)pg_atomic_read_u64(&g_buffer_write_info.total_miss)
+        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_index_fetch_old) / (double)pg_atomic_read_u64(&g_buffer_write_info.total_fetch)
+        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_index_miss_old) / (double)pg_atomic_read_u64(&g_buffer_write_info.total_miss)
+        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_data_fetch_new) / (double)pg_atomic_read_u64(&g_buffer_write_info.total_fetch)
+        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_data_miss_new) / (double)pg_atomic_read_u64(&g_buffer_write_info.total_miss)
+        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_data_fetch_old) / (double)pg_atomic_read_u64(&g_buffer_write_info.total_fetch)
+        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_data_miss_old) / (double)pg_atomic_read_u64(&g_buffer_write_info.total_miss)
+    )));
+    if(ENABLE_LRUC){
+        uint64 total_miss = pg_atomic_read_u64(&g_buffer_write_info.total_miss);
+        uint64 total_trigger = pg_atomic_read_u64(&g_lruc_info.trigger_scan);
+        if(total_miss && total_trigger)
+            ereport(LOG, (errmsg("LRUC ratio:[%.2f]avg scan len:[%.2f]success[%.2f]"
+            , (double)total_trigger / (double)total_miss
+            , (double)pg_atomic_read_u64(&g_lruc_info.scan_total) / (double)total_trigger
+            , (double)pg_atomic_read_u64(&g_lruc_info.got_clean) / (double)total_trigger
+            )));
+    }
+}
+
+static void GetBufferSnapshot(){
+    uint32 local_buf_state;
+    uint32 pinned = 0;
+    uint64 is_index = 0;
+    for(int i = 0; i < TOTAL_BUFFER_NUM; i++){
+        BufferDesc* buf = GetBufferDescriptor(i);
+        is_index += buf->is_index_block ? 1:0;        
+    }
+    double index = (double)is_index / (double)TOTAL_BUFFER_NUM;
+    ereport(WARNING, (errmsg("Data:[%.5f]Index:[%.5f]"
+    , 1.0 - index
+    , index)));
 }
 
 static uint32 get_candidate_buf_and_flush_list(uint32 start, uint32 end, uint32 max_flush_num,
@@ -2665,7 +2703,7 @@ static uint32 get_candidate_buf_and_flush_list(uint32 start, uint32 end, uint32 
         need_flush_num += lruc_try_flush_buf(max_flush_num, contain_hashbucket);
     }else if(ENABLE_TWB){
         need_flush_num += twb_try_flush_buf(max_flush_num, contain_hashbucket);
-    }else if(ENABLE_LRU){
+    }else if(ENABLE_LRU && ENABLE_TAIL_SCAN){
         /* Let only one thread flush this */
         if(thread_id != 1)
             return 0;
@@ -2752,16 +2790,9 @@ EXIT:
     }
     pg_atomic_add_fetch_u64(&g_buffer_write_info.bg_flushed, need_flush_num);
     if(thread_id == 1){
-        if(ENABLE_LRUC)
-            ereport(LOG, (errmsg("Taged dirty evict page [%d]", (int)get_thread_candidate_nums(&g_lruc_info.lruc_dirty_list))));
-        ereport(LOG, (errmsg("Dirty[%.2f],BG flushed:[%u],FG flushed:[%u],Stall:[%.2f]"
-        , (float)g_instance.ckpt_cxt_ctl->actual_dirty_page_num / (float)(g_instance.attr.attr_storage.NBuffers)
-        , pg_atomic_read_u64(&g_buffer_write_info.bg_flushed)
-        , pg_atomic_read_u64(&g_buffer_write_info.fg_flushed)
-        , (double)pg_atomic_read_u64(&g_buffer_write_info.fg_flushed) / (double)pg_atomic_read_u64(&g_buffer_write_info.total_fg_fetch_count))));
-        ereport(LOG, (errmsg("Total index stall[%.2f]"
-                    , (double)pg_atomic_read_u64(&g_buffer_write_info.index_flushed) / (double)pg_atomic_read_u64(&g_buffer_write_info.fg_flushed)
-        )));
+        show_flush_and_fetch_stat();
+        if(ENABLE_BUFFER_TYPE_SCAN)
+            GetBufferSnapshot();
     }
     return need_flush_num;
 }

@@ -132,10 +132,12 @@ static bool ReadBuffer_common_ReadBlock(SMgrRelation smgr, char relpersistence, 
 static Buffer ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum, BlockNumber blockNum,
     ReadBufferMode mode, BufferAccessStrategy strategy, bool *hit, const XLogPhyBlock *pblk);
 static void TerminateBufferIO_common(BufferDesc *buf, bool clear_dirty, uint32 set_flag_bits);
+static Buffer ReadBuffer_common_warp(Relation reln, SMgrRelation smgr, char relpersistence, ForkNumber forkNum, BlockNumber blockNum,
+                                ReadBufferMode mode, BufferAccessStrategy strategy, bool *hit, const XLogPhyBlock *pblk);
 /**
  * @Description: Push buffer bufId to thread threadId's candidate list.
  * @in: buf_id, buffer id which need push to the list
- * @in: thread_id, pagewriter thread id.
+ * @in: thread_id, pagewriter thread id../conf
  */
 static bool candidate_buf_push_twb(CandidateList *list, int buf_id)
 {
@@ -1765,18 +1767,48 @@ Buffer ReadBufferExtended(Relation reln, ForkNumber fork_num, BlockNumber block_
     if (RelationisEncryptEnable(reln)) {
         reln->rd_smgr->encrypt = true;
     }
-    t_thrd.is_index_split_fetch = (reln->rd_rel->relkind == RELKIND_INDEX || 
-                                  reln->rd_rel->relkind == RELKIND_GLOBAL_INDEX);
-    pg_atomic_add_fetch_u64(&g_buffer_write_info.total_fetch, 1);
-    if(t_thrd.is_index_split_fetch)
-        pg_atomic_add_fetch_u64(&g_buffer_write_info.total_index_fetch_count, 1);
-    buf = ReadBuffer_common(reln->rd_smgr, reln->rd_rel->relpersistence, fork_num,
-                            block_num, mode, strategy, &hit, NULL);
-    t_thrd.is_index_split_fetch = false;                        
+    buf = ReadBuffer_common_warp(reln, reln->rd_smgr, reln->rd_rel->relpersistence, fork_num,
+                            block_num, mode, strategy, &hit, NULL);                    
     if (hit) {
         pgstat_count_buffer_hit(reln);
     }
     return buf;
+}
+
+static Buffer ReadBuffer_common_warp(Relation reln, SMgrRelation smgr, char relpersistence, ForkNumber forkNum, BlockNumber blockNum,
+                                ReadBufferMode mode, BufferAccessStrategy strategy, bool *hit, const XLogPhyBlock *pblk){
+
+        Buffer buf;
+        bool is_new = blockNum == P_NEW;
+        bool is_index = reln->rd_rel->relkind == RELKIND_INDEX || reln->rd_rel->relkind == RELKIND_GLOBAL_INDEX;
+        t_thrd.is_index = is_index;
+        t_thrd.fetch_type = ( ( is_index ? 1U : 0U ) << 1) | ( is_new ? 1U : 0U ); // index | new
+        t_thrd.flush = false;
+        buf = ReadBuffer_common(smgr, relpersistence, forkNum, blockNum, mode, strategy, hit, pblk);
+        
+        bool is_flush = t_thrd.flush;
+        bool is_hit = *hit;
+        pg_atomic_add_fetch_u64(&g_buffer_write_info.total_fetch, 1);
+        pg_atomic_add_fetch_u64(&g_buffer_write_info.fg_flushed, is_flush ? 1:0);
+        pg_atomic_add_fetch_u64(&g_buffer_write_info.total_miss, is_hit ? 0:1 );
+        if (!is_index && is_new){
+            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_data_fetch_new, 1);
+            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_data_flushed_new, is_flush ? 1:0 );
+            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_data_miss_new, is_hit ? 0:1 );
+        }else if (!is_index && !is_new){
+            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_data_fetch_old, 1);
+            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_data_flushed_old, is_flush ? 1:0 );
+            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_data_miss_old, is_hit ? 0:1 );
+        }else if (is_index && is_new){
+            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_index_fetch_new, 1);
+            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_index_flushed_new, is_flush ? 1:0 );
+            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_index_miss_new, is_hit ? 0:1 );
+        }else{
+            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_index_fetch_old, 1);
+            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_index_flushed_old, is_flush ? 1:0 );
+            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_index_miss_old, is_hit ? 0:1 );
+        }
+        return buf;
 }
 
 /*
@@ -1827,7 +1859,6 @@ Buffer ReadBufferForRemote(const RelFileNode &rnode, ForkNumber fork_num, BlockN
         ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
                         errmsg("invalid forkNum %d, should be less than %d", fork_num, smgr->md_fdarray_size)));
     }
-
 
     return ReadBuffer_common(smgr, RELPERSISTENCE_PERMANENT, fork_num, block_num, mode, strategy, hit, pblk);
 }
@@ -2643,7 +2674,6 @@ found_branch:
 
     return BufferDescriptorGetBuffer(bufHdr);
 }
-
 void SimpleMarkBufDirty(BufferDesc *buf)
 {
     /* set  BM_DIRTY to overwrite later */
@@ -2853,21 +2883,6 @@ bool UpdateRefBuffer(uint32 access_hash, BufferTag *access_tag){
     buffer_cxt->curr_ref_size++;
     pthread_mutex_unlock(&buffer_cxt->tenant_ref_buffer_lock);
     return hit;
-}
-void UpdateHitRateStat(uint32 access_hash, BufferTag *access_tag, bool found){
-    bool ref_hit = UpdateRefBuffer(access_hash, access_tag);
-    bool real_hit = found;
-    tenant_buffer_cxt* buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
-    pthread_spin_lock(&buffer_cxt->hit_stat_lock);
-    if(ref_hit)
-        buffer_cxt->ref_hits++;
-    else
-        buffer_cxt->ref_misses++;
-    if(real_hit)
-        buffer_cxt->real_hits++;
-    else
-        buffer_cxt->real_misses++;
-    pthread_spin_unlock(&buffer_cxt->hit_stat_lock);
 }
 bool InsertToHist(FIFO_queue * list, BufferTag* access_tag , uint32 access_hash){
     uint32 list_size = list->cand_list_size;
@@ -3156,7 +3171,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
         }
 
         if(!ENABLE_FIXED)
-            UpdateHitRateStat(new_hash, &new_tag, *found);
+            //UpdateHitRateStat(new_hash, &new_tag, *found);
         return buf;
     }
     /*
@@ -3526,7 +3541,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
         *found = TRUE;
     }
     if(!ENABLE_FIXED)
-        UpdateHitRateStat(new_hash, &new_tag, *found);
+        //UpdateHitRateStat(new_hash, &new_tag, *found);
     return buf;
 }
 void COST_TEST_REWEIGHT(){
@@ -3639,8 +3654,7 @@ TWB_RETRY:
         /* Which was not supposed to be found in TWB buffered */
         if(ENABLE_TWB){
             uint32 flush_state = pg_atomic_read_u32(&buf->flush_state);
-            bool bail_from_twb = pg_atomic_compare_exchange_u32(&buf->flush_state, TWB_BUFFERED, 0U);
-            if(bail_from_twb){
+            if(flush_state != 0U){
                 /* This shit is being flushed now */
                 if(ENABLE_LOG)
                 ereport(WARNING, (errmsg("FG hit TWB Buf %d, sleep 1ms, total stall %d, is dirty %u, curr dirty queue size %u", buf_id, 
@@ -3649,7 +3663,7 @@ TWB_RETRY:
                         get_thread_candidate_nums_twb(&g_twb_info.twb_dirty_list))));
                 LWLockRelease(new_partition_lock);
                 /* Wait for flushed */
-                pg_usleep(100000);
+                pg_usleep(3000);
                 goto TWB_RETRY;   
             }
         }
@@ -3696,7 +3710,6 @@ TWB_RETRY:
      * Didn't find it in the buffer pool.  We'll have to initialize a new
      * buffer.	Remember to unlock the mapping lock while doing the work.
      */
-    pg_atomic_add_fetch_u64(&g_buffer_write_info.total_fg_fetch_count, 1);
     LWLockRelease(new_partition_lock);
     /* Loop here in case we have to try another victim buffer */
     bool from_clean = false;
@@ -3743,6 +3756,8 @@ TWB_RETRY:
          * won't prevent hint-bit updates).  We will recheck the dirty bit
          * after re-locking the buffer header.
          */
+        if (!(old_flags & BM_DIRTY) && ENABLE_LRUC && lruc_scan_len > 0)
+            pg_atomic_add_fetch_u64(&g_lruc_info.got_clean, 1);
         if (old_flags & BM_DIRTY) {
             /* backend should not flush dirty pages if working version less than DW_SUPPORT_NEW_SINGLE_FLUSH */
             if (!backend_can_flush_dirty_page()) {
@@ -3776,9 +3791,13 @@ TWB_RETRY:
             /* Buffer is dirty and we had pinned it */
             if(needDoFlush 
                 && ENABLE_LRUC 
-                && (lruc_scan_len++ < MAX_LRUC_SCAN_LEN) 
-                && (!INDEX_SKIP_FLUSH || t_thrd.is_index_split_fetch))
+                && (lruc_scan_len < MAX_LRUC_SCAN_LEN) 
+                && (!INDEX_SKIP_FLUSH || t_thrd.is_index))
             {
+                if(lruc_scan_len == 0)
+                    pg_atomic_add_fetch_u64(&g_lruc_info.trigger_scan, 1);
+                lruc_scan_len++;
+                pg_atomic_add_fetch_u64(&g_lruc_info.scan_total, 1);
                 if(!(pg_atomic_read_u32(&buf->flush_state) & LRUC_CANDIDATE)){
                     /* It's only a hint */
                     pg_atomic_write_u32(&buf->flush_state, LRUC_CANDIDATE);
@@ -3820,6 +3839,7 @@ TWB_RETRY:
                         continue;
                     }
             } else if (needDoFlush) {
+                t_thrd.flush = true;
                 /*
                  * If using a nondefault strategy, and writing the buffer
                  * would require a WAL flush, let the strategy decide whether
@@ -3870,9 +3890,6 @@ TWB_RETRY:
 
                 TRACE_POSTGRESQL_BUFFER_WRITE_DIRTY_DONE(fork_num, block_num, smgr->smgr_rnode.node.spcNode,
                                                          smgr->smgr_rnode.node.dbNode, smgr->smgr_rnode.node.relNode);
-                pg_atomic_add_fetch_u64(&g_buffer_write_info.fg_flushed, 1);
-                if(t_thrd.is_index_split_fetch)
-                    pg_atomic_add_fetch_u64(&g_buffer_write_info.index_flushed, 1);
             } else {
                 /*
                  * Someone else has locked the buffer, so give it up and loop
@@ -3882,7 +3899,16 @@ TWB_RETRY:
                 continue;
             }
         }
-
+        
+        if (ENABLE_SIM_LAT && 
+            (  LAT_TYPE == 1 
+                || LAT_TYPE == 2 && t_thrd.is_index 
+                || LAT_TYPE == 3 && !t_thrd.is_index) ){
+            double random = double(rand()) / double(RAND_MAX);
+            double ratio = double(LAT_RATIO) / double(100);
+            if(random <= ratio) 
+                pg_usleep(WRITE_LAT_US);
+        }
         /*
          * To change the association of a valid buffer, we'll need to have
          * exclusive lock on both the old and new mapping partitions.
@@ -4067,9 +4093,7 @@ TWB_RETRY:
     } else {
         *found = TRUE;
     }
-    if(ENABLE_COST_TEST){
-        UpdateHitRateStat(new_hash, &new_tag, *found);
-    }
+    buf->is_index_block = t_thrd.is_index;
     return buf;
 }
 static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
@@ -4235,8 +4259,8 @@ static void recheck_page_content(const BufferDesc *buf_desc)
  */
 
 void RecordDirty(BufferDesc *buf){
-    pg_atomic_fetch_add_u32(&buf->write_count, 1);
-    pg_atomic_write_u64(&buf->pre_write_ts, get_time_ms());
+    // pg_atomic_fetch_add_u32(&buf->write_count, 1);
+    // pg_atomic_write_u64(&buf->pre_write_ts, get_time_ms());
 }
 
 void MarkBufferDirty(Buffer buffer)
@@ -5678,9 +5702,9 @@ char* PageDataEncryptForBuffer(Page page, BufferDesc *bufdesc, bool is_segbuf)
 }
 
 void RecordFlush(void *buf){
-    pg_atomic_write_u32(&((BufferDesc *)buf)->write_count, 0);
-    pg_atomic_add_fetch_u32(&((BufferDesc *)buf)->flush_count, 1);
-    pg_atomic_write_u64(&((BufferDesc *)buf)->pre_flush_ts, get_time_ms());
+    // pg_atomic_write_u32(&((BufferDesc *)buf)->write_count, 0);
+    // pg_atomic_add_fetch_u32(&((BufferDesc *)buf)->flush_count, 1);
+    // pg_atomic_write_u64(&((BufferDesc *)buf)->pre_flush_ts, get_time_ms());
 }
 /*
  * Physically write out a shared buffer.

@@ -320,25 +320,11 @@ void InitTenantShadowBuffer(void){
     pthread_mutex_init(&shadow_tenant->tenant_ref_buffer_lock, NULL);
     pthread_spin_init(&shadow_tenant->hit_stat_lock, NULL);
 }
-void InitCostTest(bool first){
-    if(first){
-        g_tenant_info.tenant_num = g_instance.attr.attr_storage.max_tenant;
-        for(int i = 0; i < g_instance.attr.attr_storage.max_tenant; ++i){
-            g_tenant_info.tenant_buffer_cxt_array[i].weight = (float) 1.0 / g_instance.attr.attr_storage.max_tenant;
-        }
-        /* Shadow LRU */
-        InitTenantShadowBuffer();
-    }
-    /* Lock */
-    InitTenantBufferLock(first);
-    /* Evict history list should be fifo */
-    InitTenantHist(first);
-}
 void BufWriteStatReset(BufferDesc *buf){
-    pg_atomic_init_u32(&buf->write_count, 0);
-    pg_atomic_init_u32(&buf->flush_count, 0);
-    pg_atomic_init_u64(&buf->pre_flush_ts, 0);
-    pg_atomic_init_u64(&buf->pre_write_ts, 0);
+    // pg_atomic_init_u32(&buf->write_count, 0);
+    // pg_atomic_init_u32(&buf->flush_count, 0);
+    // pg_atomic_init_u64(&buf->pre_flush_ts, 0);
+    // pg_atomic_init_u64(&buf->pre_write_ts, 0);
 }
 void TWB_init(){
     bool first;
@@ -381,15 +367,33 @@ void LRUC_init(){
     MemSet((char*)lruc_dirty_buf_pool, 0, TOTAL_BUFFER_NUM * sizeof(Buffer));
     INIT_CANDIDATE_LIST(g_lruc_info.lruc_dirty_list, lruc_dirty_buf_pool,
     TOTAL_BUFFER_NUM, 0 ,0);
+    pg_atomic_init_u64(&g_lruc_info.scan_total, 0);
+    pg_atomic_init_u64(&g_lruc_info.trigger_scan, 0);
+    pg_atomic_init_u64(&g_lruc_info.got_clean, 0);
     ereport(LOG,(errmsg("LRUC init")));
+
 }
 void LRU_init(){
+        
         pg_atomic_init_u64(&g_buffer_write_info.bg_flushed, 0);
         pg_atomic_init_u64(&g_buffer_write_info.fg_flushed, 0);
-        pg_atomic_init_u64(&g_buffer_write_info.index_flushed, 0);
-        pg_atomic_init_u64(&g_buffer_write_info.total_index_fetch_count, 0);
         pg_atomic_init_u64(&g_buffer_write_info.total_fetch, 0);
-        pg_atomic_init_u64(&g_buffer_write_info.total_fg_fetch_count, 0);
+        pg_atomic_init_u64(&g_buffer_write_info.total_miss, 0);
+
+        pg_atomic_init_u64(&g_buffer_write_info.total_data_fetch_new, 0);
+        pg_atomic_init_u64(&g_buffer_write_info.total_data_fetch_old, 0);
+        pg_atomic_init_u64(&g_buffer_write_info.total_index_fetch_new, 0);
+        pg_atomic_init_u64(&g_buffer_write_info.total_index_fetch_old, 0);
+        
+        pg_atomic_init_u64(&g_buffer_write_info.total_data_miss_new, 0);
+        pg_atomic_init_u64(&g_buffer_write_info.total_data_miss_old, 0);
+        pg_atomic_init_u64(&g_buffer_write_info.total_index_miss_new, 0);
+        pg_atomic_init_u64(&g_buffer_write_info.total_index_miss_old, 0);
+        
+        pg_atomic_init_u64(&g_buffer_write_info.total_data_flushed_new, 0);
+        pg_atomic_init_u64(&g_buffer_write_info.total_data_flushed_old, 0);
+        pg_atomic_init_u64(&g_buffer_write_info.total_index_flushed_new, 0);
+        pg_atomic_init_u64(&g_buffer_write_info.total_index_flushed_old, 0);
 
         pthread_mutex_init(&g_buffer_write_info.shadow_lru_cxt.lru_lock, NULL);
         pg_atomic_init_u32(&g_buffer_write_info.shadow_lru_cxt.free_list_idx, 0);
@@ -397,16 +401,12 @@ void LRU_init(){
         /* LRU init */
         BufferDesc * head = &g_buffer_write_info.shadow_lru_cxt.lru_head;
         BufferDesc * tail = &g_buffer_write_info.shadow_lru_cxt.lru_tail;
+        g_buffer_write_info.shadow_lru_cxt.lru_c_pointer = tail;
         head->prev = NULL;
         head->next = tail;
         tail->prev = head;
         tail->next = NULL;
         
-        int i;
-        for(i = 0; i < 10; ++i){
-            pg_atomic_init_u64(&g_buffer_write_info.shadow_lru_cxt.pinned_count[i], 0);
-        }
-
 }
 void InitBufferPool(void)
 {
@@ -438,10 +438,6 @@ void InitBufferPool(void)
     if(ENABLE_MULTI_TENANTCY){
         /* We make sure this won't exec twice */
         InitMultiTenantBufferPool();
-    }
-    if(!ENABLE_MULTI_TENANTCY && ENABLE_COST_TEST){
-        /* Do cost test */
-        InitCostTest(!found_descs);
     }
 
 
