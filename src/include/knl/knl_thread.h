@@ -3522,7 +3522,6 @@ typedef struct knl_thrd_context {
     
     bool is_index;
     bool flush;
-
     int fetch_type;/* Index | New */
 } knl_thrd_context;
 

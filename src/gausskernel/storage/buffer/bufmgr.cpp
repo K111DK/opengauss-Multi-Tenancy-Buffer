@@ -86,7 +86,13 @@
 #include "ddes/dms/ss_common_attr.h"
 #include "ddes/dms/ss_reform_common.h"
 #include "ddes/dms/ss_transaction.h"
-
+#include "access/nbtree.h"
+#include "db4ai/xgboost.h"
+#include "db4ai/aifuncs.h"
+#include "db4ai/model_warehouse.h"
+#include "db4ai/predict_by.h"
+#include "db4ai/db4ai_common.h"
+#include "db4ai/db4ai_api.h"
 const int ONE_MILLISECOND = 1;
 const int TEN_MICROSECOND = 10;
 const int MILLISECOND_TO_MICROSECOND = 1000;
@@ -1774,39 +1780,231 @@ Buffer ReadBufferExtended(Relation reln, ForkNumber fork_num, BlockNumber block_
     }
     return buf;
 }
+/*
+    * Track the access time of buffer.
+    * access: 0 for read, 1 for write
+*/
+static void track(BufferDesc *buf, int access){
+    pg_atomic_add_fetch_u32(&buf->access_count, 1);
+    if(access == 0){
+        pg_memory_barrier();
+        uint32 old_pos = pg_atomic_read_u32(&buf->accessHead);
+        uint32 now_timer = pg_atomic_read_u32(&g_buffer_write_info.global_timer);
+        if(now_timer != buf->accessLog[old_pos]){
+            uint32 new_pos = (old_pos + 1) % 8;
+            pg_memory_barrier();
+            buf->accessLog[new_pos] = now_timer;
+            pg_memory_barrier();
+            pg_atomic_write_u32(&buf->accessHead, new_pos);
+        }
+        return;
+    }
+    pg_memory_barrier();
+    uint32 old_pos = pg_atomic_read_u32(&buf->writeHead);
+    uint32 now_timer = pg_atomic_read_u32(&g_buffer_write_info.global_timer);
+    if(now_timer != buf->writeLog[old_pos]){
+        uint32 new_pos = (old_pos + 1) % 8;
+        pg_memory_barrier();
+        buf->writeLog[new_pos] = now_timer;
+        pg_memory_barrier();
+        pg_atomic_write_u32(&buf->writeHead, new_pos);
+    }
+    pg_atomic_add_fetch_u32(&buf->write_count, 1);
+    return;
+}
+static float GetPageWriteVal(BufferDesc *buf){
+    pg_memory_barrier();
+    uint32 write_pos = pg_atomic_read_u32(&buf->writeHead);
+    pg_memory_barrier();
+    uint32 now_timer = pg_atomic_read_u32(&g_buffer_write_info.global_timer);
+    float max_write_val = 0;
+    float freq_factor = 0.2;
+    uint32 recent_factor = 0;
+    uint32 pos;
+    for(int i = 0; i < 4; i++){
+        pos = (write_pos - i + 4) % 4;
+        freq_factor = i == 0 ? 0.2 : i + 1;
+        recent_factor = now_timer - pg_atomic_read_u32(&buf->writeLog[pos]);
+        if(recent_factor == now_timer)
+            break;
+        max_write_val = Max(max_write_val, freq_factor / (float)Max(recent_factor, 1));
+    }
+    return max_write_val;
+}
 
+static float GetPageReadVal(BufferDesc *buf){
+    pg_memory_barrier();
+    uint32 read_pos = pg_atomic_read_u32(&buf->accessHead);
+    uint32 now_timer = pg_atomic_read_u32(&g_buffer_write_info.global_timer);
+    float max_read_val = 0;
+    float freq_factor = 0.2;
+    uint32 recent_factor = 0;
+    uint32 pos;
+    for(int i = 0; i < 8; i++){
+        pos = (read_pos - i + 8) % 8;
+        freq_factor = i == 0 ? 0.2 : i + 1;
+        recent_factor = now_timer - pg_atomic_read_u32(&buf->accessLog[pos]);
+        if(recent_factor == now_timer)
+            break;
+        max_read_val = Max(max_read_val, freq_factor / (float)Max(recent_factor, 1));
+    }
+    return max_read_val;
+}
+static void xgb_sighup_handler(SIGNAL_ARGS)
+{
+    int save_errno = errno;
+    if (t_thrd.proc) {
+        SetLatch(&t_thrd.proc->procLatch);
+    }
+    errno = save_errno;
+}
+
+/* SIGINT: set flag to run a normal checkpoint right away */
+static void xgb_sigint_handler(SIGNAL_ARGS)
+{
+    int save_errno = errno;
+    if (t_thrd.proc)
+        SetLatch(&t_thrd.proc->procLatch);
+    errno = save_errno;
+}
+
+static void xgb_quick_die(SIGNAL_ARGS)
+{
+    gs_signal_setmask(&t_thrd.libpq_cxt.BlockSig, NULL);
+    on_exit_reset();
+    gs_thread_exit(EXIT_MODE_TWO);
+}
+
+static void xgb_request_shutdown_handler(SIGNAL_ARGS)
+{
+    int save_errno = errno;
+    if (t_thrd.proc) {
+        SetLatch(&t_thrd.proc->procLatch);
+    }
+    errno = save_errno;
+}
+
+/* SIGUSR1: used for latch wakeups */
+static void xgb_sigusr1_handler(SIGNAL_ARGS)
+{
+    int save_errno = errno;
+    latch_sigusr1_handler();
+    errno = save_errno;
+}
+
+static void XGB_kill(){
+    crps_destory_ctxs();
+}
+
+static void XGB_setup_signal_hook(){
+    /*
+     * Reset some signals that are accepted by postmaster but not here
+     */
+    (void)gspqsignal(SIGHUP, xgb_sighup_handler);  /* set flag to read config file */
+    (void)gspqsignal(SIGINT, xgb_sigint_handler);
+    (void)gspqsignal(SIGTERM, xgb_request_shutdown_handler);
+    (void)gspqsignal(SIGQUIT, xgb_quick_die); /* hard crash time */
+    (void)gspqsignal(SIGALRM, SIG_IGN);
+    (void)gspqsignal(SIGPIPE, SIG_IGN);
+    (void)gspqsignal(SIGUSR1, xgb_sigusr1_handler);
+    (void)gspqsignal(SIGUSR2, SIG_IGN);
+    (void)gspqsignal(SIGURG, print_stack);
+    /*
+     * Reset some signals that are accepted by postmaster but not here
+     */
+    (void)gspqsignal(SIGCHLD, SIG_DFL);
+    (void)gspqsignal(SIGTTIN, SIG_DFL);
+    (void)gspqsignal(SIGTTOU, SIG_DFL);
+    (void)gspqsignal(SIGCONT, SIG_DFL);
+    (void)gspqsignal(SIGWINCH, SIG_DFL);
+
+    /* We allow SIGQUIT (quickdie) at all times */
+    (void)sigdelset(&t_thrd.libpq_cxt.BlockSig, SIGQUIT);
+
+}
+void XGB_evictor_main(){
+    sigjmp_buf localSigjmpBuf;
+    MemoryContext xgb_context;
+    char name[MAX_THREAD_NAME_LEN] = {0};
+    t_thrd.role = XGBEVICT_THREAD;
+
+    // how to handle signals??
+    XGB_setup_signal_hook();
+
+    ereport(LOG,(errmodule(MOD_INCRE_CKPT), errmsg("XGB evictor started")));
+
+    /*
+     * Create a resource owner to keep track of our resources.
+     */
+    errno_t err_rc = snprintf_s(name, MAX_THREAD_NAME_LEN, MAX_THREAD_NAME_LEN - 1, "%s", "XGB evictor");
+    securec_check_ss(err_rc, "", "");
+    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, name,
+        THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE));
+
+    /*
+     * Create a memory context that we will do all our work in.  We do this so
+     * that we can reset the context during error recovery and thereby avoid
+     * possible memory leaks.  Formerly this code just ran in
+     * TopMemoryContext, but resetting that would be a really bad idea.
+     */
+    xgb_context = AllocSetContextCreate(
+        TopMemoryContext, name, ALLOCSET_DEFAULT_MINSIZE, ALLOCSET_DEFAULT_INITSIZE, ALLOCSET_DEFAULT_MAXSIZE);
+    (void)MemoryContextSwitchTo(xgb_context);
+    on_shmem_exit(XGB_kill, (Datum)0);
+
+    /*
+     * If an exception is encountered, processing resumes here.
+     *
+     * See notes in postgres.c about the design of this coding.
+     */
+    if (sigsetjmp(localSigjmpBuf, 1) != 0) {
+        ereport(WARNING, (errmodule(MOD_INCRE_CKPT), errmsg("XGB evictor exception occured.")));
+        proc_exit(1);
+    }
+
+    /* We can now handle ereport(ERROR) */
+    t_thrd.log_cxt.PG_exception_stack = &localSigjmpBuf;
+
+    /*
+     * Unblock signals (they were blocked when the postmaster forked us)
+     */
+    gs_signal_setmask(&t_thrd.libpq_cxt.UnBlockSig, NULL);
+    (void)gs_signal_unblock_sigusr2();
+
+    pgstat_report_appname("XGB evictor");
+    pgstat_report_activity(STATE_IDLE, NULL);
+    /*
+     * Loop forever
+     */
+    int rc;
+    for (;;) {
+        // sleep this wake
+        rc = WaitLatch(&t_thrd.proc->procLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, (long)10); // ms
+        if (rc & WL_POSTMASTER_DEATH) {
+            gs_thread_exit(1);
+        }
+        // wait someone wake up
+        SetLatch(&t_thrd.proc->procLatch);
+    }
+}
 static Buffer ReadBuffer_common_warp(Relation reln, SMgrRelation smgr, char relpersistence, ForkNumber forkNum, BlockNumber blockNum,
                                 ReadBufferMode mode, BufferAccessStrategy strategy, bool *hit, const XLogPhyBlock *pblk){
 
         Buffer buf;
-        bool is_new = blockNum == P_NEW;
-        bool is_index = reln->rd_rel->relkind == RELKIND_INDEX || reln->rd_rel->relkind == RELKIND_GLOBAL_INDEX;
-        t_thrd.is_index = is_index;
-        t_thrd.fetch_type = ( ( is_index ? 1U : 0U ) << 1) | ( is_new ? 1U : 0U ); // index | new
-        t_thrd.flush = false;
+        bool isLocalBuf = SmgrIsTemp(smgr);
         buf = ReadBuffer_common(smgr, relpersistence, forkNum, blockNum, mode, strategy, hit, pblk);
-        
+        if(isLocalBuf){
+            return buf;
+        }
         bool is_flush = t_thrd.flush;
         bool is_hit = *hit;
-        pg_atomic_add_fetch_u64(&g_buffer_write_info.total_fetch, 1);
+        uint64 epoch_size = NORMAL_SHARED_BUFFER_NUM / 64;
+        if(pg_atomic_fetch_add_u64(&g_buffer_write_info.total_fetch, 1) == 0){
+            testXGB();
+        }
         pg_atomic_add_fetch_u64(&g_buffer_write_info.fg_flushed, is_flush ? 1:0);
-        pg_atomic_add_fetch_u64(&g_buffer_write_info.total_miss, is_hit ? 0:1 );
-        if (!is_index && is_new){
-            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_data_fetch_new, 1);
-            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_data_flushed_new, is_flush ? 1:0 );
-            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_data_miss_new, is_hit ? 0:1 );
-        }else if (!is_index && !is_new){
-            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_data_fetch_old, 1);
-            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_data_flushed_old, is_flush ? 1:0 );
-            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_data_miss_old, is_hit ? 0:1 );
-        }else if (is_index && is_new){
-            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_index_fetch_new, 1);
-            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_index_flushed_new, is_flush ? 1:0 );
-            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_index_miss_new, is_hit ? 0:1 );
-        }else{
-            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_index_fetch_old, 1);
-            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_index_flushed_old, is_flush ? 1:0 );
-            pg_atomic_add_fetch_u64(&g_buffer_write_info.total_index_miss_old, is_hit ? 0:1 );
+        if(pg_atomic_add_fetch_u64(&g_buffer_write_info.total_miss, is_hit ? 0:1 ) % epoch_size == 0){
+            pg_atomic_add_fetch_u32(&g_buffer_write_info.global_timer, 1);
         }
         return buf;
 }
@@ -2770,6 +2968,7 @@ TWB g_twb_info;
 LRUC g_lruc_info;
 tenant_info g_tenant_info;
 buffer_write_info g_buffer_write_info;
+THR_LOCAL miss_info g_miss_info;
 void show_tenant_status(){
     uint64 total_hit = 0;
     uint64 total_miss = 0;
@@ -3607,7 +3806,6 @@ static void InsertToHead(BufferDesc *buf)
     buf->prev = head;
     pthread_mutex_unlock(&g_buffer_write_info.shadow_lru_cxt.lru_lock);
 }
-
 static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
                                BufferAccessStrategy strategy, bool *found, const XLogPhyBlock *pblk)
 {
@@ -3900,15 +4098,6 @@ TWB_RETRY:
             }
         }
         
-        if (ENABLE_SIM_LAT && 
-            (  LAT_TYPE == 1 
-                || LAT_TYPE == 2 && t_thrd.is_index 
-                || LAT_TYPE == 3 && !t_thrd.is_index) ){
-            double random = double(rand()) / double(RAND_MAX);
-            double ratio = double(LAT_RATIO) / double(100);
-            if(random <= ratio) 
-                pg_usleep(WRITE_LAT_US);
-        }
         /*
          * To change the association of a valid buffer, we'll need to have
          * exclusive lock on both the old and new mapping partitions.
@@ -4054,7 +4243,13 @@ TWB_RETRY:
     } else {
         buf_state |= BM_TAG_VALID | BUF_USAGECOUNT_ONE;
     }
-
+    pg_atomic_write_u32(&buf->accessHead, 0);
+    pg_atomic_write_u32(&buf->writeHead, 0);
+    for(int i = 0; i < 8; i++){
+        buf->accessLog[i] = 0;
+        if(i < 4)
+            buf->writeLog[i] = 0;
+    }
     UnlockBufHdr(buf, buf_state);
 
     if (ENABLE_DMS) {
@@ -4093,7 +4288,6 @@ TWB_RETRY:
     } else {
         *found = TRUE;
     }
-    buf->is_index_block = t_thrd.is_index;
     return buf;
 }
 static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
@@ -4279,6 +4473,7 @@ void MarkBufferDirty(Buffer buffer)
     }
 
     buf_desc = GetBufferDescriptor(buffer - 1);
+    track(buf_desc, 1);
 
     Assert(BufferIsPinned(buffer));
     /* unfortunately we can't check if the lock is held exclusively */

@@ -237,8 +237,6 @@ retry:
          */
         if (!retryLockBufHdr(buf, &local_buf_state))
             continue;
-
-        retry_lock_status.retry_times = 0;
         if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0 && !(local_buf_state & BM_IS_META) &&
             (backend_can_flush_dirty_page() || !(local_buf_state & BM_DIRTY))) {
             
@@ -249,16 +247,6 @@ retry:
             (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->get_buf_num_clock_sweep, 1);
             pthread_mutex_unlock(&g_buffer_write_info.shadow_lru_cxt.lru_lock);
             return buf;
-        } else if (--try_counter == 0) {
-            /*
-             * We've scanned all the buffers without making any state changes,
-             * so all the buffers are pinned (or were when we looked at them).
-             * We could hope that someone will free one eventually, but it's
-             * probably better to fail than to risk getting stuck in an
-             * infinite loop. 
-             */
-            ereport(ERROR, (errmsg("no unpinned buffers available")));
-            Assert(0);
         }
         UnlockBufHdr(buf, local_buf_state);
     }

@@ -243,6 +243,7 @@ typedef struct knl_instance_attr_storage {
 
     /* Others */
     bool buffer_type_scan;
+    bool enable_leaf_quick_evict;
 } knl_instance_attr_storage;
 
 #endif /* SRC_INCLUDE_KNL_KNL_INSTANCE_ATTR_STORAGE_H_ */

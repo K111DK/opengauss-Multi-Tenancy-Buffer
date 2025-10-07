@@ -38,4 +38,5 @@ extern XGBoost xg_reg_logistic;
 extern XGBoost xg_bin_logistic;
 extern XGBoost xg_reg_sqe;
 extern XGBoost xg_reg_gamma;
+extern void testXGB();
 #endif 

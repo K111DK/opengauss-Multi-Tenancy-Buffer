@@ -24,7 +24,6 @@
 #include <pthread.h>
 
 
-
 /* [ dram buffer | nvm buffer | segment buffer] */
 #define NVM_BUFFER_NUM (g_instance.attr.attr_storage.NNvmBuffers)
 #define SEGMENT_BUFFER_NUM (g_instance.attr.attr_storage.NSegBuffers) // 1GB

@@ -836,3 +836,125 @@ XGBoost xg_reg_gamma = {
         xgboost_explain
     },
 };
+static Model* testTrain(){
+    /* XGoost DMatrix handle */
+    load_xgboost_library();
+    xg_data_t chunk; /* chunk of data */
+    uint32 batch_size = 64;
+    chunk.lb_rows = batch_size; /* 64 per batch */
+    chunk.ft_rows = chunk.lb_rows;
+    chunk.ft_cols = 10;
+    setup_xg_chunk<true>(chunk);
+    DMatrixHandle dtrain, dtest;
+
+    /* load DTrain matrix */
+    safe_xgboost(g_xgboostApi->XGDMatrixCreateFromMat((float *)chunk.features,  // input data
+                                        batch_size,                  // # rows
+                                        chunk.ft_cols,            // # columns in the input
+                                        -1,                        // filler for missing values
+                                        &dtrain));                 // handle of the DMatrix
+
+    /* load DTest matrix */
+    safe_xgboost(g_xgboostApi->XGDMatrixCreateFromMat((float *)chunk.features, batch_size, chunk.ft_cols, -1, &dtest));
+
+    /* load the labels */
+    safe_xgboost(g_xgboostApi->XGDMatrixSetFloatInfo(dtrain, "label", chunk.labels, batch_size));
+    safe_xgboost(g_xgboostApi->XGDMatrixSetFloatInfo(dtest, "label", chunk.labels, batch_size));
+
+    DMatrixHandle eval_dmats[2] = {dtrain, dtest};
+
+    /* create the booster and load the desired parameters */
+    BoosterHandle booster;
+    HyperparamsXGBoost* g_param = reinterpret_cast<HyperparamsXGBoost *>(palloc0(sizeof(HyperparamsXGBoost)));
+    g_param->n_iterations = 10;
+    g_param->batch_size = batch_size;
+    g_param->max_depth = 4;
+    g_param->min_child_weight = 1;
+    g_param->nthread = 8;
+    g_param->seed = 0.8;
+    g_param->eval_metric = xgboost_eval_metric_str[2]; // rmse
+    AlgorithmAPI *algo = get_algorithm_api(XG_REG_SQE);
+    safe_xgboost(g_xgboostApi->XGBoosterCreate(eval_dmats, 2, &booster));
+    set_hyperparams(algo, g_param, booster);
+        /* evaluation structures */
+    const char* eval_names[2] = {"train", "test"};
+    const char* eval_result = nullptr;
+
+    for (uint32_t iter = 0; iter < g_param->n_iterations; ++iter) {
+        safe_xgboost(g_xgboostApi->XGBoosterUpdateOneIter(booster, iter, dtrain));
+        safe_xgboost(g_xgboostApi->XGBoosterEvalOneIter(booster, iter, eval_dmats, eval_names, 2, &eval_result));
+    }
+
+    /* get evaluation results */
+    chunk.validation_score = parseDoubleFromErrMetric(eval_result);
+    uint64_t raw_model_len;
+    char *raw_model;
+    safe_xgboost(g_xgboostApi->XGBoosterSerializeToBuffer(booster, &raw_model_len, (const char **)&raw_model));
+    chunk.set_raw_model(raw_model, raw_model_len);
+    /* free xgboost structures */
+    safe_xgboost(g_xgboostApi->XGDMatrixFree(dtrain));
+    safe_xgboost(g_xgboostApi->XGDMatrixFree(dtest));
+    safe_xgboost(g_xgboostApi->XGBoosterFree(booster));
+
+    Model *model = (Model *)palloc0(sizeof(Model));
+    model->memory_context = CurrentMemoryContext;
+    model->algorithm = algo->algorithm;
+    model->model_name = "MY_XGBOOST_MODEL";
+    model->data.version = DB4AI_MODEL_V01;
+    xgboost_serialize(&model->data, &chunk);
+    model->return_type = FLOAT8OID;
+    TrainingScore* pscore = (TrainingScore*)palloc0(sizeof(TrainingScore));
+    pscore->name = g_param->eval_metric;
+    pscore->value = chunk.validation_score;
+    model->scores = lappend(model->scores, pscore);
+    model->status = ERRCODE_SUCCESSFUL_COMPLETION;
+    return model;
+}
+static void testPredict(Model* model, int ncolumns, int nrows){
+
+    SerializedModelXgboost *xgboostm = (SerializedModelXgboost *)xgboost_predict_prepare(nullptr, &model->data, FLOAT8OID);
+
+    /* init XGBoost predictor */
+    safe_xgboost(g_xgboostApi->XGBoosterCreate(nullptr, 0, &xgboostm->booster));
+    /* load the decoded model */
+    safe_xgboost(g_xgboostApi->XGBoosterUnserializeFromBuffer(xgboostm->booster, xgboostm->model->raw_data, xgboostm->model->size));
+    /* sanity checks */
+    Assert(xgboostm->booster != nullptr);
+    if (ncolumns != xgboostm->ft_cols)
+        ereport(ERROR, (errmodule(MOD_DB4AI),
+            errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+            errmsg("Invalid number of features for prediction, provided %d, expected %d",
+                ncolumns, xgboostm->ft_cols)));
+
+    load_xgboost_library();
+
+    float features[nrows][ncolumns];
+    // for (int col = 0; col < ncolumns; ++col)
+    //     features[col] = isnull[col] ? 0.0 : datum_get_float8(types[col], values[col]);
+
+    DMatrixHandle dmat;
+    /* convert to DMatrix */
+    safe_xgboost(g_xgboostApi->XGDMatrixCreateFromMat((float *) features, nrows, ncolumns, -1, &dmat));
+
+    bst_ulong out_len;
+    const float *out_result;
+    safe_xgboost(g_xgboostApi->XGBoosterPredict(xgboostm->booster, dmat, 0, 0, 0, &out_len, &out_result));
+
+    /* release memory of xgboost dmatrix structure */
+    safe_xgboost(g_xgboostApi->XGDMatrixFree(dmat));
+    safe_xgboost(g_xgboostApi->XGBoosterFree(xgboostm->booster));
+    return;
+}
+/* test xgboost */
+extern void testXGB(){
+    Model* model = testTrain();
+    testPredict(model, 10, 5);
+    // model_store(model);
+    // pfree(model);
+    // Model *new_model = const_cast<Model *>(model_load("MY_XGBOOST_MODEL"));
+    // if (new_model == nullptr or new_model->status != ERRCODE_SUCCESSFUL_COMPLETION) {
+    //     ereport(ERROR, (errmodule(MOD_DB4AI), errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+    //             errmsg("load model failed")));
+    // }
+    // testPredict(new_model, 10, 5);
+}

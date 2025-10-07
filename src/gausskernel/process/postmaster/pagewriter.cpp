@@ -2632,28 +2632,12 @@ UNLOCK:
 }
 
 static void show_flush_and_fetch_stat(){
-    ereport(LOG, (errmsg("Dirty[%.2f],BG:[%u],FG:[%u]"
+    ereport(LOG, (errmsg("Dirty[%.2f],BG:[%u],FG:[%u],Stall[%.2f]"
         , (float)g_instance.ckpt_cxt_ctl->actual_dirty_page_num / (float)(g_instance.attr.attr_storage.NBuffers)
         , pg_atomic_read_u64(&g_buffer_write_info.bg_flushed)
         , pg_atomic_read_u64(&g_buffer_write_info.fg_flushed)
-        )));
-    ereport(LOG, (errmsg("Stall:[%.2f]IndexN:[%.2f]IndexO[%.2f]DataN[%.2f]DataO[%.2f]"
         , (double)pg_atomic_read_u64(&g_buffer_write_info.fg_flushed) / (double)pg_atomic_read_u64(&g_buffer_write_info.total_miss)
-        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_index_flushed_new) / (double)pg_atomic_read_u64(&g_buffer_write_info.fg_flushed)
-        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_index_flushed_old) / (double)pg_atomic_read_u64(&g_buffer_write_info.fg_flushed)
-        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_data_flushed_new) / (double)pg_atomic_read_u64(&g_buffer_write_info.fg_flushed)
-        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_data_flushed_old) / (double)pg_atomic_read_u64(&g_buffer_write_info.fg_flushed)
         )));
-    ereport(LOG, (errmsg("[Fetch/Miss]:IndexN[%.2f/%.2f]IndexO[%.2f/%.2f]DataN[%.2f/%.2f]DataO[%.2f/%.2f]"
-        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_index_fetch_new) / (double)pg_atomic_read_u64(&g_buffer_write_info.total_fetch)
-        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_index_miss_new) / (double)pg_atomic_read_u64(&g_buffer_write_info.total_miss)
-        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_index_fetch_old) / (double)pg_atomic_read_u64(&g_buffer_write_info.total_fetch)
-        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_index_miss_old) / (double)pg_atomic_read_u64(&g_buffer_write_info.total_miss)
-        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_data_fetch_new) / (double)pg_atomic_read_u64(&g_buffer_write_info.total_fetch)
-        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_data_miss_new) / (double)pg_atomic_read_u64(&g_buffer_write_info.total_miss)
-        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_data_fetch_old) / (double)pg_atomic_read_u64(&g_buffer_write_info.total_fetch)
-        , (double)pg_atomic_read_u64(&g_buffer_write_info.total_data_miss_old) / (double)pg_atomic_read_u64(&g_buffer_write_info.total_miss)
-    )));
     if(ENABLE_LRUC){
         uint64 total_miss = pg_atomic_read_u64(&g_buffer_write_info.total_miss);
         uint64 total_trigger = pg_atomic_read_u64(&g_lruc_info.trigger_scan);
@@ -2667,17 +2651,7 @@ static void show_flush_and_fetch_stat(){
 }
 
 static void GetBufferSnapshot(){
-    uint32 local_buf_state;
-    uint32 pinned = 0;
-    uint64 is_index = 0;
-    for(int i = 0; i < TOTAL_BUFFER_NUM; i++){
-        BufferDesc* buf = GetBufferDescriptor(i);
-        is_index += buf->is_index_block ? 1:0;        
-    }
-    double index = (double)is_index / (double)TOTAL_BUFFER_NUM;
-    ereport(WARNING, (errmsg("Data:[%.5f]Index:[%.5f]"
-    , 1.0 - index
-    , index)));
+    return;
 }
 
 static uint32 get_candidate_buf_and_flush_list(uint32 start, uint32 end, uint32 max_flush_num,

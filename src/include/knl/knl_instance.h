@@ -217,6 +217,7 @@ typedef struct knl_g_pid_context {
     ThreadId ApplyLauncerPID;
     ThreadId StackPerfPID;
     ThreadId CfsShrinkerPID;
+    ThreadId XGBEvictPID;
 } knl_g_pid_context;
 
 typedef struct {

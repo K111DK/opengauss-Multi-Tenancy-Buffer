@@ -425,7 +425,7 @@ typedef struct PROC_HDR {
  * PGXC needs another slot for the pool manager process
  */
 const int MAX_PAGE_WRITER_THREAD_NUM = 17;
-
+const int MAX_XGB_THREAD_NUM = 5;
 #ifndef ENABLE_LITE_MODE
 const int MAX_COMPACTION_THREAD_NUM = 100;
 #else
@@ -437,7 +437,8 @@ const int MAX_COMPACTION_THREAD_NUM = 10;
     (MAX_PAGE_WRITER_THREAD_NUM + \
      MAX_RECOVERY_THREAD_NUM + \
      g_instance.shmem_cxt.ThreadPoolGroupNum + \
-     MAX_COMPACTION_THREAD_NUM \
+     MAX_COMPACTION_THREAD_NUM + \
+     MAX_XGB_THREAD_NUM \
     )
 
 #define NUM_AUXILIARY_PROCS (NUM_SINGLE_AUX_PROC + NUM_MULTI_AUX_PROC) 

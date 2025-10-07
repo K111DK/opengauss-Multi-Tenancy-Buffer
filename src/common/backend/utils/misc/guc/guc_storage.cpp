@@ -1253,6 +1253,18 @@ static void InitStorageConfigureNamesBool()
             NULL,
             NULL
         },
+        {{"enable_leaf_quick_evict",
+            PGC_POSTMASTER,
+            NODE_ALL,
+            RESOURCES_MEM,
+            gettext_noop("whether enable enable_leaf_quick_evict"),
+            NULL},
+            &g_instance.attr.attr_storage.enable_leaf_quick_evict,
+            false,
+            NULL,
+            NULL,
+            NULL
+        },
         {{"enable_tail_scan",
             PGC_POSTMASTER,
             NODE_ALL,

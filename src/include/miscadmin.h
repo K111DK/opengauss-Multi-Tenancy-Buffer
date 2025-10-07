@@ -568,6 +568,7 @@ typedef enum {
      * Meanwhile, you must update NUM_MULTI_AUX_PROC and GetAuxProcEntryIndex().
      */
     PageWriterProcess,
+    XGBEVICTProcess,
     PageRedoProcess,
     TpoolListenerProcess,
     TsCompactionConsumerProcess,

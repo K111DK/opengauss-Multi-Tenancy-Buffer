@@ -1181,12 +1181,17 @@ int GetAuxProcEntryIndex(int baseIdx)
         index = baseIdx + NUM_SINGLE_AUX_PROC;
         if (t_thrd.bootstrap_cxt.MyAuxProcType == PageWriterProcess) {
             index += get_pagewriter_thread_id();
+        } else if (t_thrd.bootstrap_cxt.MyAuxProcType == XGBEVICTProcess) {
+            index += 1 + MAX_PAGE_WRITER_THREAD_NUM;
         } else if (t_thrd.bootstrap_cxt.MyAuxProcType == PageRedoProcess) {
-            index += MultiRedoGetWorkerId() + MAX_PAGE_WRITER_THREAD_NUM;
+            index += MultiRedoGetWorkerId() + 
+                    MAX_XGB_THREAD_NUM + 
+                    MAX_PAGE_WRITER_THREAD_NUM;
         } else if (t_thrd.bootstrap_cxt.MyAuxProcType == TpoolListenerProcess) {
             /* thread pool listerner slots follow page redo threads */
             index += t_thrd.threadpool_cxt.listener->GetGroup()->GetGroupId() +
                      MAX_PAGE_WRITER_THREAD_NUM +
+                     MAX_XGB_THREAD_NUM +
                      MAX_RECOVERY_THREAD_NUM;
         }
 #ifdef ENABLE_MULTIPLE_NODES

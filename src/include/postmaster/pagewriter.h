@@ -153,7 +153,6 @@ const int SLOT_VALID = 1;
 extern bool IsPagewriterProcess(void);
 extern void incre_ckpt_pagewriter_cxt_init();
 extern void ckpt_pagewriter_main(void);
-
 extern bool push_pending_flush_queue(Buffer buffer);
 extern void remove_dirty_page_from_queue(BufferDesc* buf);
 extern int64 get_dirty_page_num();

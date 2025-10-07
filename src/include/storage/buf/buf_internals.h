@@ -226,12 +226,12 @@ typedef struct BufferDesc {
     struct BufferDesc* next; /* link in freelist of buffers */
     struct BufferDesc* prev;
     uint32 tenantOid;
-    // pg_atomic_uint32 write_count;
-    // pg_atomic_uint32 flush_count;
-    // pg_atomic_uint64 pre_flush_ts;
-    // pg_atomic_uint64 pre_write_ts;
+    pg_atomic_uint32 accessLog[8];
+    pg_atomic_uint32 writeLog[4];
+    pg_atomic_uint32 accessHead, writeHead;
     pg_atomic_uint32 flush_state;
-    bool is_index_block;
+    pg_atomic_uint32 access_count;
+    pg_atomic_uint32 write_count;
 #ifdef USE_ASSERT_CHECKING
     volatile uint64 lsn_dirty;
 #endif
@@ -537,7 +537,7 @@ typedef struct TWB {
 
 }TWB;
 
-
+#define ENABLE_LEAF_QUICK_EVICT (g_instance.attr.attr_storage.enable_leaf_quick_evict)
 #define ENABLE_LRUC (g_instance.attr.attr_storage.enable_lruc)
 #define ENABLE_TAIL_SCAN (g_instance.attr.attr_storage.enable_tail_scan)
 #define ENABLE_BUFFER_TYPE_SCAN (g_instance.attr.attr_storage.buffer_type_scan)
@@ -577,24 +577,29 @@ typedef struct buffer_write_info {
     pg_atomic_uint64 fg_flushed;
     pg_atomic_uint64 bg_flushed;
     pg_atomic_uint64 index_flushed; /* Index split get page meets flush*/
-    pg_atomic_uint64 total_index_flushed_new;
-    pg_atomic_uint64 total_data_flushed_new;
-    pg_atomic_uint64 total_index_flushed_old;
-    pg_atomic_uint64 total_data_flushed_old;
     /* fetch */
     pg_atomic_uint64 total_fetch; /* Total BufferAlloc */
-    pg_atomic_uint64 total_index_fetch_new;
-    pg_atomic_uint64 total_data_fetch_new;
-    pg_atomic_uint64 total_index_fetch_old;
-    pg_atomic_uint64 total_data_fetch_old;
+
     /* miss */
     pg_atomic_uint64 total_miss;
-    pg_atomic_uint64 total_index_miss_new;
-    pg_atomic_uint64 total_data_miss_new;
-    pg_atomic_uint64 total_index_miss_old;
-    pg_atomic_uint64 total_data_miss_old;
+
+    pg_atomic_uint32 global_timer;
+
+    /* consecutive miss */
     shadow_lru shadow_lru_cxt;
 } buffer_write_info;
+
+#define BUF_HIST_LEN 8
+typedef struct {
+    int hist_idx;
+    BufferDesc * desc_hist[BUF_HIST_LEN];
+    BufferTag tag_hist[BUF_HIST_LEN];
+    bool hit_hist[BUF_HIST_LEN];
+    bool is_index[BUF_HIST_LEN];
+    int access_cnt;
+}miss_info;
+extern THR_LOCAL miss_info g_miss_info;
+
 /* */
 extern buffer_write_info g_buffer_write_info;
 extern tenant_info g_tenant_info;
@@ -603,7 +608,7 @@ extern LRUC g_lruc_info;
 extern BufferDesc *TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt);
 extern void show_tenant_status();
 double GetTenantHRD(tenant_buffer_cxt* buffer_cxt);
-
+extern void XGB_evictor_main();
 /* new */
 extern void ThrdGetRefBufferIndex(tenant_buffer_cxt* buffer_cxt);
 extern bool UpdateRefBuffer(uint32 access_hash, BufferTag *access_tag);

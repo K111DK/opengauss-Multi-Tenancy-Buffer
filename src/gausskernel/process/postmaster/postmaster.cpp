@@ -266,6 +266,7 @@
 #endif
 
 #include "utils/postinit.h"
+#include "storage/buf/bufmgr.h"
 
 extern void InitGlobalSeq();
 extern void auto_explain_init(void);
@@ -6907,6 +6908,8 @@ static void reaper(SIGNAL_ARGS)
                     }
                 }
             }
+            if (g_instance.pid_cxt.XGBEvictPID == 0 && !dummyStandbyMode)
+                g_instance.pid_cxt.XGBEvictPID = initialize_util_thread(XGBOOST_EVICT);
 
             if (g_instance.pid_cxt.WalWriterPID == 0)
                 g_instance.pid_cxt.WalWriterPID = initialize_util_thread(WALWRITER);
@@ -7156,6 +7159,13 @@ static void reaper(SIGNAL_ARGS)
             }
         }
 
+        if (pid == g_instance.pid_cxt.XGBEvictPID) {
+            g_instance.pid_cxt.XGBEvictPID = 0;
+
+            if (!EXIT_STATUS_0(exitstatus))
+                HandleChildCrash(pid, exitstatus, _("XGBoost evict process"));
+            continue;
+        }
         /*
          * Was it the checkpointer?
          */
@@ -13216,6 +13226,9 @@ static void SetAuxType()
         case PAGEWRITER_THREAD:
             t_thrd.bootstrap_cxt.MyAuxProcType = PageWriterProcess;
             break;
+        case XGBEVICT_THREAD:
+            t_thrd.bootstrap_cxt.MyAuxProcType = XGBEVICTProcess;
+            break;
         case PAGEREPAIR_THREAD:
             t_thrd.bootstrap_cxt.MyAuxProcType = PageRepairProcess;
             break;
@@ -13492,6 +13505,11 @@ int GaussDbAuxiliaryThreadMain(knl_thread_arg* arg)
 
         case PAGEWRITER_THREAD:
             ckpt_pagewriter_main();
+            proc_exit(1);
+            break;
+        
+        case XGBEVICT_THREAD:
+            XGB_evictor_main();
             proc_exit(1);
             break;
 
@@ -13785,6 +13803,7 @@ int GaussDbThreadMain(knl_thread_arg* arg)
 #endif   /* ENABLE_MULTIPLE_NODES */
         case THREADPOOL_LISTENER:
         case THREADPOOL_SCHEDULER:
+        case XGBEVICT_THREAD:
         case UNDO_RECYCLER: {
             SetAuxType<thread_role>();
             /* Restore basic shared memory pointers */
@@ -14307,6 +14326,7 @@ static ThreadMetaData GaussdbThreadGate[] = {
     { GaussDbThreadMain<DATARECWRITER>, DATARECWRITER, "datarecwriter", "data receive writer" },
     { GaussDbThreadMain<CBMWRITER>, CBMWRITER, "CBMwriter", "CBM writer" },
     { GaussDbThreadMain<PAGEWRITER_THREAD>, PAGEWRITER_THREAD, "pagewriter", "page writer" },
+    { GaussDbThreadMain<XGBEVICT_THREAD>, XGBEVICT_THREAD, "XGBEvict", "XGBoost evict" },
     { GaussDbThreadMain<PAGEREPAIR_THREAD>, PAGEREPAIR_THREAD, "pagerepair", "page repair" },
     { GaussDbThreadMain<HEARTBEAT>, HEARTBEAT, "heartbeat", "heart beat" },
     { GaussDbThreadMain<COMM_SENDERFLOWER>, COMM_SENDERFLOWER, "COMMsendflow", "communicator sender flower" },

@@ -27,7 +27,6 @@
 #include "utils/palloc.h"
 #include "ddes/dms/ss_dms_bufmgr.h"
 #include "ddes/dms/ss_common_attr.h"
-
 const int PAGE_QUEUE_SLOT_MULTI_NBUFFERS = 5;
 /*
  * Data Structures:
@@ -380,23 +379,9 @@ void LRU_init(){
         pg_atomic_init_u64(&g_buffer_write_info.total_fetch, 0);
         pg_atomic_init_u64(&g_buffer_write_info.total_miss, 0);
 
-        pg_atomic_init_u64(&g_buffer_write_info.total_data_fetch_new, 0);
-        pg_atomic_init_u64(&g_buffer_write_info.total_data_fetch_old, 0);
-        pg_atomic_init_u64(&g_buffer_write_info.total_index_fetch_new, 0);
-        pg_atomic_init_u64(&g_buffer_write_info.total_index_fetch_old, 0);
-        
-        pg_atomic_init_u64(&g_buffer_write_info.total_data_miss_new, 0);
-        pg_atomic_init_u64(&g_buffer_write_info.total_data_miss_old, 0);
-        pg_atomic_init_u64(&g_buffer_write_info.total_index_miss_new, 0);
-        pg_atomic_init_u64(&g_buffer_write_info.total_index_miss_old, 0);
-        
-        pg_atomic_init_u64(&g_buffer_write_info.total_data_flushed_new, 0);
-        pg_atomic_init_u64(&g_buffer_write_info.total_data_flushed_old, 0);
-        pg_atomic_init_u64(&g_buffer_write_info.total_index_flushed_new, 0);
-        pg_atomic_init_u64(&g_buffer_write_info.total_index_flushed_old, 0);
-
         pthread_mutex_init(&g_buffer_write_info.shadow_lru_cxt.lru_lock, NULL);
         pg_atomic_init_u32(&g_buffer_write_info.shadow_lru_cxt.free_list_idx, 0);
+        pg_atomic_init_u32(&g_buffer_write_info.global_timer, 0);
         
         /* LRU init */
         BufferDesc * head = &g_buffer_write_info.shadow_lru_cxt.lru_head;
