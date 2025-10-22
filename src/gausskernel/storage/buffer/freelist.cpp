@@ -403,85 +403,24 @@ retry:
     return NULL;
 }
 /* Nothing on the freelist, so run the "clock sweep" algorithm */
-BufferDesc* ClockSweepBufferEvict(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt){
+BufferDesc* LRUBufferEvict(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt){
     uint32 local_buf_state = 0; /* to avoid repeated (de-)referencing */
-    BufferDesc *buf = NULL;
-retry:
-    StrategyDelayStatus retry_lock_status = { 0, 0 };
-    StrategyDelayStatus retry_buf_status = { 0, 0 };
-    int try_counter;
-    int max_buffer_can_use = buffer_cxt->max_real_size;
-    try_counter = max_buffer_can_use;
-    int try_get_loc_times = max_buffer_can_use;
     pthread_mutex_lock(&buffer_cxt->tenant_buffer_lock);
+    BufferDesc* curr = &buffer_cxt->real_dummy_tail;
     for(;;){        
-        if(buffer_cxt->real_dummy_head.next == &buffer_cxt->real_dummy_tail){
-            ereport(WARNING, ((errmsg("no unpinned buffers available"))));
-            Assert(0);
-        }
-        if(buffer_cxt->sweep_hand == NULL){
-            buffer_cxt->sweep_hand = buffer_cxt->real_dummy_head.next;
-        }
-        if(buffer_cxt->sweep_hand == &buffer_cxt->real_dummy_tail){
-            buffer_cxt->sweep_hand = buffer_cxt->real_dummy_head.next;
-        }
-        buf = buffer_cxt->sweep_hand;
-        if (!retryLockBufHdr(buf, &local_buf_state)) {
-            if (--try_get_loc_times == 0) {
-                ereport(WARNING,
-                        (errmsg("try get buf headr lock times equal to maxNBufferCanUse when StrategyGetBuffer")));
-                try_get_loc_times = max_buffer_can_use;
-            }
-            perform_delay(&retry_lock_status);
-            buffer_cxt->sweep_hand = buffer_cxt->sweep_hand->next;
+        curr = curr->prev;
+        Assert(curr != &buffer_cxt->real_dummy_head);
+        if (!retryLockBufHdr(curr, &local_buf_state)) {
             continue;
         }
 
         if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0 && !(local_buf_state & BM_IS_META) &&
             (backend_can_flush_dirty_page() || !(local_buf_state & BM_DIRTY))) {
-            /* Found a usable buffer */
-            // if (strategy != NULL)
-            //     AddBufferToRing(strategy, buf);
             *buf_state = local_buf_state;
-            (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->get_buf_num_clock_sweep, 1);//? need it?
-            //ereport(WARNING, (errmsg("Buf %d is evicted by clock sweep", buf->buf_id)));
-            buffer_cxt->sweep_hand = buffer_cxt->sweep_hand->next;
             pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
-            return buf;
-        } 
-        else if (--try_counter == 0) {
-            /*
-             * We've scanned all the buffers without making any state changes,
-             * so all the buffers are pinned (or were when we looked at them).
-             * We could hope that someone will free one eventually, but it's
-             * probably better to fail than to risk getting stuck in an
-             * infinite loop.
-             */
-            UnlockBufHdr(buf, local_buf_state);
-            pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
-
-            if (u_sess->attr.attr_storage.shared_buffers_fraction < 1.0) {
-                ereport(WARNING, (errmsg("no unpinned buffers available")));
-                u_sess->attr.attr_storage.shared_buffers_fraction =
-                    Min(u_sess->attr.attr_storage.shared_buffers_fraction + 0.1, 1.0);
-                goto retry;
-            } else if (dw_page_writer_running()) {
-                ereport(WARNING, (errmsg("double writer is on, no buffer available, this buffer dirty is %u, "
-                                     "this buffer refcount is %u, now dirty page num is %ld, already flushed %ld",
-                                     (local_buf_state & BM_DIRTY), BUF_STATE_GET_REFCOUNT(local_buf_state),
-                                     get_dirty_page_num(),  
-                                     pg_atomic_read_u64(&g_instance.ckpt_cxt_ctl->page_writer_actual_flush))));
-                perform_delay(&retry_buf_status);
-                goto retry;
-            } else if (t_thrd.storage_cxt.is_btree_split) {
-                ereport(WARNING, (errmsg("no unpinned buffers available when btree insert parent")));
-                goto retry;
-            } else
-                ereport(ERROR, (errcode(ERRCODE_INVALID_BUFFER), (errmsg("no unpinned buffers available"))));
+            return curr;
         }
-        UnlockBufHdr(buf, local_buf_state);
-        perform_delay(&retry_buf_status);
-        buffer_cxt->sweep_hand = buffer_cxt->sweep_hand->next;
+        UnlockBufHdr(curr, local_buf_state);
     }
     pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
 }
@@ -523,20 +462,10 @@ BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_s
      * the rate of buffer consumption.	Note that buffers recycled by a
      * strategy object are intentionally not counted here.
      */
-    bool tempo_satisfy = false;
-    if (ENABLE_FIXED){
-        pthread_mutex_lock(&buffer_cxt->tenant_buffer_lock);
-        tempo_satisfy = buffer_cxt->curr_real_size >= buffer_cxt->max_real_size;
-        pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
-    }else{
-        pthread_mutex_lock(&buffer_cxt->tenant_buffer_lock);
-        pthread_spin_lock(&buffer_cxt->hit_stat_lock);
-        tempo_satisfy = buffer_cxt->real_misses < buffer_cxt->ref_misses &&
-        buffer_cxt->curr_real_size > buffer_cxt->max_ref_size;
-        pthread_spin_unlock(&buffer_cxt->hit_stat_lock);
-        pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
-    }
-    
+    pthread_mutex_lock(&self->tenant_buffer_lock);
+    bool meet_max = self->curr_real_size >= self->max_real_size;
+    pthread_mutex_unlock(&self->tenant_buffer_lock);
+
     (void)pg_atomic_fetch_add_u32(&t_thrd.storage_cxt.StrategyControl->numBufferAllocs, 1);
     bool take_from_free_list = false;
     if(buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt){
@@ -548,31 +477,22 @@ BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_s
         pthread_spin_unlock(&g_tenant_info.free_list_lock);
     }else{
         pthread_spin_lock(&g_tenant_info.free_list_lock);
-        pthread_spin_lock(&buffer_cxt->hit_stat_lock);
-        if(g_tenant_info.tenant_free_taken < (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE) && !tempo_satisfy){
+        if(g_tenant_info.tenant_free_taken < (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE) && !meet_max){
             g_tenant_info.tenant_free_taken++;
             take_from_free_list = true;
         }
-        pthread_spin_unlock(&buffer_cxt->hit_stat_lock);
         pthread_spin_unlock(&g_tenant_info.free_list_lock);
-    }
-    
+    }    
     if(take_from_free_list){
         /* Fetch from global free buffer pool */
         buf = GetBufFreeList(strategy, buf_state, buffer_cxt);
         if(buf != NULL){
-            pg_atomic_fetch_add_u64(&(self->pick_free_count), 1);
             return buf;
         }
     }
 EVICT:
     /* Fetch from tenant's buffer pool */
-    BufferDesc* ans =  ClockSweepBufferEvict(strategy, buf_state, buffer_cxt);
-    if(buffer_cxt == self){
-        pg_atomic_fetch_add_u64(&(self->pick_self_count), 1);
-    }else{
-        pg_atomic_fetch_add_u64(&(self->pick_other_count), 1);
-    }
+    BufferDesc* ans = LRUBufferEvict(strategy, buf_state, buffer_cxt);
     return ans;
 }
 

@@ -82,149 +82,23 @@ static void buf_push(CandidateList *list, int buf_id)
     list->cand_buf_list[tail_loc] = buf_id;
     (void)pg_atomic_fetch_add_u64(&list->tail, 1);
 }
-/* We'll do it with tenant map lock */
-tenant_buffer_cxt* GetThrdTenant(const char* name){
-    tenant_buffer_cxt* thrd_tenant = NULL;
-    bool tenant_found = false;
-    uint32 name_hash = string_hash(name, TENANT_NAME_LEN);
-    
-    pthread_mutex_lock(&g_tenant_info.tenant_map_lock);
-    tenant_name_mapping* entry = (tenant_name_mapping*)hash_search_with_hash_value((HTAB*)t_thrd.thrd_tenant_map_HTAB, name,
-    name_hash, HASH_ENTER, &tenant_found);
-    /* init entry */
-    if (!tenant_found) {
-            /* Assign new Tenant oid */
-            tenant_buffer_cxt* new_tenant = &g_tenant_info.tenant_buffer_cxt_array[g_tenant_info.tenant_num];
-            new_tenant->tenant_oid = g_tenant_info.tenant_num;
-            entry->tenant_cxt = new_tenant;
-            g_tenant_info.tenant_num++;
-            thrd_tenant = new_tenant;
-            
-            //Tenant name format: T[0-9][0-9][0-9](tenant_id) + _ + [0-9][0-9][0-9][0-9](promised_memory in MB) + _ + [0-9][0-9](SLA)
-            strcpy_s(new_tenant->tenant_name, TENANT_NAME_LEN, name);
-            uint32 tenant_id = (name[1] - '0') * 100 + (name[2] - '0') * 10 + (name[3] - '0');
-            uint32 promised_memory = (name[5] - '0') * 1000 + (name[6] - '0') * 100 + (name[7] - '0') * 10 + (name[8] - '0');
-            uint32 sla = (name[10] - '0') * 10 + (name[11] - '0');
-            uint32 ref_capacity = ( promised_memory * 1024 * 1024) / BLCKSZ;
-            g_tenant_info.total_promised += ref_capacity;
-
-            // Init basic info
-            new_tenant->sla = sla;
-
-            /* Real buffer init */
-            {
-                new_tenant->max_real_size = NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE;
-                new_tenant->curr_real_size = 0;
-                new_tenant->real_dummy_head.next = &new_tenant->real_dummy_tail;
-                new_tenant->real_dummy_head.prev = NULL;
-                new_tenant->real_dummy_tail.prev = &new_tenant->real_dummy_head;
-                new_tenant->real_dummy_tail.next = NULL;
-            }
-            /* Ref buffer init */
-            {
-                int ret = memset_s(&new_tenant->ref_hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
-                securec_check(ret, "\0", "\0");
-                new_tenant->ref_hctl.keysize = sizeof(BufferTag);//tag hash
-                new_tenant->ref_hctl.entrysize = sizeof(buffer_node);//lru node
-                new_tenant->ref_hctl.hash = tag_hash;
-                new_tenant->ref_dummy_head.next = &new_tenant->ref_dummy_tail;
-                new_tenant->ref_dummy_head.prev = NULL;
-                new_tenant->ref_dummy_tail.prev = &new_tenant->ref_dummy_head;
-                new_tenant->ref_dummy_tail.next = NULL;
-                new_tenant->max_ref_size = ref_capacity;
-                new_tenant->curr_ref_size = 0;
-            }
-
-            /* Tenant 's mutex */
-            pthread_mutex_init(&new_tenant->tenant_buffer_lock, NULL);
-            pthread_mutex_init(&new_tenant->tenant_ref_buffer_lock, NULL);
-            pthread_spin_init(&new_tenant->hit_stat_lock, NULL);
-
-        
-            ereport(WARNING,
-            (errmsg("Tenant [%s] added, Id: [%u], Promised mem: [%u mb][%u blk] , SLA: [%u]", name, tenant_id, promised_memory, ref_capacity, sla)));
-            ereport(WARNING,
-            (errmsg("Current Total Promised:[%u] Actual[%u] Active Tenant Num[%u]", g_tenant_info.total_promised, NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE, g_tenant_info.tenant_num)));
-            pthread_mutex_lock(&g_tenant_info.tenant_stat_lock);
-            {
-                uint64 total_actual = (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE);
-                uint64 total_promised = (g_tenant_info.total_promised);
-
-                
-                for(uint i = 0; i < g_tenant_info.tenant_num; ++i){
-                    /* Every time new tenant in, reset the weight */
-                    g_tenant_info.tenant_buffer_cxt_array[i].weight = 1.0 / g_tenant_info.tenant_num;
-                    if(ENABLE_FIXED){
-                        pthread_mutex_lock(&g_tenant_info.tenant_buffer_cxt_array[i].tenant_buffer_lock);
-                        g_tenant_info.tenant_buffer_cxt_array[i].max_real_size = (total_actual * g_tenant_info.tenant_buffer_cxt_array[i].max_ref_size) / total_promised;
-                        pthread_mutex_unlock(&g_tenant_info.tenant_buffer_cxt_array[i].tenant_buffer_lock);
-                        ereport(WARNING, (errmsg("Tenant[%s] Promised:[%u] Actual[%u] Active Tenant Num[%u]"
-                        , g_tenant_info.tenant_buffer_cxt_array[i].tenant_name
-                        , g_tenant_info.tenant_buffer_cxt_array[i].max_ref_size
-                        , g_tenant_info.tenant_buffer_cxt_array[i].max_real_size
-                        , g_tenant_info.tenant_num)));
-                    }
-                }
-            }
-            pthread_mutex_unlock(&g_tenant_info.tenant_stat_lock);
-    }else{
-        thrd_tenant = entry->tenant_cxt;
-    }
-    pthread_mutex_unlock(&g_tenant_info.tenant_map_lock);
-    return thrd_tenant;
-}
-void ThrdGetRefBufferIndex(tenant_buffer_cxt* buffer_cxt){
-    t_thrd.thrd_ref_HTAB = (void*)ShmemInitHash(buffer_cxt->tenant_name, 
-        buffer_cxt->max_ref_size, 
-        buffer_cxt->max_ref_size,
-        &buffer_cxt->ref_hctl, 
-        HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
-}
 void InitTenantPrivateCxt(){
     bool kill_db = false;
-    bool name_valid = u_sess && u_sess->proc_cxt.MyProcPort && u_sess->proc_cxt.MyProcPort->user_name;
-    if(name_valid){
-        name_valid = u_sess->proc_cxt.MyProcPort->user_name[0] == 't' || u_sess->proc_cxt.MyProcPort->user_name[0] == 'T';  ;
-        kill_db = u_sess->proc_cxt.MyProcPort->user_name[0] == 'e'||u_sess->proc_cxt.MyProcPort->user_name[0] == 'E';
-    }
-    if(kill_db){
-        show_tenant_status();
-        Assert(0);
+    bool is_tenant = u_sess && u_sess->proc_cxt.MyProcPort && u_sess->proc_cxt.MyProcPort->user_name;
+    if(is_tenant){
+        is_tenant = u_sess->proc_cxt.MyProcPort->user_name[0] == 't' || u_sess->proc_cxt.MyProcPort->user_name[0] == 'T';
     }
     tenant_buffer_cxt* thrd_tenant = NULL;
-    const char* curr_thrd_name = name_valid ? u_sess->proc_cxt.MyProcPort->user_name : NON_TENANT_NAME;
-    if(name_valid){
-        thrd_tenant = GetThrdTenant(curr_thrd_name);
+    const char* curr_thrd_name = is_tenant ? u_sess->proc_cxt.MyProcPort->user_name : NON_TENANT_NAME;
+    if(is_tenant){
+        uint32 tenant_id = (curr_thrd_name[1] - '0') * 100 + (curr_thrd_name[2] - '0') * 10 + (curr_thrd_name[3] - '0');
+        Assert(tenant_id < MAX_TENANT);
+        thrd_tenant = &g_tenant_info.tenant_buffer_cxt_array[tenant_id];
     }else{
         thrd_tenant = &g_tenant_info.non_tenant_buffer_cxt;
     }
     /* Attach thrd_tenant cxt */
     t_thrd.thrd_tenant_buffer_cxt = (void *)thrd_tenant;
-    /* Attach Ref buffer Hist */
-    if(name_valid){
-        ThrdGetRefBufferIndex(thrd_tenant);
-    }else{
-        t_thrd.thrd_ref_HTAB = NULL;
-    }
-}
-void InitNonTenantBuffer(){
-    bool found_descs = false;
-    tenant_name_mapping* entry = (tenant_name_mapping*)hash_search((HTAB*)t_thrd.thrd_tenant_map_HTAB, NON_TENANT_NAME, HASH_ENTER, &found_descs);
-    if(!found_descs){
-        entry->tenant_cxt = &g_tenant_info.non_tenant_buffer_cxt;
-        g_tenant_info.non_tenant_buffer_cxt.max_real_size = MINIMAL_BUFFER_SIZE;
-        g_tenant_info.non_tenant_buffer_cxt.curr_real_size = 0;
-        g_tenant_info.non_tenant_buffer_cxt.max_ref_size = MINIMAL_BUFFER_SIZE;
-        g_tenant_info.non_tenant_buffer_cxt.curr_ref_size = 0;
-        g_tenant_info.non_tenant_buffer_cxt.real_dummy_head.next = &g_tenant_info.non_tenant_buffer_cxt.real_dummy_tail;
-        g_tenant_info.non_tenant_buffer_cxt.real_dummy_head.prev = NULL;
-        g_tenant_info.non_tenant_buffer_cxt.real_dummy_tail.prev = &g_tenant_info.non_tenant_buffer_cxt.real_dummy_head;
-        g_tenant_info.non_tenant_buffer_cxt.real_dummy_tail.next = NULL;
-        /* Tenant 's mutex */
-        pthread_mutex_init(&g_tenant_info.non_tenant_buffer_cxt.tenant_buffer_lock, NULL);
-        pthread_mutex_init(&g_tenant_info.non_tenant_buffer_cxt.tenant_ref_buffer_lock, NULL);
-        pthread_spin_init(&g_tenant_info.non_tenant_buffer_cxt.hit_stat_lock, NULL);
-    }
 }
 void InitBufferPool(bool *found_descs){
     g_tenant_info.buffer_pool = (Buffer *)
@@ -239,52 +113,46 @@ void InitBufferPool(bool *found_descs){
         }
     }
 }
-static void InitTenantHist(bool first_init){
-    HASHCTL hctl1;
-    memset_s(&hctl1, sizeof(HASHCTL), 0, sizeof(HASHCTL));
-    hctl1.keysize = sizeof(BufferTag);//tag hash
-    hctl1.entrysize = sizeof(buffer_node);//lru node
-    hctl1.hash = tag_hash;
-    hctl1.num_partitions = NUM_BUFFER_PARTITIONS;
-    t_thrd.thrd_hist_HTAB = ShmemInitHash("Hist", 
-    NORMAL_SHARED_BUFFER_NUM, 
-    NORMAL_SHARED_BUFFER_NUM, 
-    &hctl1, HASH_ELEM | HASH_FUNCTION | HASH_PARTITION);
-    g_tenant_info.fifo_pool = (fifo_ele *)
-    ShmemInitStruct("FIFOHISTBuffers", NORMAL_SHARED_BUFFER_NUM * sizeof(fifo_ele), &first_init);
-    if(first_init){
-        int i = 0;
-        for(i=0 ; i < NUM_BUFFER_PARTITIONS; i++){
-            pthread_mutex_init(&g_tenant_info.lockArray[i], NULL);
-        }
-        g_tenant_info.max_hist_size = NORMAL_SHARED_BUFFER_NUM;
-        g_tenant_info.curr_hist_size = 0;
-        MemSet((char*)g_tenant_info.fifo_pool, 0, NORMAL_SHARED_BUFFER_NUM * sizeof(fifo_ele));
-        INIT_CANDIDATE_LIST(g_tenant_info.fifo_list, g_tenant_info.fifo_pool, 
-            NORMAL_SHARED_BUFFER_NUM, 0 ,0);
-    }
-}
 static void InitTenantBufferLock(bool first_init){
     if(first_init){
         pthread_spin_init(&g_tenant_info.free_list_lock, NULL);
-        pthread_mutex_init(&g_tenant_info.hist_lock, NULL);
         pthread_mutex_init(&g_tenant_info.tenant_stat_lock, NULL);
-        pthread_mutex_init(&g_tenant_info.tenant_map_lock, NULL);
     }
 }
-void InitTenantMap(){
-    HASHCTL hctl;
-    int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
-    securec_check(ret, "\0", "\0");
-    hctl.keysize = TENANT_NAME_LEN;
-    hctl.entrysize = sizeof(tenant_name_mapping); // oid
-    hctl.hash = string_hash;
-    t_thrd.thrd_tenant_map_HTAB = ShmemInitHash("tenant info hash", 
-    64, 64, &hctl, HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
+void InitAllTenant(bool is_first){
+    if(!is_first)
+        return;
+    /* Normal tenant */
+    int tenant_num = TENANT_NUM_PARAM;
+    g_tenant_info.tenant_num = TENANT_NUM_PARAM;
+    uint32 i;
+    uint32 total_buffer_num = NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE;
+    for(i = 0; i < tenant_num; i++){
+        tenant_buffer_cxt* tenant_cxt = &g_tenant_info.tenant_buffer_cxt_array[i];
+        tenant_cxt->tenant_oid = i;
+        tenant_cxt->max_real_size = total_buffer_num / tenant_num;
+        tenant_cxt->curr_real_size = 0;
+        tenant_cxt->real_dummy_head.next = &tenant_cxt->real_dummy_tail;
+        tenant_cxt->real_dummy_head.prev = NULL;
+        tenant_cxt->real_dummy_tail.prev = &tenant_cxt->real_dummy_head;
+        tenant_cxt->real_dummy_tail.next = NULL;
+        /* Tenant 's mutex */
+        pthread_mutex_init(&tenant_cxt->tenant_buffer_lock, NULL);
+        pthread_spin_init(&tenant_cxt->hit_stat_lock, NULL);
+    }
+
+    /* Non tenant */
+    g_tenant_info.non_tenant_buffer_cxt.max_real_size = MINIMAL_BUFFER_SIZE;
+    g_tenant_info.non_tenant_buffer_cxt.curr_real_size = 0;
+    g_tenant_info.non_tenant_buffer_cxt.real_dummy_head.next = &g_tenant_info.non_tenant_buffer_cxt.real_dummy_tail;
+    g_tenant_info.non_tenant_buffer_cxt.real_dummy_head.prev = NULL;
+    g_tenant_info.non_tenant_buffer_cxt.real_dummy_tail.prev = &g_tenant_info.non_tenant_buffer_cxt.real_dummy_head;
+    g_tenant_info.non_tenant_buffer_cxt.real_dummy_tail.next = NULL;
+    /* Tenant 's mutex */
+    pthread_mutex_init(&g_tenant_info.non_tenant_buffer_cxt.tenant_buffer_lock, NULL);
+    pthread_spin_init(&g_tenant_info.non_tenant_buffer_cxt.hit_stat_lock, NULL);
 }
 void InitMultiTenantBufferPool(void){
-    /* Init thread tenant map */
-    InitTenantMap();
 
     bool found_descs = false;  
     /* Free pool init */
@@ -293,37 +161,10 @@ void InitMultiTenantBufferPool(void){
     /* Lock only init once */
     InitTenantBufferLock(!found_descs);
 
-    /* Evict history list should be fifo */
-    InitTenantHist(!found_descs);
-
-    /* Non-Tenant Buffer */
-    InitNonTenantBuffer();
+    InitAllTenant(!found_descs);
 
     /* Init tenant buffer */
     InitTenantPrivateCxt();    
-}
-void InitTenantShadowBuffer(void){
-    tenant_buffer_cxt* shadow_tenant = &g_tenant_info.shadow_cxt;
-    int ret = memset_s(&shadow_tenant->ref_hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
-    securec_check(ret, "\0", "\0");
-    shadow_tenant->ref_hctl.keysize = sizeof(BufferTag);//tag hash
-    shadow_tenant->ref_hctl.entrysize = sizeof(buffer_node);//lru node
-    shadow_tenant->ref_hctl.hash = tag_hash;
-    shadow_tenant->ref_dummy_head.next = &shadow_tenant->ref_dummy_tail;
-    shadow_tenant->ref_dummy_head.prev = NULL;
-    shadow_tenant->ref_dummy_tail.prev = &shadow_tenant->ref_dummy_head;
-    shadow_tenant->ref_dummy_tail.next = NULL;
-    shadow_tenant->max_ref_size = NORMAL_SHARED_BUFFER_NUM;
-    shadow_tenant->curr_ref_size = 0;
-    pthread_mutex_init(&shadow_tenant->tenant_buffer_lock, NULL);
-    pthread_mutex_init(&shadow_tenant->tenant_ref_buffer_lock, NULL);
-    pthread_spin_init(&shadow_tenant->hit_stat_lock, NULL);
-}
-void BufWriteStatReset(BufferDesc *buf){
-    // pg_atomic_init_u32(&buf->write_count, 0);
-    // pg_atomic_init_u32(&buf->flush_count, 0);
-    // pg_atomic_init_u64(&buf->pre_flush_ts, 0);
-    // pg_atomic_init_u64(&buf->pre_write_ts, 0);
 }
 void TWB_init(){
     bool first;
@@ -393,6 +234,29 @@ void LRU_init(){
         tail->next = NULL;
         
 }
+void AccessHistoryInit(){
+    bool first;
+    g_access_history.cand_buf_list = (BufferMeta *)CACHELINEALIGN(
+    ShmemInitStruct("Access History List", NORMAL_SHARED_BUFFER_NUM * sizeof(BufferMeta), &first));
+    int i = 0;
+    for(i; i < NUM_BUFFER_PARTITIONS; i++){
+        pthread_mutex_init(&g_access_history.lockArray[i], NULL);
+    }
+    g_access_history.cand_list_size = NORMAL_SHARED_BUFFER_NUM;
+    g_access_history.head = 0;
+    g_access_history.tail = 0;
+    MemSet((char*)g_access_history.cand_buf_list, 0, NORMAL_SHARED_BUFFER_NUM * sizeof(BufferMeta));
+
+    HASHCTL hctl;
+    int ret = memset_s(&hctl, sizeof(HASHCTL), 0, sizeof(HASHCTL));
+    securec_check(ret, "\0", "\0");
+    hctl.keysize = sizeof(BufferTag);//tag hash
+    hctl.entrysize = sizeof(BufferMeta); // oid
+    hctl.hash = tag_hash;
+    hctl.num_partitions = NUM_BUFFER_PARTITIONS;
+    g_access_history.access_hist = ShmemInitHash("access history hash",
+    NORMAL_SHARED_BUFFER_NUM, NORMAL_SHARED_BUFFER_NUM, &hctl, HASH_ELEM | HASH_FUNCTION | HASH_PARTITION);
+}
 void InitBufferPool(void)
 {
     bool found_bufs = false;
@@ -413,12 +277,10 @@ void InitBufferPool(void)
                         &found_buf_extra));
     if(!found_descs && ENABLE_LRU)
         LRU_init();
-
-    if(!found_descs && ENABLE_TWB)
-        TWB_init();
-
-    if(!found_descs && ENABLE_LRUC)
-        LRUC_init();
+    
+    if(!found_descs){
+        AccessHistoryInit();
+    }
 
     if(ENABLE_MULTI_TENANTCY){
         /* We make sure this won't exec twice */
@@ -522,11 +384,10 @@ void InitBufferPool(void)
             buf->prev = NULL;
             buf->next = NULL;
             buf->tenantOid = UINT32_MAX;
-            pg_atomic_write_u32(&buf->flush_state, 0);
-            if(ENABLE_TWB && (buf->buf_id >= NORMAL_SHARED_BUFFER_NUM - TWB_SIZE)) {
-                pg_atomic_write_u32(&buf->flush_state, TWB_CANDIDATE);
-            }
-            BufWriteStatReset(buf);
+            // buf->extra->meta.sample_time = 0;
+            // buf->extra->meta.access_count = 0;
+            // buf->extra->meta.id = i;
+            // buf->extra->meta.link = NULL;
         }
         g_instance.bgwriter_cxt.rel_hashtbl_lock = LWLockAssign(LWTRANCHE_UNLINK_REL_TBL);
         g_instance.bgwriter_cxt.rel_one_fork_hashtbl_lock = LWLockAssign(LWTRANCHE_UNLINK_REL_FORK_TBL);
@@ -588,7 +449,9 @@ Size BufferShmemSize(void)
 
     size = add_size(size, mul_size(EXTRA_MEM_FACTOR * TOTAL_BUFFER_NUM + TWB_SIZE, sizeof(buffer_node)));
 
-    size = add_size(size, mul_size(TOTAL_BUFFER_NUM + TWB_SIZE, sizeof(fifo_ele)));
+    size = add_size(size, mul_size(2 * TOTAL_BUFFER_NUM, sizeof(BufferMeta)));
+
+    size = add_size(size, hash_estimate_size(2 * TOTAL_BUFFER_NUM, sizeof(BufferMeta)));
 
     /* size of dms buf ctrl and buffer align */
     if (ENABLE_DMS) {

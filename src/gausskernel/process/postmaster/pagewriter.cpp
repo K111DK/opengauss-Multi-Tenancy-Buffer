@@ -2764,7 +2764,7 @@ EXIT:
     }
     pg_atomic_add_fetch_u64(&g_buffer_write_info.bg_flushed, need_flush_num);
     if(thread_id == 1){
-        show_flush_and_fetch_stat();
+        //show_flush_and_fetch_stat();
         if(ENABLE_BUFFER_TYPE_SCAN)
             GetBufferSnapshot();
     }

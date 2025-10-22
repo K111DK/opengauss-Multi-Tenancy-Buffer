@@ -3515,9 +3515,6 @@ typedef struct knl_thrd_context {
     knl_t_rc_context rc_cxt;
 
 
-    void * thrd_ref_HTAB;
-    void * thrd_hist_HTAB;
-    void * thrd_tenant_map_HTAB;
     void * thrd_tenant_buffer_cxt;
     
     bool is_index;

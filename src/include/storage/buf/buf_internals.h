@@ -191,6 +191,27 @@ typedef struct {
  * We use this same struct for local buffer headers, but the lock fields
  * are not used and not all of the flag bits are useful either.
  */
+/* BufferMeta -- metadata for a buffer */
+#define MAX_ACCESS_HISTORY 4
+typedef struct BufferMeta {
+    /* access hist  makesure tag on top */
+    BufferTag tag;
+    Buffer id;
+    uint32 hashcode;
+    uint32 tenant_oid;
+    bool is_dirty;
+    pg_atomic_uint32 pre_access_self;
+    pg_atomic_uint32 pre_access_global;
+    void* link;
+} BufferMeta;
+#define TENANT_NUM 8
+typedef struct ShemmCxt{
+    float tenant_fetures[TENANT_NUM][3];//cache size(float)  hit ratio(float)  traffic(float)
+    int db_ready;
+    float tenant_partitions[TENANT_NUM];
+    float reward;
+    int rl_ready;
+} ShemmCxt;
 typedef struct BufferDescExtra {
     /* Cached physical location for segment-page storage, used for xlog */
     uint8 seg_fileno;
@@ -204,6 +225,7 @@ typedef struct BufferDescExtra {
     volatile uint64 lsn_on_disk;
 
     volatile bool aio_in_progress; /* indicate aio is in progress */
+    BufferMeta meta;
 } BufferDescExtra;
 #define TWB_CANDIDATE 1U
 #define TWB_BUFFERED (1U << 1)
@@ -226,12 +248,7 @@ typedef struct BufferDesc {
     struct BufferDesc* next; /* link in freelist of buffers */
     struct BufferDesc* prev;
     uint32 tenantOid;
-    pg_atomic_uint32 accessLog[8];
-    pg_atomic_uint32 writeLog[4];
-    pg_atomic_uint32 accessHead, writeHead;
     pg_atomic_uint32 flush_state;
-    pg_atomic_uint32 access_count;
-    pg_atomic_uint32 write_count;
 #ifdef USE_ASSERT_CHECKING
     volatile uint64 lsn_dirty;
 #endif
@@ -387,6 +404,7 @@ extern void LocalBufferFlushAllBuffer();
 #define ENABLE_HIST (g_instance.attr.attr_storage.enable_hist)
 #define EXTRA_MEM_FACTOR (g_instance.attr.attr_storage.extra_mem_factor)
 #define ENABLE_LOG (g_instance.attr.attr_storage.enable_log)
+#define TENANT_NUM_PARAM (g_instance.attr.attr_storage.max_tenant)
 #define MULTITENANT_RESET_ENABLE 1
 #define HIT_IN_HIST -2
 #define TENANT_NAME_LEN 32
@@ -409,16 +427,6 @@ typedef struct tenant_buffer_cxt{
     //key
     char tenant_name[TENANT_NAME_LEN];
     
-    //ref buffer cxt
-    pthread_mutex_t tenant_ref_buffer_lock;
-    buffer_node ref_dummy_head;
-    buffer_node ref_dummy_tail;
-    uint64 max_ref_size{0};
-    uint64 curr_ref_size{0};
-    /* ref buffer HTAB init */
-    HASHCTL ref_hctl;
-    
-
     //real buffer cxt
     pthread_mutex_t tenant_buffer_lock;
     BufferDesc real_dummy_head;
@@ -427,61 +435,23 @@ typedef struct tenant_buffer_cxt{
     uint64 curr_real_size{0};
     uint64 max_real_size{0};
 
-
     //Buffer hit stat lock
     pthread_spinlock_t hit_stat_lock;
-    uint64 real_hits{0};
-    uint64 real_misses{0};
-    uint64 ref_hits{0};
-    uint64 ref_misses{0};
-
-
+    pg_atomic_uint32 real_hits{0};
+    pg_atomic_uint32 real_miss{0};
+    pg_atomic_uint32 traffic{0};
+    pg_atomic_uint32 over_max{0};
+    float traffic_radio;
+    pg_atomic_uint32 rehit_traffic{0};
+    pg_atomic_uint32 rehit_dirty{0};
+    pg_atomic_uint32 rehit_precentil_total{0};
+    pg_atomic_uint32 rehit_precentil_total_dirty{0};
     /* Multi Tenant info */ 
-    uint32 sla;
     uint32 tenant_oid;
-    double weight{1.0};
-    
-    /* Other static */
-    pg_atomic_uint64 reweight_count{0};
-    pg_atomic_uint64 pick_free_count{0};
-    pg_atomic_uint64 pick_self_count{0};
-    pg_atomic_uint64 pick_other_count{0};
 } tenant_buffer_cxt;
-typedef struct tenant_name_mapping{
-    //key
-    char tenant_name[TENANT_NAME_LEN];
-    //oid
-    tenant_buffer_cxt* tenant_cxt;
-}tenant_name_mapping;
-
-typedef struct fifo_ele {
-    uint32 hashcode;
-    BufferTag tag; /* ID of page contained in buffer */
-}fifo_ele;
-
-typedef struct FIFO_queue {
-    fifo_ele *cand_buf_list;
-    volatile int cand_list_size;
-    pg_atomic_uint64 head;
-    pg_atomic_uint64 tail;
-    volatile int buf_id_start;
-    int32 next_scan_loc;
-    int32 next_scan_ratio_loc;
-} FIFO_queue;
-
-
 typedef struct tenant_info{   
-
     /* History list */
     pthread_mutex_t lockArray[NUM_BUFFER_PARTITIONS];
-    fifo_ele* fifo_pool;
-    FIFO_queue fifo_list;
-    pthread_mutex_t hist_lock;
-    buffer_node hist_dummy_head;
-    buffer_node hist_dummy_tail;
-    uint64 max_hist_size;
-    uint64 curr_hist_size;
-
 
     /* Free list */
     pthread_spinlock_t free_list_lock;
@@ -490,10 +460,6 @@ typedef struct tenant_info{
     /* <= NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_NUM*/
     uint64 tenant_free_taken{0};
     uint64 non_tenant_free_taken{0};
-
-    /* Tenant map lock */
-    pthread_mutex_t tenant_map_lock;
-    struct HTAB* tenant_map;// tenant name -> tenant_buffer_cxt
     
     /* Back up buffer*/
     tenant_buffer_cxt non_tenant_buffer_cxt;
@@ -503,12 +469,14 @@ typedef struct tenant_info{
     tenant_buffer_cxt tenant_buffer_cxt_array[MAX_TENANT];
     uint32 tenant_num{0};
 
-    /* Update count */
+    pg_atomic_uint32 adjust_done{1u};
+    pg_atomic_uint32 total_traffic{0};
+    pg_atomic_uint32 candidate_idx;
+    pg_atomic_uint32 hit_traffic{0};
+    pg_atomic_uint32 stall_traffic{0};
+    pg_atomic_uint32 rehit_traffic{0};
+    uint32 candidate_tenant[MAX_TENANT];
     pg_atomic_uint64 update_count{0};
-    uint64 total_promised{0};
-    
-    /* For cost test */
-    tenant_buffer_cxt shadow_cxt;
 } tenant_info;
 
 
@@ -537,6 +505,18 @@ typedef struct TWB {
 
 }TWB;
 
+
+typedef struct AccessHistory{
+    /* History list */
+    pthread_mutex_t lockArray[NUM_BUFFER_PARTITIONS];
+    BufferMeta *cand_buf_list;
+    volatile int cand_list_size;
+    pg_atomic_uint64 head;
+    pg_atomic_uint64 tail;
+    HTAB * access_hist;
+    pg_atomic_uint64 head_ts{0};
+} AccessHistory;
+extern AccessHistory g_access_history;
 #define ENABLE_LEAF_QUICK_EVICT (g_instance.attr.attr_storage.enable_leaf_quick_evict)
 #define ENABLE_LRUC (g_instance.attr.attr_storage.enable_lruc)
 #define ENABLE_TAIL_SCAN (g_instance.attr.attr_storage.enable_tail_scan)
@@ -607,10 +587,8 @@ extern TWB g_twb_info;
 extern LRUC g_lruc_info;
 extern BufferDesc *TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt);
 extern void show_tenant_status();
-double GetTenantHRD(tenant_buffer_cxt* buffer_cxt);
 extern void XGB_evictor_main();
 /* new */
 extern void ThrdGetRefBufferIndex(tenant_buffer_cxt* buffer_cxt);
 extern bool UpdateRefBuffer(uint32 access_hash, BufferTag *access_tag);
-extern void BufWriteStatReset(BufferDesc *buf);
 #endif /* BUFMGR_INTERNALS_H */

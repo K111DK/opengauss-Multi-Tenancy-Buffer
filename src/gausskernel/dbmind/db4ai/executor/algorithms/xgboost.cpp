@@ -836,125 +836,265 @@ XGBoost xg_reg_gamma = {
         xgboost_explain
     },
 };
-static Model* testTrain(){
-    /* XGoost DMatrix handle */
-    load_xgboost_library();
-    xg_data_t chunk; /* chunk of data */
-    uint32 batch_size = 64;
-    chunk.lb_rows = batch_size; /* 64 per batch */
-    chunk.ft_rows = chunk.lb_rows;
-    chunk.ft_cols = 10;
-    setup_xg_chunk<true>(chunk);
-    DMatrixHandle dtrain, dtest;
+// static const int sample_list_size=65536;
+// static BufferMeta sample_list[65536];
+// static pg_atomic_uint32 sample_head;
+// static pg_atomic_uint32 sample_tail;
+// static HyperparamsXGBoost xgb_param;
+// static xg_data_t xgb_train_chunk;
+// static xg_data_t xgb_predict_chunk;
+// static uint32 batch_size = 10240;
+// static pg_atomic_uint32 total_batch;
+// pg_atomic_uint32 max_reuse_time;
+// static const char* eval_names[2] = {"train", "test"};
+// static const char* eval_result = nullptr;
+struct PGPROC* xgb_proc = nullptr;
+// static pg_atomic_uint32 is_training;
+// extern bool sample_push(BufferMeta *meta){
+//     if(pg_atomic_read_u32(&is_training) == 1)
+//         return false;
+//     pg_memory_barrier();
+//     BufferMeta copy = *meta;
+//     pg_memory_barrier();
+//     if(copy.sample_time < copy.accessLog[copy.accessHead])
+//         return false;
+//     if(copy.visit_ts < copy.sample_time)
+//         return false;
+//     volatile uint32 head = pg_atomic_read_u32(&sample_head);
+//     pg_memory_barrier();
+//     volatile uint32 tail = pg_atomic_add_fetch_u32(&sample_tail, 1);
+//     if (unlikely(tail - head >= sample_list_size)) {
+//         pg_atomic_sub_fetch_u32(&sample_tail, 1);
+//         /* buffer full wake learner up */
+//         pg_atomic_write_u32(&is_training, 1);
+//         if(xgb_proc)
+//             SetLatch(&xgb_proc->procLatch);
+//         return false;
+//     }
+//     pg_memory_barrier();
+//     uint32 tail_loc = tail % sample_list_size;
+//     g_access_history.cand_buf_list[tail_loc] = copy;
+//     pg_memory_barrier();
+//     return true;
+// }
+// static bool sample_pop(BufferMeta* meta){
+//     uint32 head_loc;
+//     while (true) {
+//         pg_memory_barrier();
+//         uint32 head = pg_atomic_read_u32(&sample_head);
+//         pg_memory_barrier();
+//         volatile uint32 tail = pg_atomic_read_u32(&sample_tail);
+//         if (unlikely(head >= tail)) {
+//             return false;       /* candidate list is empty */
+//         }
+//         head_loc = head % sample_list_size;
+//         *meta = g_access_history.cand_buf_list[head_loc];
+//         /* It's ok to do CAS here since only one consumer */
+//         if (pg_atomic_compare_exchange_u32(&sample_head, &head, head + 1)) {
+//             return true;
+//         }
+//     }
+// }
+// extern void XGB_init(){
+//     /* init xgboost */
+//     xgb_param.n_iterations = 16;
+//     xgb_param.batch_size = batch_size;
+//     xgb_param.nthread = 8;
+//     xgb_param.seed = 0.8;
+//     xgb_param.min_child_weight = 1;
+//     xgb_param.max_depth = 6;
+//     xgb_param.eval_metric = xgboost_eval_metric_str[0]; // rmse
 
-    /* load DTrain matrix */
-    safe_xgboost(g_xgboostApi->XGDMatrixCreateFromMat((float *)chunk.features,  // input data
-                                        batch_size,                  // # rows
-                                        chunk.ft_cols,            // # columns in the input
-                                        -1,                        // filler for missing values
-                                        &dtrain));                 // handle of the DMatrix
+//     /* chunk init */
+//     xgb_train_chunk.lb_rows = xgb_param.batch_size; /* 64 per batch */
+//     xgb_train_chunk.ft_rows = xgb_train_chunk.lb_rows;
+//     xgb_train_chunk.ft_cols = (MAX_ACCESS_HISTORY - 1) + 2; // 8 history => ( 6 + 1(predicted) ) interval + 1 access_cnt  
+//     xgb_predict_chunk.lb_rows = xgb_param.batch_size; /* 64 per batch */
+//     xgb_predict_chunk.ft_rows = xgb_predict_chunk.lb_rows;
+//     xgb_predict_chunk.ft_cols = (MAX_ACCESS_HISTORY - 1) + 2;
+//     setup_xg_chunk<true>(xgb_predict_chunk);
+//     setup_xg_chunk<true>(xgb_train_chunk);
 
-    /* load DTest matrix */
-    safe_xgboost(g_xgboostApi->XGDMatrixCreateFromMat((float *)chunk.features, batch_size, chunk.ft_cols, -1, &dtest));
+//     /* Init shit */
+//     pg_atomic_init_u32(&sample_head, 0);
+//     pg_atomic_init_u32(&sample_tail, 0);
 
-    /* load the labels */
-    safe_xgboost(g_xgboostApi->XGDMatrixSetFloatInfo(dtrain, "label", chunk.labels, batch_size));
-    safe_xgboost(g_xgboostApi->XGDMatrixSetFloatInfo(dtest, "label", chunk.labels, batch_size));
+//     /* Init proc pointer */
+//     xgb_proc = t_thrd.proc;
 
-    DMatrixHandle eval_dmats[2] = {dtrain, dtest};
+//     /* Init max reuse time */
+//     pg_atomic_init_u32(&max_reuse_time, 0);
+//     pg_atomic_init_u32(&is_training, 0);
+// }
+// /* feature */
+// /* /time since last access/ (n+1 ts)n interval/access_cnt/ */
+// /* label */
+// /* visit_ts - sample_ts */
+// static uint32 collect_samples(){
+//     BufferMeta meta;
+//     int curr_row = 0;
+//     uint32 pos;
+//     uint32 future_interval = 0;
+//     uint32 pre_interval;
+//     uint32 currentIndex;
+//     uint32 previousIndex; 
+//     uint32 currentTime; 
+//     uint32 previousTime;
+//     uint32 interval;
+//     while(sample_pop(&meta) && curr_row < batch_size){
 
-    /* create the booster and load the desired parameters */
-    BoosterHandle booster;
-    HyperparamsXGBoost* g_param = reinterpret_cast<HyperparamsXGBoost *>(palloc0(sizeof(HyperparamsXGBoost)));
-    g_param->n_iterations = 10;
-    g_param->batch_size = batch_size;
-    g_param->max_depth = 4;
-    g_param->min_child_weight = 1;
-    g_param->nthread = 8;
-    g_param->seed = 0.8;
-    g_param->eval_metric = xgboost_eval_metric_str[2]; // rmse
-    AlgorithmAPI *algo = get_algorithm_api(XG_REG_SQE);
-    safe_xgboost(g_xgboostApi->XGBoosterCreate(eval_dmats, 2, &booster));
-    set_hyperparams(algo, g_param, booster);
-        /* evaluation structures */
-    const char* eval_names[2] = {"train", "test"};
-    const char* eval_result = nullptr;
+//         while(unlikely(meta.accessLog[meta.accessHead]<meta.accessLog[(meta.accessHead + 1) % MAX_ACCESS_HISTORY]))
+//             meta.accessHead = (meta.accessHead + 1) % MAX_ACCESS_HISTORY;
+        
+//         /* Future Interval */
+//         if(meta.visit_ts < meta.sample_time){
+//             //ereport(WARNING, (errmsg("visi_ts < sample")));
+//             continue;
+//         }
+//         future_interval = meta.visit_ts - meta.sample_time;
+//         /* Update max reuse time */
+//         pg_atomic_write_u32(&max_reuse_time, Max(pg_atomic_read_u32(&max_reuse_time), future_interval));
+        
+//         /* Time since pre access */
+//         if(meta.sample_time < meta.accessLog[meta.accessHead]){
+//             // meta.accessHead = (meta.accessHead - 1 + MAX_ACCESS_HISTORY) % MAX_ACCESS_HISTORY;
+//             // if(meta.sample_time < meta.accessLog[meta.accessHead]){
+//             //     ereport(WARNING, (errmsg("sample < head & head - 1")));
+//             continue;
+//             // }
+//         }
+//         pre_interval = meta.sample_time - meta.accessLog[meta.accessHead];
+        
+//         /* Label: reuse dist */
+//         xgb_train_chunk.labels[curr_row] = static_cast<float>(future_interval);
 
-    for (uint32_t iter = 0; iter < g_param->n_iterations; ++iter) {
-        safe_xgboost(g_xgboostApi->XGBoosterUpdateOneIter(booster, iter, dtrain));
-        safe_xgboost(g_xgboostApi->XGBoosterEvalOneIter(booster, iter, eval_dmats, eval_names, 2, &eval_result));
-    }
+//         /* First feature: */
+//         *(xgb_train_chunk.features + curr_row * xgb_train_chunk.ft_cols)
+//                     = static_cast<float>(pre_interval);
+        
+//         /* Second feature */
+//         *(xgb_train_chunk.features + curr_row * xgb_train_chunk.ft_cols + 1)
+//                     = static_cast<float>(meta.access_count);      
 
-    /* get evaluation results */
-    chunk.validation_score = parseDoubleFromErrMetric(eval_result);
-    uint64_t raw_model_len;
-    char *raw_model;
-    safe_xgboost(g_xgboostApi->XGBoosterSerializeToBuffer(booster, &raw_model_len, (const char **)&raw_model));
-    chunk.set_raw_model(raw_model, raw_model_len);
-    /* free xgboost structures */
-    safe_xgboost(g_xgboostApi->XGDMatrixFree(dtrain));
-    safe_xgboost(g_xgboostApi->XGDMatrixFree(dtest));
-    safe_xgboost(g_xgboostApi->XGBoosterFree(booster));
+//         /* 7 interval */
+//         for (uint32 i = 0; i < MAX_ACCESS_HISTORY - 1; i++) {
+//             uint32 currentIndex = (meta.accessHead - i + MAX_ACCESS_HISTORY) % MAX_ACCESS_HISTORY;
+//             uint32 previousIndex = (meta.accessHead - i + MAX_ACCESS_HISTORY-1) % MAX_ACCESS_HISTORY;
+//             uint32 currentTime = meta.accessLog[currentIndex];
+//             uint32 previousTime = meta.accessLog[previousIndex];
+//             Assert(currentTime >= previousTime);
+//             uint32 interval = currentTime - previousTime;
+//             // 存储间隔到data数组中
+//             if(interval == 0)
+//                 continue;
+//             *(xgb_train_chunk.features + curr_row * xgb_train_chunk.ft_cols + i + 2) 
+//             = static_cast<float>(interval);
+//         }
+        
+//         curr_row++;
+//     }
+//     return curr_row;
+// }
+// /* test xgboost */
+// static void BatchTrain(xg_data_t* chunk, int n_rows, const HyperparamsXGBoost* param, bool first_call){
+//     /* XBoost DMatrix handle */
+//     load_xgboost_library();
+//     DMatrixHandle dtrain, dtest;
 
-    Model *model = (Model *)palloc0(sizeof(Model));
-    model->memory_context = CurrentMemoryContext;
-    model->algorithm = algo->algorithm;
-    model->model_name = "MY_XGBOOST_MODEL";
-    model->data.version = DB4AI_MODEL_V01;
-    xgboost_serialize(&model->data, &chunk);
-    model->return_type = FLOAT8OID;
-    TrainingScore* pscore = (TrainingScore*)palloc0(sizeof(TrainingScore));
-    pscore->name = g_param->eval_metric;
-    pscore->value = chunk.validation_score;
-    model->scores = lappend(model->scores, pscore);
-    model->status = ERRCODE_SUCCESSFUL_COMPLETION;
-    return model;
-}
-static void testPredict(Model* model, int ncolumns, int nrows){
+//     /* load DTrain matrix */
+//     safe_xgboost(g_xgboostApi->XGDMatrixCreateFromMat((float *)chunk->features,  // input data
+//                                         n_rows,                  // # rows
+//                                         chunk->ft_cols,            // # columns in the input
+//                                         -1,                        // filler for missing values
+//                                         &dtrain));                 // handle of the DMatrix
 
-    SerializedModelXgboost *xgboostm = (SerializedModelXgboost *)xgboost_predict_prepare(nullptr, &model->data, FLOAT8OID);
+//     /* load DTest matrix */
+//     safe_xgboost(g_xgboostApi->XGDMatrixCreateFromMat((float *)chunk->features, 
+//                                         n_rows, 
+//                                         chunk->ft_cols, 
+//                                         -1, 
+//                                         &dtest));
 
-    /* init XGBoost predictor */
-    safe_xgboost(g_xgboostApi->XGBoosterCreate(nullptr, 0, &xgboostm->booster));
-    /* load the decoded model */
-    safe_xgboost(g_xgboostApi->XGBoosterUnserializeFromBuffer(xgboostm->booster, xgboostm->model->raw_data, xgboostm->model->size));
-    /* sanity checks */
-    Assert(xgboostm->booster != nullptr);
-    if (ncolumns != xgboostm->ft_cols)
-        ereport(ERROR, (errmodule(MOD_DB4AI),
-            errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-            errmsg("Invalid number of features for prediction, provided %d, expected %d",
-                ncolumns, xgboostm->ft_cols)));
+//     /* load the labels */
+//     safe_xgboost(g_xgboostApi->XGDMatrixSetFloatInfo(dtrain, "label", chunk->labels, n_rows));
+//     safe_xgboost(g_xgboostApi->XGDMatrixSetFloatInfo(dtest, "label", chunk->labels, n_rows));
 
-    load_xgboost_library();
+//     DMatrixHandle eval_dmats[2] = {dtrain, dtest};
 
-    float features[nrows][ncolumns];
-    // for (int col = 0; col < ncolumns; ++col)
-    //     features[col] = isnull[col] ? 0.0 : datum_get_float8(types[col], values[col]);
+//     /* create the booster and load the desired parameters */
+//     BoosterHandle booster;
+//     AlgorithmAPI *algo = get_algorithm_api(XG_REG_SQE);
+//     safe_xgboost(g_xgboostApi->XGBoosterCreate(eval_dmats, 2, &booster));
+    
+//     if (!first_call) {
+//         safe_xgboost(g_xgboostApi->XGBoosterUnserializeFromBuffer(booster, chunk->raw_model, chunk->raw_model_size));
+//     } else {
+//         set_hyperparams(algo, param, booster);
+//     }
+    
+//     /* evaluation structures */
+//     const char* eval_names[2] = {"train", "test"};
+//     const char* eval_result = nullptr;
 
-    DMatrixHandle dmat;
-    /* convert to DMatrix */
-    safe_xgboost(g_xgboostApi->XGDMatrixCreateFromMat((float *) features, nrows, ncolumns, -1, &dmat));
+//     for (uint32_t iter = 0; iter < param->n_iterations; ++iter) {
+//         safe_xgboost(g_xgboostApi->XGBoosterUpdateOneIter(booster, iter, dtrain));
+//         safe_xgboost(g_xgboostApi->XGBoosterEvalOneIter(booster, iter, eval_dmats, eval_names, 2, &eval_result));
+//     }
 
-    bst_ulong out_len;
-    const float *out_result;
-    safe_xgboost(g_xgboostApi->XGBoosterPredict(xgboostm->booster, dmat, 0, 0, 0, &out_len, &out_result));
+//     /* get evaluation results */
+//     chunk->validation_score = parseDoubleFromErrMetric(eval_result);
+//     uint64_t raw_model_len;
+//     char *raw_model;
+//     safe_xgboost(g_xgboostApi->XGBoosterSerializeToBuffer(booster, &raw_model_len, (const char **)&raw_model));
+//     chunk->set_raw_model(raw_model, raw_model_len);
+    
+//     /* free xgboost structures */
+//     safe_xgboost(g_xgboostApi->XGDMatrixFree(dtrain));
+//     safe_xgboost(g_xgboostApi->XGDMatrixFree(dtest));
+//     safe_xgboost(g_xgboostApi->XGBoosterFree(booster));
+// }
+// extern void trainBatch(){
+//     setup_xg_chunk(xgb_train_chunk);
+//     uint32 nrows = collect_samples();
+//     if(nrows){
+//         uint32 curr_batch = pg_atomic_fetch_add_u32(&total_batch, 1);
+//         clock_gettime(CLOCK_MONOTONIC, &exec_start_time);
+//         BatchTrain(&xgb_train_chunk, nrows,  &xgb_param, (curr_batch == 0u));
+//         clock_gettime(CLOCK_MONOTONIC, &exec_end_time);
+//         double execution_time = interval_to_sec(time_diff(&exec_end_time, &exec_start_time));
+//         double loss = xgb_train_chunk.validation_score;
+//         ereport(WARNING, (errmsg("XGB Training Item/Batch:[%u/%u] Iter[%u] Loss[%.4f] Time[%.4fsec]",
+//                                 nrows,
+//                                 curr_batch,
+//                                 xgb_param.n_iterations,
+//                                 loss,
+//                                 execution_time)));
+//     }
+//     pg_atomic_write_u32(&is_training, 0);
+// }
+// static void testPredict(Model* model, int ncolumns, int nrows){
 
-    /* release memory of xgboost dmatrix structure */
-    safe_xgboost(g_xgboostApi->XGDMatrixFree(dmat));
-    safe_xgboost(g_xgboostApi->XGBoosterFree(xgboostm->booster));
-    return;
-}
-/* test xgboost */
-extern void testXGB(){
-    Model* model = testTrain();
-    testPredict(model, 10, 5);
-    // model_store(model);
-    // pfree(model);
-    // Model *new_model = const_cast<Model *>(model_load("MY_XGBOOST_MODEL"));
-    // if (new_model == nullptr or new_model->status != ERRCODE_SUCCESSFUL_COMPLETION) {
-    //     ereport(ERROR, (errmodule(MOD_DB4AI), errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-    //             errmsg("load model failed")));
-    // }
-    // testPredict(new_model, 10, 5);
-}
+//     BoosterHandle booster;
+//     /* init XGBoost predictor */
+//     safe_xgboost(g_xgboostApi->XGBoosterCreate(nullptr, 0, &booster));
+//     /* load the decoded model */
+//     safe_xgboost(g_xgboostApi->XGBoosterUnserializeFromBuffer(booster, xgb_train_chunk.raw_model, xgb_train_chunk.raw_model_size));
+//     /* sanity checks */
+//     Assert(booster != nullptr);
+//     load_xgboost_library();
+
+//     //float features[nrows][ncolumns];
+
+//     DMatrixHandle dmat;
+//     /* convert to DMatrix */
+//     safe_xgboost(g_xgboostApi->XGDMatrixCreateFromMat((float *) features, nrows, ncolumns, -1, &dmat));
+
+//     bst_ulong out_len;
+//     const float *out_result;
+//     safe_xgboost(g_xgboostApi->XGBoosterPredict(xgboostm->booster, dmat, 0, 0, 0, &out_len, &out_result));
+
+//     /* release memory of xgboost dmatrix structure */
+//     safe_xgboost(g_xgboostApi->XGDMatrixFree(dmat));
+//     safe_xgboost(g_xgboostApi->XGBoosterFree(xgboostm->booster));
+//     return;
+// }

@@ -38,5 +38,10 @@ extern XGBoost xg_reg_logistic;
 extern XGBoost xg_bin_logistic;
 extern XGBoost xg_reg_sqe;
 extern XGBoost xg_reg_gamma;
-extern void testXGB();
+// extern void XGB_init();
+// extern void trainBatch();
+// extern void predictBatch();
+// extern bool sample_push(BufferMeta *meta);
+extern struct PGPROC* xgb_proc;
+// extern pg_atomic_uint32 max_reuse_time;
 #endif 

@@ -6909,7 +6909,7 @@ static void reaper(SIGNAL_ARGS)
                 }
             }
             if (g_instance.pid_cxt.XGBEvictPID == 0 && !dummyStandbyMode)
-                g_instance.pid_cxt.XGBEvictPID = initialize_util_thread(XGBOOST_EVICT);
+                g_instance.pid_cxt.XGBEvictPID = initialize_util_thread(XGBEVICT_THREAD);
 
             if (g_instance.pid_cxt.WalWriterPID == 0)
                 g_instance.pid_cxt.WalWriterPID = initialize_util_thread(WALWRITER);

@@ -93,6 +93,13 @@
 #include "db4ai/predict_by.h"
 #include "db4ai/db4ai_common.h"
 #include "db4ai/db4ai_api.h"
+#include "utils/dynahash.h"
+TWB g_twb_info;
+LRUC g_lruc_info;
+tenant_info g_tenant_info;
+buffer_write_info g_buffer_write_info;
+THR_LOCAL miss_info g_miss_info;
+AccessHistory g_access_history;
 const int ONE_MILLISECOND = 1;
 const int TEN_MICROSECOND = 10;
 const int MILLISECOND_TO_MICROSECOND = 1000;
@@ -140,66 +147,68 @@ static Buffer ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumb
 static void TerminateBufferIO_common(BufferDesc *buf, bool clear_dirty, uint32 set_flag_bits);
 static Buffer ReadBuffer_common_warp(Relation reln, SMgrRelation smgr, char relpersistence, ForkNumber forkNum, BlockNumber blockNum,
                                 ReadBufferMode mode, BufferAccessStrategy strategy, bool *hit, const XLogPhyBlock *pblk);
-/**
- * @Description: Push buffer bufId to thread threadId's candidate list.
- * @in: buf_id, buffer id which need push to the list
- * @in: thread_id, pagewriter thread id../conf
- */
-static bool candidate_buf_push_twb(CandidateList *list, int buf_id)
-{
-    uint32 list_size = list->cand_list_size;
-    uint32 tail_loc;
-
-    pg_memory_barrier();
-    volatile uint64 head = pg_atomic_read_u64(&list->head);
-    pg_memory_barrier();
-    volatile uint64 tail = pg_atomic_read_u64(&list->tail);
-
-    if (unlikely(tail - head >= list_size)) {
-        return false;
-    }
-    tail_loc = tail % list_size;
-    list->cand_buf_list[tail_loc] = buf_id;
-    (void)pg_atomic_fetch_add_u64(&list->tail, 1);
-    return true;
-}
-
-/**
- * @Description: Pop a buffer from the head of thread threadId's candidate list and store the buffer in buf_id.
- * @in: buf_id, store the buffer id from the list.
- * @in: thread_id, pagewriter thread id
- */
-bool candidate_buf_pop_twb(CandidateList *list, int *buf_id)
-{
-    uint32 list_size = list->cand_list_size;
+bool pop_access_history(BufferMeta* meta){
+    uint32 list_size = g_access_history.cand_list_size;
     uint32 head_loc;
-
     while (true) {
         pg_memory_barrier();
-        uint64 head = pg_atomic_read_u64(&list->head);
+        uint64 head = pg_atomic_read_u64(&g_access_history.head);
         pg_memory_barrier();
-        volatile uint64 tail = pg_atomic_read_u64(&list->tail);
-
+        volatile uint64 tail = pg_atomic_read_u64(&g_access_history.tail);
         if (unlikely(head >= tail)) {
             return false;       /* candidate list is empty */
         }
-
         head_loc = head % list_size;
-        *buf_id = list->cand_buf_list[head_loc];
-        if (pg_atomic_compare_exchange_u64(&list->head, &head, head + 1)) {
+        *meta = g_access_history.cand_buf_list[head_loc];
+        if (pg_atomic_compare_exchange_u64(&g_access_history.head, &head, head + 1)) {
             return true;
         }
     }
 }
-
-static int64 get_thread_candidate_nums_twb(CandidateList *list)
+static bool push_to_access_history(BufferMeta* meta)
 {
-    volatile uint64 head = pg_atomic_read_u64(&list->head);
+    uint32 list_size = g_access_history.cand_list_size;
+    uint32 tail_loc;
     pg_memory_barrier();
-    volatile uint64 tail = pg_atomic_read_u64(&list->tail);
-    int64 curr_cand_num = tail - head;
-    Assert(curr_cand_num >= 0);
-    return curr_cand_num;
+    volatile uint64 head = pg_atomic_read_u64(&g_access_history.head);
+    pg_memory_barrier();
+    volatile uint64 tail = pg_atomic_add_fetch_u64(&g_access_history.tail, 1);
+    if (unlikely(tail - head >= list_size)) {
+        pg_atomic_sub_fetch_u64(&g_access_history.tail, 1);
+        return false;
+    }
+    pg_memory_barrier();
+    tail_loc = tail % list_size;
+    g_access_history.cand_buf_list[tail_loc] = *meta;// make sure this link point to hashtable meta
+    g_access_history.cand_buf_list[tail_loc].pre_access_global = pg_atomic_fetch_add_u64(&g_access_history.head_ts, 1);
+    pg_memory_barrier();
+    return true;
+}
+/* Always return meta copy in hashtable, if we want to sample history meta, we'll go list_array -> hashtable */
+static bool DeletedFromAccessHistory(BufferTag* tag, uint32 hashcode, BufferMeta* meta){
+    bool found = false;
+    void * ptr = NULL;
+    pthread_mutex_lock(&g_access_history.lockArray[hashcode % NUM_BUFFER_PARTITIONS]);
+    ptr = buf_hash_operate<HASH_REMOVE>((HTAB*)g_access_history.access_hist, tag, hashcode, &found);
+    if(found && ptr && meta)
+       *meta = *(BufferMeta*)ptr;
+    pthread_mutex_unlock(&g_access_history.lockArray[hashcode % NUM_BUFFER_PARTITIONS]);
+    return found;
+}
+static bool InsertToAccessHistory(BufferDesc* buf, BufferMeta* ret_meta)
+{
+    bool got_ret = false;
+    bool found;
+    uint32 hashcode = buf->extra->meta.hashcode;
+    pthread_mutex_lock(&g_access_history.lockArray[hashcode % NUM_BUFFER_PARTITIONS]);
+    BufferMeta* meta = (BufferMeta*)buf_hash_operate<HASH_ENTER>((HTAB*)g_access_history.access_hist, &buf->tag, hashcode, &found);
+    *meta = buf->extra->meta;
+    meta->link = meta; // point to meta in hashtable
+    pthread_mutex_unlock(&g_access_history.lockArray[hashcode % NUM_BUFFER_PARTITIONS]);
+    while(!push_to_access_history(meta) && pop_access_history(ret_meta)){
+        got_ret = DeletedFromAccessHistory(&ret_meta->tag, ret_meta->hashcode, ret_meta);
+    }
+    return got_ret;
 }
 /*
  * Ensure that the the PrivateRefCountArray has sufficient space to store one
@@ -1780,76 +1789,6 @@ Buffer ReadBufferExtended(Relation reln, ForkNumber fork_num, BlockNumber block_
     }
     return buf;
 }
-/*
-    * Track the access time of buffer.
-    * access: 0 for read, 1 for write
-*/
-static void track(BufferDesc *buf, int access){
-    pg_atomic_add_fetch_u32(&buf->access_count, 1);
-    if(access == 0){
-        pg_memory_barrier();
-        uint32 old_pos = pg_atomic_read_u32(&buf->accessHead);
-        uint32 now_timer = pg_atomic_read_u32(&g_buffer_write_info.global_timer);
-        if(now_timer != buf->accessLog[old_pos]){
-            uint32 new_pos = (old_pos + 1) % 8;
-            pg_memory_barrier();
-            buf->accessLog[new_pos] = now_timer;
-            pg_memory_barrier();
-            pg_atomic_write_u32(&buf->accessHead, new_pos);
-        }
-        return;
-    }
-    pg_memory_barrier();
-    uint32 old_pos = pg_atomic_read_u32(&buf->writeHead);
-    uint32 now_timer = pg_atomic_read_u32(&g_buffer_write_info.global_timer);
-    if(now_timer != buf->writeLog[old_pos]){
-        uint32 new_pos = (old_pos + 1) % 8;
-        pg_memory_barrier();
-        buf->writeLog[new_pos] = now_timer;
-        pg_memory_barrier();
-        pg_atomic_write_u32(&buf->writeHead, new_pos);
-    }
-    pg_atomic_add_fetch_u32(&buf->write_count, 1);
-    return;
-}
-static float GetPageWriteVal(BufferDesc *buf){
-    pg_memory_barrier();
-    uint32 write_pos = pg_atomic_read_u32(&buf->writeHead);
-    pg_memory_barrier();
-    uint32 now_timer = pg_atomic_read_u32(&g_buffer_write_info.global_timer);
-    float max_write_val = 0;
-    float freq_factor = 0.2;
-    uint32 recent_factor = 0;
-    uint32 pos;
-    for(int i = 0; i < 4; i++){
-        pos = (write_pos - i + 4) % 4;
-        freq_factor = i == 0 ? 0.2 : i + 1;
-        recent_factor = now_timer - pg_atomic_read_u32(&buf->writeLog[pos]);
-        if(recent_factor == now_timer)
-            break;
-        max_write_val = Max(max_write_val, freq_factor / (float)Max(recent_factor, 1));
-    }
-    return max_write_val;
-}
-
-static float GetPageReadVal(BufferDesc *buf){
-    pg_memory_barrier();
-    uint32 read_pos = pg_atomic_read_u32(&buf->accessHead);
-    uint32 now_timer = pg_atomic_read_u32(&g_buffer_write_info.global_timer);
-    float max_read_val = 0;
-    float freq_factor = 0.2;
-    uint32 recent_factor = 0;
-    uint32 pos;
-    for(int i = 0; i < 8; i++){
-        pos = (read_pos - i + 8) % 8;
-        freq_factor = i == 0 ? 0.2 : i + 1;
-        recent_factor = now_timer - pg_atomic_read_u32(&buf->accessLog[pos]);
-        if(recent_factor == now_timer)
-            break;
-        max_read_val = Max(max_read_val, freq_factor / (float)Max(recent_factor, 1));
-    }
-    return max_read_val;
-}
 static void xgb_sighup_handler(SIGNAL_ARGS)
 {
     int save_errno = errno;
@@ -1858,7 +1797,6 @@ static void xgb_sighup_handler(SIGNAL_ARGS)
     }
     errno = save_errno;
 }
-
 /* SIGINT: set flag to run a normal checkpoint right away */
 static void xgb_sigint_handler(SIGNAL_ARGS)
 {
@@ -1867,12 +1805,11 @@ static void xgb_sigint_handler(SIGNAL_ARGS)
         SetLatch(&t_thrd.proc->procLatch);
     errno = save_errno;
 }
-
 static void xgb_quick_die(SIGNAL_ARGS)
 {
     gs_signal_setmask(&t_thrd.libpq_cxt.BlockSig, NULL);
     on_exit_reset();
-    gs_thread_exit(EXIT_MODE_TWO);
+    gs_thread_exit(2);
 }
 
 static void xgb_request_shutdown_handler(SIGNAL_ARGS)
@@ -1922,10 +1859,41 @@ static void XGB_setup_signal_hook(){
     (void)sigdelset(&t_thrd.libpq_cxt.BlockSig, SIGQUIT);
 
 }
+/*
+    only when we 
+*/
+// static void track(BufferMeta *meta){
+//     pg_memory_barrier();
+//     uint32 old_pos = pg_atomic_read_u32(&meta->accessHead);
+//     uint32 now_timer = pg_atomic_read_u32(&g_buffer_write_info.global_timer);    
+//     if(now_timer != meta->accessLog[old_pos]){
+//         uint32 new_pos = (old_pos + 1) % MAX_ACCESS_HISTORY;
+//         pg_atomic_write_u32(&meta->sample_time, 0);
+//         pg_memory_barrier();// barrier here make sure: latest access time update MUST AFTER sample time reset
+//         pg_atomic_write_u32(&meta->accessLog[new_pos], now_timer);
+//         pg_atomic_write_u32(&meta->accessHead, new_pos);
+//         pg_atomic_add_fetch_u32(&meta->access_count, 1);
+//     }
+//     return;
+// }
+// static void try_add_to_training(BufferMeta *meta, bool over_max){
+//     /* if we can get train data here ? */
+//     /* update hist */
+//     if((rand() % 4 == 0) && pg_atomic_read_u32(&meta->sample_time) != 0U && meta->access_count >= 1){
+//         pg_memory_barrier();
+//         uint32 curr = pg_atomic_read_u32(&g_buffer_write_info.global_timer);// make sure we read first
+//         pg_atomic_write_u32(&meta->visit_ts, Max(curr, max_reuse_time));
+//         sample_push(meta);
+//         pg_atomic_write_u32(&meta->sample_time, 0);
+//     }else{
+//         pg_atomic_write_u32(&meta->sample_time, 0);
+//     }
+//     return;
+// }
 void XGB_evictor_main(){
     sigjmp_buf localSigjmpBuf;
     MemoryContext xgb_context;
-    char name[MAX_THREAD_NAME_LEN] = {0};
+    char thrd_name[128] = {0};
     t_thrd.role = XGBEVICT_THREAD;
 
     // how to handle signals??
@@ -1936,9 +1904,9 @@ void XGB_evictor_main(){
     /*
      * Create a resource owner to keep track of our resources.
      */
-    errno_t err_rc = snprintf_s(name, MAX_THREAD_NAME_LEN, MAX_THREAD_NAME_LEN - 1, "%s", "XGB evictor");
+    errno_t err_rc = snprintf_s(thrd_name, 128, 128 - 1, "%s", "XGB evictor");
     securec_check_ss(err_rc, "", "");
-    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, name,
+    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, thrd_name,
         THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE));
 
     /*
@@ -1948,9 +1916,8 @@ void XGB_evictor_main(){
      * TopMemoryContext, but resetting that would be a really bad idea.
      */
     xgb_context = AllocSetContextCreate(
-        TopMemoryContext, name, ALLOCSET_DEFAULT_MINSIZE, ALLOCSET_DEFAULT_INITSIZE, ALLOCSET_DEFAULT_MAXSIZE);
+        TopMemoryContext, thrd_name, ALLOCSET_DEFAULT_MINSIZE, ALLOCSET_DEFAULT_INITSIZE, ALLOCSET_DEFAULT_MAXSIZE);
     (void)MemoryContextSwitchTo(xgb_context);
-    on_shmem_exit(XGB_kill, (Datum)0);
 
     /*
      * If an exception is encountered, processing resumes here.
@@ -1959,6 +1926,14 @@ void XGB_evictor_main(){
      */
     if (sigsetjmp(localSigjmpBuf, 1) != 0) {
         ereport(WARNING, (errmodule(MOD_INCRE_CKPT), errmsg("XGB evictor exception occured.")));
+        /* Prevent interrupts while cleaning up */
+        HOLD_INTERRUPTS();
+        /* Report the error to the server log */
+        EmitErrorReport();
+        FlushErrorState();
+        /* Now we can allow interrupts again */
+        RESUME_INTERRUPTS();
+        
         proc_exit(1);
     }
 
@@ -1973,18 +1948,128 @@ void XGB_evictor_main(){
 
     pgstat_report_appname("XGB evictor");
     pgstat_report_activity(STATE_IDLE, NULL);
+    const int shmm_size = 8192;
     /*
      * Loop forever
      */
+    int shm_fd = shm_open("/my_shared_memory", O_CREAT | O_RDWR, 0666);
+    if (shm_fd == -1) {
+        ereport(WARNING, (errmodule(MOD_INCRE_CKPT), errmsg("shm open fail")));
+        proc_exit(1);
+    }
+
+    // 设置共享内存大小
+    if (ftruncate(shm_fd, shmm_size) == -1) {
+        ereport(WARNING, (errmodule(MOD_INCRE_CKPT), errmsg("shm truncate fail")));
+        proc_exit(1);
+    }
+
+    // 映射共享内存到进程地址空间
+    ShemmCxt* shared_ctx = (ShemmCxt*)mmap(0, shmm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (shared_ctx == MAP_FAILED) {
+        ereport(WARNING, (errmodule(MOD_INCRE_CKPT), errmsg("mmap fail")));
+        proc_exit(1);
+    }
+
+    memset(shared_ctx, 0, shmm_size);
+    while( g_tenant_info.tenant_free_taken < NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE ){
+        WaitLatch(&t_thrd.proc->procLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, (long)2000); // ms
+    }
     int rc;
+    int epoch = 0;
     for (;;) {
-        // sleep this wake
-        rc = WaitLatch(&t_thrd.proc->procLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, (long)10); // ms
-        if (rc & WL_POSTMASTER_DEATH) {
-            gs_thread_exit(1);
+        //trainBatch();
+        uint32 min_cache_size = (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE) / TENANT_NUM_PARAM;
+        uint32 partition_cache_size = NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE - min_cache_size;
+        uint32 min_cache_size_each = min_cache_size / TENANT_NUM_PARAM;
+        uint32 total_alloc = 0;
+        int i=0;
+        for (i; i < TENANT_NUM_PARAM; ++i){
+            tenant_buffer_cxt* buffer_cxt = &g_tenant_info.tenant_buffer_cxt_array[i];
+            // /* Cache size */
+            // shared_ctx->tenant_fetures[i][0] = (float)buffer_cxt->curr_real_size / (float)(NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE);
+            // /* Miss */
+            // shared_ctx->tenant_fetures[i][1] = (float)pg_atomic_read_u32(&buffer_cxt->real_hits) / (float)(
+            //     pg_atomic_read_u32(&buffer_cxt->real_hits) + pg_atomic_read_u32(&buffer_cxt->real_miss)
+            // );
+            /* rehit dist to total */
+            if(buffer_cxt->rehit_traffic > 0){
+                shared_ctx->tenant_fetures[i][0]
+                = (float)pg_atomic_read_u32(&buffer_cxt->rehit_precentil_total) / (float)( 100 * pg_atomic_read_u32(&buffer_cxt->rehit_traffic) );
+                /* rehit ratio */
+                shared_ctx->tenant_fetures[i][1]
+                = (float)pg_atomic_read_u32(&buffer_cxt->rehit_traffic) / (float)pg_atomic_read_u32(&g_tenant_info.rehit_traffic);
+            }else{
+                shared_ctx->tenant_fetures[i][0] = 100.0;
+                shared_ctx->tenant_fetures[i][1] = 0.0;
+            }
+            /* traffic */
+            shared_ctx->tenant_fetures[i][2] 
+                = (float)pg_atomic_read_u32(&buffer_cxt->traffic) / (float)pg_atomic_read_u32(&g_tenant_info.total_traffic);
+            /* reset traffic here */
+            pg_atomic_write_u32(&buffer_cxt->traffic, 0);
+            pg_atomic_write_u32(&buffer_cxt->rehit_traffic, 0);                
+            pg_atomic_write_u32(&buffer_cxt->rehit_precentil_total, 0);
         }
-        // wait someone wake up
-        SetLatch(&t_thrd.proc->procLatch);
+        pg_atomic_write_u32(&g_tenant_info.total_traffic, 0);
+        pg_atomic_write_u32(&g_tenant_info.rehit_traffic, 0);    
+        shared_ctx->rl_ready = 0;
+        pg_memory_barrier();
+        shared_ctx->db_ready = 1;
+
+        /* sleep for action calculate */
+        while(shared_ctx->rl_ready != 1){
+            rc = WaitLatch(&t_thrd.proc->procLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, (long)20); // ms
+            if (rc & WL_POSTMASTER_DEATH) {
+                gs_thread_exit(1);
+            }
+        }
+        
+        /* reset candidate tenant */
+        pg_atomic_write_u32(&g_tenant_info.candidate_idx, 0);
+        for (i = 0; i < TENANT_NUM_PARAM; ++i){
+            bool has_free = false;
+            tenant_buffer_cxt* buffer_cxt = &g_tenant_info.tenant_buffer_cxt_array[i];
+            uint32 alloc = (uint32)(shared_ctx->tenant_partitions[i] * (float)partition_cache_size);
+            if(total_alloc + alloc > partition_cache_size)
+                alloc = partition_cache_size - total_alloc;
+            total_alloc += alloc;
+            uint32 pre_size = buffer_cxt->max_real_size;
+            uint32 after_size = alloc + min_cache_size_each;
+            ereport(WARNING, (errmsg("T[%u] size: %u -> %u", buffer_cxt->tenant_oid, pre_size, after_size)));
+            pthread_mutex_lock(&buffer_cxt->tenant_buffer_lock);
+            has_free = buffer_cxt->max_real_size > (alloc + min_cache_size_each);
+            buffer_cxt->max_real_size = alloc + min_cache_size_each;
+            pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
+            if(has_free){
+                uint32 idx = pg_atomic_fetch_add_u32(&g_tenant_info.candidate_idx, 1);
+                g_tenant_info.candidate_tenant[idx] = buffer_cxt->tenant_oid;
+                pg_atomic_write_u32(&buffer_cxt->over_max, 1);
+            }
+        }
+        pg_memory_barrier();
+        pg_atomic_write_u32(&g_tenant_info.adjust_done, 0);
+        uint32 sleep_cnt = 0;
+        while(!(pg_atomic_read_u32(&g_tenant_info.adjust_done) == 1) && sleep_cnt++ < 10)
+            WaitLatch(&t_thrd.proc->procLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, (long)10);/* 10ms */
+        pg_atomic_write_u32(&g_tenant_info.hit_traffic, 0);
+        pg_atomic_write_u32(&g_tenant_info.stall_traffic, 0);
+        pg_usleep(1000000); /* 5 ms */
+        /* reward = hit traffic in 5 ms */
+        //shared_ctx->reward = pg_atomic_read_u32(&g_tenant_info.hit_traffic) - 10 * pg_atomic_read_u32(&g_tenant_info.stall_traffic);
+        shared_ctx->reward = pg_atomic_read_u32(&g_tenant_info.hit_traffic);
+        shared_ctx->rl_ready = 0;
+        pg_memory_barrier();
+        shared_ctx->db_ready = 1;
+        
+        /* sleep for update weight */
+        while(shared_ctx->rl_ready != 1){
+            rc = WaitLatch(&t_thrd.proc->procLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, (long)100); // ms
+            if (rc & WL_POSTMASTER_DEATH) {
+                gs_thread_exit(1);
+            }
+        }
+        epoch++;
     }
 }
 static Buffer ReadBuffer_common_warp(Relation reln, SMgrRelation smgr, char relpersistence, ForkNumber forkNum, BlockNumber blockNum,
@@ -1998,20 +2083,15 @@ static Buffer ReadBuffer_common_warp(Relation reln, SMgrRelation smgr, char relp
         }
         bool is_flush = t_thrd.flush;
         bool is_hit = *hit;
-        uint64 epoch_size = NORMAL_SHARED_BUFFER_NUM / 64;
-        if(pg_atomic_fetch_add_u64(&g_buffer_write_info.total_fetch, 1) == 0){
-            testXGB();
-        }
         pg_atomic_add_fetch_u64(&g_buffer_write_info.fg_flushed, is_flush ? 1:0);
-        if(pg_atomic_add_fetch_u64(&g_buffer_write_info.total_miss, is_hit ? 0:1 ) % epoch_size == 0){
-            pg_atomic_add_fetch_u32(&g_buffer_write_info.global_timer, 1);
-        }
+        pg_atomic_add_fetch_u64(&g_buffer_write_info.total_miss, is_hit);
+        pg_atomic_add_fetch_u32(&g_buffer_write_info.global_timer, 1);
         return buf;
 }
 
 /*
  * ReadBufferWithoutRelcache -- like ReadBufferExtended, but doesn't require
- *		a relcache entry for the relation.
+ *		a relcache entry for the relation.GetV
  *
  * NB: At present, this function may only be used on permanent relations, which
  * is OK, because we only use it during XLOG replay and segment-page copy relation data.  
@@ -2964,50 +3044,24 @@ void PageCheckWhenChosedElimination(const BufferDesc *buf, uint32 oldFlags)
  *
  * No locks are held either at entry or exit.
  */
-TWB g_twb_info;
-LRUC g_lruc_info;
-tenant_info g_tenant_info;
-buffer_write_info g_buffer_write_info;
-THR_LOCAL miss_info g_miss_info;
 void show_tenant_status(){
     uint64 total_hit = 0;
     uint64 total_miss = 0;
     double total_cost = 0.0;
     pthread_mutex_lock(&g_tenant_info.tenant_stat_lock);
-    ereport(WARNING, (errmsg("=====Tenant Weight Info[Alloc count:%u][MTPR Enable:%s][Tenant free alloc:%u]====="
-        , g_tenant_info.update_count
-        , !ENABLE_FIXED ? "Yes": "No"
-        , g_tenant_info.tenant_free_taken)));
-    ereport(WARNING, (errmsg("Non-tenant [H/M:%lu/%lu] Free Taken:%lu"
-    , g_tenant_info.non_tenant_buffer_cxt.real_hits
-    , g_tenant_info.non_tenant_buffer_cxt.real_misses
-    , g_tenant_info.non_tenant_free_taken)));
     for(uint32 i = 0; i < g_tenant_info.tenant_num; i++){
                 pthread_spin_lock(&g_tenant_info.tenant_buffer_cxt_array[i].hit_stat_lock);
                 tenant_buffer_cxt* temp = &g_tenant_info.tenant_buffer_cxt_array[i];
-                double temp_hrd = GetTenantHRD(temp);
-                ereport(WARNING, (errmsg("T:[%s], W:[%f], SLA:[%u], HRD:[%f], Rel[H/M:%u/%u][%.2f%] Ref[H/M:%u/%u][%.2f%] Size:[%u] Pick[Free/Self/Others:%lu/%lu/%lu] Reweight:%lu", 
-                    temp->tenant_name, 
-                    temp->weight,
-                    temp->sla,
-                    temp_hrd,
+                ereport(WARNING, (errmsg("[H/M:%u/%u][%.2f%] Size:[%.2f]", 
                     temp->real_hits,
-                    temp->real_misses,
-                    100.0 * (double)(temp->real_hits) / (double)(temp->real_hits + temp->real_misses),
-                    temp->ref_hits,
-                    temp->ref_misses,
-                    100.0 * (double)(temp->ref_hits) / (double)(temp->ref_hits + temp->ref_misses),
-                    temp->curr_real_size,
-                    pg_atomic_read_u64(&temp->pick_free_count),
-                    pg_atomic_read_u64(&temp->pick_self_count),
-                    pg_atomic_read_u64(&temp->pick_other_count),
-                    pg_atomic_read_u64(&temp->reweight_count)
+                    temp->real_miss,
+                    100.0 * (double)(temp->real_hits) / (double)(temp->real_hits + temp->real_miss),
+                    (double)temp->curr_real_size / (double) (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE)
                     ))
                 );
 
                 total_hit += temp->real_hits;
-                total_miss += temp->real_misses;
-                total_cost += temp_hrd  * temp->sla;
+                total_miss += temp->real_miss;
                 pthread_spin_unlock(&g_tenant_info.tenant_buffer_cxt_array[i].hit_stat_lock);
     }
     pthread_mutex_unlock(&g_tenant_info.tenant_stat_lock);
@@ -3016,285 +3070,33 @@ void show_tenant_status(){
                                     total_miss,
                                     100.0 *( (double)total_hit / (double) (total_hit + total_miss) )
                                     )));
-    ereport(WARNING, (errmsg("Total SLA Cost = %f", total_cost)));
 }
-#include "utils/dynahash.h"
-/* Make sure we held hit stat lock */
-double GetTenantHRD(tenant_buffer_cxt* buffer_cxt){
-
-    uint64 ref_hits = buffer_cxt->ref_hits;
-    uint64 ref_misses = buffer_cxt->ref_misses;
-    uint64 real_hits = buffer_cxt->real_hits;
-    uint64 real_misses = buffer_cxt->real_misses;
-    
-    if((ref_hits + ref_misses) == 0 || (real_hits + real_misses) == 0){
-        return 0;
+static tenant_buffer_cxt *GetVictim(tenant_buffer_cxt* buffer_cxt){
+    if(pg_atomic_read_u32(&g_tenant_info.adjust_done) == 1 || pg_atomic_read_u32(&buffer_cxt->over_max) == 1)
+        return buffer_cxt;
+    int i;
+    bool found = false;
+    tenant_buffer_cxt* victim;
+    uint32 max_candidate = pg_atomic_read_u32(&g_tenant_info.candidate_idx);
+    uint32 idx;
+    for(i = 0; i < max_candidate; ++i){
+        idx = g_tenant_info.candidate_tenant[i];
+        victim = &g_tenant_info.tenant_buffer_cxt_array[idx];
+        pthread_mutex_lock(&victim->tenant_buffer_lock);
+        found = victim->curr_real_size > victim->max_real_size && victim != buffer_cxt;
+        pthread_mutex_unlock(&victim->tenant_buffer_lock);
+        if(found)
+            return victim;
+        pg_atomic_write_u32(&victim->over_max, 0);
     }
-    double hrd = (double)((double)real_misses - (double)ref_misses) / (double) ((double)real_hits + (double)real_misses) ;
-    return hrd <= 0.0 ? 0.0 : hrd;
-}
-/* Currently we do it in LRU manner */
-bool UpdateRefBuffer(uint32 access_hash, BufferTag *access_tag){
-    tenant_buffer_cxt* buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
-    if(t_thrd.thrd_ref_HTAB == NULL || buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt){
-        return false;
-    }
-    bool hit = false;
-    bool found_descs = false;
-    pthread_mutex_lock(&buffer_cxt->tenant_ref_buffer_lock);
-    buffer_node* entry = (buffer_node*)buf_hash_operate<HASH_FIND>((HTAB*)t_thrd.thrd_ref_HTAB, access_tag, access_hash, &found_descs);
-    
-    if(found_descs){
-        hit = true;        
-        /* Remove */
-        entry->next->prev = entry->prev;
-        entry->prev->next = entry->next;
-
-        /* Insert to head */
-        entry->next = buffer_cxt->ref_dummy_head.next;
-        buffer_cxt->ref_dummy_head.next->prev = entry;
-        buffer_cxt->ref_dummy_head.next = entry;
-        entry->prev = &buffer_cxt->ref_dummy_head;
-        pthread_mutex_unlock(&buffer_cxt->tenant_ref_buffer_lock);
-        return hit;
-    }
-
-    /* Evict if needed */
-    if(buffer_cxt->curr_ref_size >= buffer_cxt->max_ref_size){
-        buffer_node* tail = buffer_cxt->ref_dummy_tail.prev;
-        Assert(tail != &buffer_cxt->ref_dummy_head);
-        buffer_node* prev = tail->prev;
-        prev->next = &buffer_cxt->ref_dummy_tail;
-        buffer_cxt->ref_dummy_tail.prev = prev;
-
-        buf_hash_operate<HASH_REMOVE>((HTAB*)t_thrd.thrd_ref_HTAB, &tail->key, BufTableHashCode(&tail->key), &found_descs);
-        Assert(found_descs);
-        buffer_cxt->curr_ref_size--;
-    }
-    /* Enter new hash */
-    entry = (buffer_node*)buf_hash_operate<HASH_ENTER>((HTAB*)t_thrd.thrd_ref_HTAB, access_tag, access_hash, &found_descs);
-    Assert(!found_descs);
-    /* Insert to head */
-    entry->next = buffer_cxt->ref_dummy_head.next;
-    buffer_cxt->ref_dummy_head.next->prev = entry;
-    buffer_cxt->ref_dummy_head.next = entry;
-    entry->prev = &buffer_cxt->ref_dummy_head;
-    buffer_cxt->curr_ref_size++;
-    pthread_mutex_unlock(&buffer_cxt->tenant_ref_buffer_lock);
-    return hit;
-}
-bool InsertToHist(FIFO_queue * list, BufferTag* access_tag , uint32 access_hash){
-    uint32 list_size = list->cand_list_size;
-    uint32 tail_loc;
-    pg_memory_barrier();
-    volatile uint64 head = pg_atomic_read_u64(&list->head);
-    pg_memory_barrier();
-    volatile uint64 tail = pg_atomic_read_u64(&list->tail);
-    if (unlikely(tail - head >= list_size)) {
-        return false;
-    }
-    tail_loc = tail % list_size;
-    list->cand_buf_list[tail_loc].hashcode = access_hash;
-    list->cand_buf_list[tail_loc].tag = *access_tag;
-    (void)pg_atomic_fetch_add_u64(&list->tail, 1);
-    return true;
-}
-bool DeleteFromHist(FIFO_queue * list, fifo_ele * ele){
-    uint32 list_size = list->cand_list_size;
-    uint32 head_loc;
-    while (true) {
-        pg_memory_barrier();
-        uint64 head = pg_atomic_read_u64(&list->head);
-        pg_memory_barrier();
-        volatile uint64 tail = pg_atomic_read_u64(&list->tail);
-        if (unlikely(head >= tail)) {
-            return false;       /* candidate list is empty */
-        }
-        head_loc = head % list_size;
-        *ele = list->cand_buf_list[head_loc];
-        if (pg_atomic_compare_exchange_u64(&list->head, &head, head + 1)) {
-            return true;
-        }
-    }
-}
-void UpdateWeight(bool found_in_hist){
-    tenant_buffer_cxt* buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
-    if(found_in_hist){
-        pg_atomic_add_fetch_u64(&buffer_cxt->reweight_count, 1);
-        pthread_spin_lock(&buffer_cxt->hit_stat_lock);
-        double hrd = GetTenantHRD(buffer_cxt);
-        pthread_spin_unlock(&buffer_cxt->hit_stat_lock);
-        const double zero = 0.0000001;
-        double total_w = 0;
-        uint32 max_sla = 0;
-        tenant_buffer_cxt* temp;
-        pthread_mutex_lock(&g_tenant_info.tenant_stat_lock);
-        /* Get max sla and max weight */
-        for(int i = 0; i < g_tenant_info.tenant_num; i++){
-            temp = &g_tenant_info.tenant_buffer_cxt_array[i];
-            max_sla = max_sla > temp->sla ? max_sla : temp->sla;
-            total_w += temp->weight;
-        }
-        /* Do reweight by hrd */
-        double sla_factor = (double)buffer_cxt->sla / max_sla;
-        double pre_val = buffer_cxt->weight;
-        total_w -= buffer_cxt->weight;
-        buffer_cxt->weight = zero + buffer_cxt->weight * exp(-1.0 * hrd * sla_factor);
-        total_w += buffer_cxt->weight;
-
-        /* global reweight */
-        for(int i = 0; i < g_tenant_info.tenant_num; i++){
-            temp = &g_tenant_info.tenant_buffer_cxt_array[i];
-            temp->weight = temp->weight / total_w;
-        }
-        pthread_mutex_unlock(&g_tenant_info.tenant_stat_lock);
-    }
-}
-void TenantWeightReset(){
-    uint32 active_tenant = g_tenant_info.tenant_num == 0 ? 1 : g_tenant_info.tenant_num; //Active tenant
-    uint32 lower_bound = (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE) / ( active_tenant * active_tenant );
-    double origin_weight = 0.0;
-    double new_sum = 1.0;
-    for(int i = 0; i < g_tenant_info.tenant_num; ++i){
-        if(g_tenant_info.tenant_buffer_cxt_array[i].curr_real_size <= lower_bound &&
-            g_tenant_info.tenant_buffer_cxt_array[i].weight > 1.0 / active_tenant){
-
-            new_sum -= 1.0 / active_tenant;
-
-        }else{
-
-            origin_weight += g_tenant_info.tenant_buffer_cxt_array[i].weight;
-
-        }
-    }
-    for(int i = 0; i < g_tenant_info.tenant_num; ++i){
-        if(g_tenant_info.tenant_buffer_cxt_array[i].curr_real_size <= lower_bound &&
-            g_tenant_info.tenant_buffer_cxt_array[i].weight > 1.0 / active_tenant){
-
-            g_tenant_info.tenant_buffer_cxt_array[i].weight = 1.0 / active_tenant;
-
-        }else{
-
-            g_tenant_info.tenant_buffer_cxt_array[i].weight = ( g_tenant_info.tenant_buffer_cxt_array[i].weight / origin_weight ) * new_sum;
-
-        }
-    }
-}
-tenant_buffer_cxt* TenantSampling(bool* do_reset){
-    *do_reset = false;
-    const double zero = 0.0000001;
-    tenant_buffer_cxt* victim_buffer_cxt = NULL;
-    double random=double(rand()) / double(RAND_MAX);
-    uint32 victim = -1;
-    uint32 max_retry = 1;
-    while( victim == -1 && max_retry > 0){
-        for(int i = 0; i < g_tenant_info.tenant_num; i++){
-            victim_buffer_cxt = &g_tenant_info.tenant_buffer_cxt_array[i];
-            random = random - victim_buffer_cxt->weight;
-            if ( random < zero ){
-                victim = i;
-                break;
-            }
-        }
-        max_retry--;
-        random=double(rand()) / double(RAND_MAX);
-    }
-    if(max_retry == 0){
-        //ereport(WARNING, (errmsg("Pick victim execced max retry")));
-        return (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
-    }
-
-    /* If victim buffer is lower than lower bound. Sampling other tenant, and do reset. */
-    uint32 active_tenant = g_tenant_info.tenant_num == 0 ? 1 : g_tenant_info.tenant_num; //Active tenant
-    uint32 lower_bound = (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE) / ( active_tenant * active_tenant );
-    if(victim_buffer_cxt->curr_real_size < lower_bound){
-        *do_reset = true;
-        /* Sampling among tenant has buf more than lower bound */
-        random=double(rand()) / double(RAND_MAX);
-        double weight_sum = 0;
-        double amplify_factor = 10000;
-        double zone_weights[ MAX_TENANT + 1 ];
-        for(uint32 i = 0;i < g_tenant_info.tenant_num; i++){
-                if (g_tenant_info.tenant_buffer_cxt_array[i].curr_real_size < lower_bound){
-                    zone_weights[i]=0.0;
-                }
-                else{
-                    zone_weights[i]=g_tenant_info.tenant_buffer_cxt_array[i].weight;
-                    weight_sum = weight_sum + zone_weights[i];
-                }
-        }
-        for(int i = 0;i < g_tenant_info.tenant_num;i++){
-            if (g_tenant_info.tenant_buffer_cxt_array[i].curr_real_size >= lower_bound){
-                zone_weights[i] = zone_weights[i] / weight_sum;
-            }
-        }
-        if(weight_sum <= zero){
-            victim_buffer_cxt = NULL;
-            return (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
-        }
-        victim = -1;
-        max_retry = 1;
-        while( victim == -1 && max_retry > 0){
-            for(int i = 0; i < g_tenant_info.tenant_num; i++){
-                victim_buffer_cxt = &g_tenant_info.tenant_buffer_cxt_array[i];
-                random = random - zone_weights[i];
-                if ( random < zero ){
-                    victim = i;
-                    break;
-                }
-            }
-            max_retry--;
-            random=double(rand()) / double(RAND_MAX);
-        }
-        if(max_retry == 0){
-            //ereport(WARNING, (errmsg("[lowerBound]Pick victim execced max retry")));
-            return (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
-        }
-    }
-    return victim_buffer_cxt;
-}
-tenant_buffer_cxt* GetVictimTenant(){
-    /* We can still take from free list */
-    bool is_non_tenant = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt;
-    if(is_non_tenant){
-        return (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
-    }
-
-    pthread_spin_lock(&g_tenant_info.free_list_lock);
-    bool take_from_free_list = g_tenant_info.tenant_free_taken < (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE);
-    pthread_spin_unlock(&g_tenant_info.free_list_lock);
-    if(take_from_free_list){
-        return (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
-    }
-    
-    tenant_buffer_cxt* self = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
-    pthread_spin_lock(&((tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt)->hit_stat_lock);
-    bool need_steal = self->real_misses > self->ref_misses;
-    pthread_spin_unlock(&((tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt)->hit_stat_lock);
-    if(!need_steal){
-        return (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
-    }
-
-    /* Pick victim */
-    bool do_reset = false;
-    pthread_mutex_lock(&g_tenant_info.tenant_stat_lock);
-    tenant_buffer_cxt* victim_buffer_cxt = TenantSampling(&do_reset);
-#if MULTITENANT_RESET_ENABLE
-    if(do_reset){
-        /* Zone reset*/
-        TenantWeightReset();
-    }
-#endif
-    pthread_mutex_unlock(&g_tenant_info.tenant_stat_lock);
-    return victim_buffer_cxt;
+    pg_atomic_write_u32(&g_tenant_info.adjust_done, 1);
+    if(xgb_proc)
+        SetLatch(&xgb_proc->procLatch);
+    return buffer_cxt;
 }
 static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
                                BufferAccessStrategy strategy, bool *found, const XLogPhyBlock *pblk){
-    Assert(t_thrd.thrd_hist_HTAB);
-    Assert(t_thrd.thrd_tenant_map_HTAB);
     Assert(t_thrd.thrd_tenant_buffer_cxt);
-    Assert(t_thrd.thrd_ref_HTAB || (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt == &g_tenant_info.non_tenant_buffer_cxt);
-
     if(ENABLE_LOG && pg_atomic_add_fetch_u64(&g_tenant_info.update_count, 1) % ((uint64)LOG_INTERVAL) == 0){
         show_tenant_status();
     }
@@ -3316,6 +3118,8 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     /* Get thrd's buffer cxt */
     tenant_buffer_cxt* buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
     tenant_buffer_cxt* victim_buffer_cxt = (tenant_buffer_cxt*)t_thrd.thrd_tenant_buffer_cxt;
+    pg_atomic_add_fetch_u32(&buffer_cxt->traffic, 1);
+    pg_atomic_add_fetch_u32(&g_tenant_info.total_traffic, 1);
     
     /* create a tag so we can lookup the buffer */
     INIT_BUFFERTAG(new_tag, smgr->smgr_rnode.node, fork_num, block_num);
@@ -3330,6 +3134,8 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     buf_id = BufTableLookup(&new_tag, new_hash);
     pgstat_report_waitevent(WAIT_EVENT_END);
     if (buf_id >= 0) {
+        pg_atomic_add_fetch_u32(&g_tenant_info.hit_traffic, 1);
+        pg_atomic_add_fetch_u32(&buffer_cxt->real_hits, 1);
         /*
          * Found it.  Now, pin the buffer so no one can steal it from the
          * buffer pool, and check to see if the correct data has been loaded
@@ -3338,10 +3144,8 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
         buf = GetBufferDescriptor(buf_id);
 
         valid = PinBuffer(buf, strategy);
-
         /* Can release the mapping lock as soon as we've pinned it */
         LWLockRelease(new_partition_lock);
-
         *found = TRUE;
 
         if (!valid) {
@@ -3378,20 +3182,22 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
      * buffer.	Remember to unlock the mapping lock while doing the work.
      */
     LWLockRelease(new_partition_lock);
-    
-    /* Before we even lock anything we'll update weight first */
-
-    if(!ENABLE_FIXED){
-        /* Update weight */
-        bool found_descs = false;
-        pthread_mutex_lock(&g_tenant_info.lockArray[new_hash % NUM_BUFFER_PARTITIONS]);
-        buf_hash_operate<HASH_REMOVE>((HTAB*)t_thrd.thrd_hist_HTAB, &new_tag, new_hash, &found_descs);
-        pthread_mutex_unlock(&g_tenant_info.lockArray[new_hash % NUM_BUFFER_PARTITIONS]);
-        UpdateWeight(found_descs);
-
-        /* Get victim */
-        victim_buffer_cxt = GetVictimTenant();
+    pg_atomic_add_fetch_u32(&buffer_cxt->real_miss, 1);
+    victim_buffer_cxt = GetVictim(buffer_cxt);
+    BufferMeta hist_hit_meta;
+    if(DeletedFromAccessHistory(&new_tag, new_hash, &hist_hit_meta)){
+        uint32 reuse_distance = pg_atomic_read_u64(&g_access_history.head_ts) - hist_hit_meta.pre_access_global;
+        Assert(hist_hit_meta.tenant_oid < TENANT_NUM_PARAM);
+        tenant_buffer_cxt* rehit_tenant = &g_tenant_info.tenant_buffer_cxt_array[hist_hit_meta.tenant_oid];
+        pg_atomic_add_fetch_u32(&rehit_tenant->rehit_traffic, 1);
+        pg_atomic_add_fetch_u32(&rehit_tenant->rehit_dirty, hist_hit_meta.is_dirty ? 1 : 0 );
+        pg_atomic_add_fetch_u32(&g_tenant_info.rehit_traffic, 1);
+        pg_atomic_add_fetch_u32(&rehit_tenant->rehit_precentil_total, 
+            100 * reuse_distance / (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE));
+        pg_atomic_add_fetch_u32(&rehit_tenant->rehit_precentil_total_dirty, hist_hit_meta.is_dirty ? 
+            100 * reuse_distance / (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE) : 0 );
     }
+    /* Before we even lock anything we'll update weight first */
     /* Loop here in case we have to try another victim buffer */
     for (;;) {
         bool needGetLock = false;
@@ -3439,6 +3245,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
                 needDoFlush = true;
             }
             if (needDoFlush) {
+                pg_atomic_add_fetch_u32(&g_tenant_info.stall_traffic, 1);
                 if (strategy != NULL) {
                     XLogRecPtr lsn;
 
@@ -3612,10 +3419,17 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     PageCheckWhenChosedElimination(buf, old_flags);
 #endif
 
-    /* We'll be able to adjust tenant's buffer */
-    
+    if(old_flags & BM_TAG_VALID){
+        BufferMeta pop_meta;
+        buf->extra->meta.tenant_oid = buf->tenantOid;
+        buf->extra->meta.is_dirty = (old_flags & BM_DIRTY);
+        buf->extra->meta.id = buf->buf_id;
+        buf->extra->meta.hashcode = old_hash;
+        buf->extra->meta.tag = old_tag;
+        InsertToAccessHistory(buf, &pop_meta);
+    }
     /* Evict others*/
-    if(victim_buffer_cxt != buffer_cxt){
+    if(victim_buffer_cxt != buffer_cxt && !from_free_list){
         
         /* Lock the victim buffer */
         pthread_mutex_t* first_lock = victim_buffer_cxt->tenant_oid < buffer_cxt->tenant_oid ? 
@@ -3631,37 +3445,38 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
         evict_prev->next = evict_next;
         evict_next->prev = evict_prev;
         victim_buffer_cxt->curr_real_size--;
+        buffer_cxt->curr_real_size++;
 
         /* Insert into buffer_cxt */
-        BufferDesc * tail = buffer_cxt->real_dummy_tail.prev;
-        ((BufferDesc *)buf)->prev = tail;
-        tail->next = (BufferDesc *)buf;
-        ((BufferDesc *)buf)->next = &buffer_cxt->real_dummy_tail;
-        buffer_cxt->real_dummy_tail.prev = (BufferDesc *)buf;
-        buffer_cxt->curr_real_size++;
-        ((BufferDesc *)buf)->tenantOid = buffer_cxt->tenant_oid;
-
-
+        BufferDesc * head = buffer_cxt->real_dummy_head.next;
+        ((BufferDesc *)buf)->prev = &buffer_cxt->real_dummy_head;
+        head->prev = (BufferDesc *)buf;
+        ((BufferDesc *)buf)->next = head;
+        buffer_cxt->real_dummy_head.next = buf;
         pthread_mutex_unlock(second_lock);
         pthread_mutex_unlock(first_lock);
     
     }else{
         pthread_mutex_lock(&buffer_cxt->tenant_buffer_lock);
-        if(from_free_list){
-            /* Insert into buffer_cxt */
-            BufferDesc * tail = buffer_cxt->real_dummy_tail.prev;
-            ((BufferDesc *)buf)->prev = tail;
-            tail->next = (BufferDesc *)buf;
-            ((BufferDesc *)buf)->next = &buffer_cxt->real_dummy_tail;
-            buffer_cxt->real_dummy_tail.prev = (BufferDesc *)buf;
-            buffer_cxt->curr_real_size++;
+        if(!from_free_list){
+            /* Evict from victim list */
+            BufferDesc * evict_prev = ((BufferDesc *)buf)->prev;
+            BufferDesc * evict_next = ((BufferDesc *)buf)->next;
+            evict_prev->next = evict_next;
+            evict_next->prev = evict_prev;
         }
-        ((BufferDesc *)buf)->tenantOid = buffer_cxt->tenant_oid;
+        /* Insert into buffer_cxt */
+        if(from_free_list)
+            buffer_cxt->curr_real_size++;
+        BufferDesc * head = buffer_cxt->real_dummy_head.next;
+        ((BufferDesc *)buf)->prev = &buffer_cxt->real_dummy_head;
+        head->prev = (BufferDesc *)buf;
+        ((BufferDesc *)buf)->next = head;
+        buffer_cxt->real_dummy_head.next = buf;
         pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
     }
-
+    ((BufferDesc *)buf)->tenantOid = buffer_cxt->tenant_oid;
     /* Otherwise We'll just need to reset the tag */
-
     /*
      * Okay, it's finally safe to rename the buffer.
      *
@@ -3712,23 +3527,6 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     }
     LWLockRelease(new_partition_lock);
 
-    if((!ENABLE_FIXED)){
-        /* */
-        bool found;
-        if(old_flags & BM_TAG_VALID){
-            pthread_mutex_lock(&g_tenant_info.lockArray[old_hash % NUM_BUFFER_PARTITIONS]);
-            buf_hash_operate<HASH_ENTER>((HTAB*)t_thrd.thrd_hist_HTAB, &old_tag, old_hash, &found);
-            pthread_mutex_unlock(&g_tenant_info.lockArray[old_hash % NUM_BUFFER_PARTITIONS]);
-        }
-        while(!InsertToHist(&g_tenant_info.fifo_list, &old_tag, old_hash)){
-            fifo_ele ele;
-            if (DeleteFromHist(&g_tenant_info.fifo_list, &ele)) {
-                pthread_mutex_lock(&g_tenant_info.lockArray[ele.hashcode % NUM_BUFFER_PARTITIONS]);
-                buf_hash_operate<HASH_REMOVE>((HTAB*)t_thrd.thrd_hist_HTAB, &ele.tag, ele.hashcode, &found);
-                pthread_mutex_unlock(&g_tenant_info.lockArray[ele.hashcode % NUM_BUFFER_PARTITIONS]);
-            } 
-        }
-    }
     /*
      * Buffer contents are currently invalid.  Try to get the io_in_progress
      * lock.  If StartBufferIO returns false, then someone else managed to
@@ -3739,51 +3537,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
     } else {
         *found = TRUE;
     }
-    if(!ENABLE_FIXED)
-        //UpdateHitRateStat(new_hash, &new_tag, *found);
     return buf;
-}
-void COST_TEST_REWEIGHT(){
-    const double zero = 0.0000001;
-    double total_w = 0;
-    tenant_buffer_cxt* buffer_cxt = &g_tenant_info.shadow_cxt;
-    pg_atomic_add_fetch_u64(&buffer_cxt->reweight_count, 1);
-    pthread_spin_lock(&buffer_cxt->hit_stat_lock);
-    double hrd = GetTenantHRD(buffer_cxt);
-    pthread_spin_unlock(&buffer_cxt->hit_stat_lock);
-    pthread_mutex_lock(&g_tenant_info.tenant_stat_lock);
-    /* Get max sla and max weight */
-    for(int i = 0; i < g_tenant_info.tenant_num; i++){
-        total_w += g_tenant_info.tenant_buffer_cxt_array[i].weight;
-    }
-    /* Do reweight by hrd */
-    buffer_cxt->weight = zero + buffer_cxt->weight * exp(-1.0 * hrd * 1.0);  
-    /* global reweight */
-    for(int i = 0; i < g_tenant_info.tenant_num; i++){
-        g_tenant_info.tenant_buffer_cxt_array[i].weight /= total_w;
-    }
-    pthread_mutex_unlock(&g_tenant_info.tenant_stat_lock);
-}
-uint32 COST_TEST_SAMPLING(){
-    /* Do scan */
-    const double zero = 0.0000001;
-    pthread_mutex_lock(&g_tenant_info.tenant_stat_lock);
-    double random=double(rand()) / double(RAND_MAX);
-    uint32 victim = -1;
-    uint32 max_retry = 10;
-    while( victim == -1 && max_retry > 0){
-        for(int i = 0; i < g_tenant_info.tenant_num; i++){
-            random = random - g_tenant_info.tenant_buffer_cxt_array[i].weight;
-            if ( random < zero ){
-                victim = i;
-                break;
-            }
-        }
-        max_retry--;
-        random=double(rand()) / double(RAND_MAX);
-    }
-    pthread_mutex_unlock(&g_tenant_info.tenant_stat_lock);
-    return victim;
 }
 static void InsertToHead(BufferDesc *buf)
 {
@@ -3812,11 +3566,7 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
     if (g_instance.attr.attr_storage.nvm_attr.enable_nvm) {
         return NvmBufferAlloc(smgr, relpersistence, fork_num, block_num, strategy, found, pblk);
     }
-
-    
     Assert(!IsSegmentPhysicalRelNode(smgr->smgr_rnode.node));
-    t_thrd.thrd_tenant_buffer_cxt = &g_tenant_info.shadow_cxt;
-
     BufferTag new_tag;                 /* identity of requested block */
     uint32 new_hash;                   /* hash value for newTag */
     LWLock *new_partition_lock = NULL; /* buffer partition lock for it */
@@ -3835,7 +3585,6 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
     /* determine its hash code and partition lock ID */
     new_hash = BufTableHashCode(&new_tag);
     new_partition_lock = BufMappingPartitionLock(new_hash);
-TWB_RETRY:
     /* see if the block is in the buffer pool already */
     (void)LWLockAcquire(new_partition_lock, LW_SHARED);
     pgstat_report_waitevent(WAIT_EVENT_BUF_HASH_SEARCH);
@@ -3847,30 +3596,11 @@ TWB_RETRY:
          * buffer pool, and check to see if the correct data has been loaded
          * into the buffer.
          */
-
         buf = GetBufferDescriptor(buf_id);
         /* Which was not supposed to be found in TWB buffered */
-        if(ENABLE_TWB){
-            uint32 flush_state = pg_atomic_read_u32(&buf->flush_state);
-            if(flush_state != 0U){
-                /* This shit is being flushed now */
-                if(ENABLE_LOG)
-                ereport(WARNING, (errmsg("FG hit TWB Buf %d, sleep 1ms, total stall %d, is dirty %u, curr dirty queue size %u", buf_id, 
-                        pg_atomic_add_fetch_u32(&g_twb_info.total_fg_stall, 1),
-                        pg_atomic_read_u32(&buf->state) & BM_DIRTY,
-                        get_thread_candidate_nums_twb(&g_twb_info.twb_dirty_list))));
-                LWLockRelease(new_partition_lock);
-                /* Wait for flushed */
-                pg_usleep(3000);
-                goto TWB_RETRY;   
-            }
-        }
-
-
         valid = PinBuffer(buf, strategy);
         /* Can release the mapping lock as soon as we've pinned it */
         LWLockRelease(new_partition_lock);
-
         *found = TRUE;
 
         if (!valid) {
@@ -3911,7 +3641,7 @@ TWB_RETRY:
     LWLockRelease(new_partition_lock);
     /* Loop here in case we have to try another victim buffer */
     bool from_clean = false;
-    bool from_twb_free = false;
+    bool found_from_hist = false;
     uint32 lruc_scan_len = 0;
     for (;;) {
         from_clean = false;
@@ -3954,8 +3684,6 @@ TWB_RETRY:
          * won't prevent hint-bit updates).  We will recheck the dirty bit
          * after re-locking the buffer header.
          */
-        if (!(old_flags & BM_DIRTY) && ENABLE_LRUC && lruc_scan_len > 0)
-            pg_atomic_add_fetch_u64(&g_lruc_info.got_clean, 1);
         if (old_flags & BM_DIRTY) {
             /* backend should not flush dirty pages if working version less than DW_SUPPORT_NEW_SINGLE_FLUSH */
             if (!backend_can_flush_dirty_page()) {
@@ -3987,56 +3715,7 @@ TWB_RETRY:
                 needDoFlush = true;
             }
             /* Buffer is dirty and we had pinned it */
-            if(needDoFlush 
-                && ENABLE_LRUC 
-                && (lruc_scan_len < MAX_LRUC_SCAN_LEN) 
-                && (!INDEX_SKIP_FLUSH || t_thrd.is_index))
-            {
-                if(lruc_scan_len == 0)
-                    pg_atomic_add_fetch_u64(&g_lruc_info.trigger_scan, 1);
-                lruc_scan_len++;
-                pg_atomic_add_fetch_u64(&g_lruc_info.scan_total, 1);
-                if(!(pg_atomic_read_u32(&buf->flush_state) & LRUC_CANDIDATE)){
-                    /* It's only a hint */
-                    pg_atomic_write_u32(&buf->flush_state, LRUC_CANDIDATE);
-                    pg_memory_barrier();
-                    Assert(candidate_buf_push_twb(&g_lruc_info.lruc_dirty_list, buf->buf_id));
-                }
-                LWLockRelease(buf->content_lock);
-                UnpinBuffer(buf, true);
-                continue;
-            } else if(needDoFlush && ENABLE_TWB){
-                    Buffer swap_free_buf;
-                    uint32 curr_dirty_size = get_thread_candidate_nums_twb(&g_twb_info.twb_dirty_list);
-                    bool has_free = candidate_buf_pop_twb(&g_twb_info.twb_free_list, &swap_free_buf);
-                    bool can_use_twb = has_free && ( pg_atomic_read_u32(&buf->flush_state) == 0U ) 
-                    && curr_dirty_size < g_twb_info.twb_size;
-                    /* Only when we got free twb buffer to replace and this buf isn't in twb */
-                    if(can_use_twb){
-                        if(ENABLE_LOG)
-                            ereport(WARNING, (errmsg("dirty %d buf push to twb, got clean buf %d, curr_dirty_size %u", 
-                            buf->buf_id, swap_free_buf, curr_dirty_size)));
-                        /* Add buf to twb dirty buf*/
-                        pg_atomic_write_u32(&buf->flush_state, TWB_BUFFERED);
-                        candidate_buf_push_twb(&g_twb_info.twb_dirty_list, buf->buf_id);
-                        from_twb_free = true;
-                        LWLockRelease(buf->content_lock);
-                        /* Unlock dirty buf */
-                        UnpinBuffer(buf, true);
-
-                        /* Get swaped buf and lock it */
-                        buf = GetBufferDescriptor(swap_free_buf);
-                        /* Swap free should be candidate */
-                        Assert(pg_atomic_read_u32(&buf->flush_state) & TWB_CANDIDATE);
-                        pg_atomic_write_u32(&buf->flush_state, 0U);
-                        LockBufHdr(buf);
-                        PinBuffer_Locked(buf);
-                    }else{
-                        LWLockRelease(buf->content_lock);
-                        UnpinBuffer(buf, true);
-                        continue;
-                    }
-            } else if (needDoFlush) {
+            if (needDoFlush) {
                 t_thrd.flush = true;
                 /*
                  * If using a nondefault strategy, and writing the buffer
@@ -4102,12 +3781,13 @@ TWB_RETRY:
          * To change the association of a valid buffer, we'll need to have
          * exclusive lock on both the old and new mapping partitions.
          */
-        if (old_flags & BM_TAG_VALID && !from_twb_free) {
+        if (old_flags & BM_TAG_VALID) {
             /*
              * Need to compute the old tag's hashcode and partition lock ID.
              * XXX is it worth storing the hashcode in BufferDesc so we need
              * not recompute it here?  Probably not.
              */
+            BufferMeta evict_sample;
             old_tag = ((BufferDesc *)buf)->tag;
             old_hash = BufTableHashCode(&old_tag);
             old_partition_lock = BufMappingPartitionLock(old_hash);
@@ -4233,7 +3913,6 @@ TWB_RETRY:
      * checkpoints, except for their "init" forks, which need to be treated
      * just like permanent relations.
      */
-    //BufWriteStatReset(buf);
     ((BufferDesc *)buf)->tag = new_tag;
     buf_state &= ~(BM_VALID | BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR | BM_PERMANENT |
                    BUF_USAGECOUNT_MASK);
@@ -4243,13 +3922,6 @@ TWB_RETRY:
     } else {
         buf_state |= BM_TAG_VALID | BUF_USAGECOUNT_ONE;
     }
-    pg_atomic_write_u32(&buf->accessHead, 0);
-    pg_atomic_write_u32(&buf->writeHead, 0);
-    for(int i = 0; i < 8; i++){
-        buf->accessLog[i] = 0;
-        if(i < 4)
-            buf->writeLog[i] = 0;
-    }
     UnlockBufHdr(buf, buf_state);
 
     if (ENABLE_DMS) {
@@ -4257,7 +3929,7 @@ TWB_RETRY:
         GetDmsBufCtrl(buf->buf_id)->been_loaded = false;
     }
 
-    if (old_flags & BM_TAG_VALID && !from_twb_free) {
+    if (old_flags & BM_TAG_VALID) {
         BufTableDelete(&old_tag, old_hash);
         if (old_partition_lock != new_partition_lock) {
             LWLockRelease(old_partition_lock);
@@ -4473,7 +4145,6 @@ void MarkBufferDirty(Buffer buffer)
     }
 
     buf_desc = GetBufferDescriptor(buffer - 1);
-    track(buf_desc, 1);
 
     Assert(BufferIsPinned(buffer));
     /* unfortunately we can't check if the lock is held exclusively */
@@ -5505,21 +5176,6 @@ uint32 SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext* wb_c
     }
 
     ScheduleBufferTagForWriteback(wb_context, &tag);
-    if(pg_atomic_read_u32(&buf_desc->flush_state) & TWB_IO_PENDING){
-        uint32 total_flushed = pg_atomic_add_fetch_u32(&g_twb_info.total_twb_flushed, 1);
-        /* Delete it from Hashtable */
-        if(ENABLE_LOG)
-            ereport(WARNING, (errmsg("TWB Buf %d flushed, total flushed %u", buf_desc->buf_id, total_flushed)));
-        uint32 buf_hash = BufTableHashCode(&buf_desc->tag);
-        LWLock *partition_lock = BufMappingPartitionLock(buf_hash);
-        LWLockAcquire(partition_lock, LW_EXCLUSIVE);
-        pg_atomic_write_u32(&buf_desc->flush_state, TWB_CANDIDATE);
-        BufTableDelete(&buf_desc->tag, buf_hash);
-        LWLockRelease(partition_lock);
-        candidate_buf_push_twb(&g_twb_info.twb_free_list, buf_desc->buf_id);
-    }else{
-        pg_atomic_write_u32(&buf_desc->flush_state, 0U);
-    }
     return (result | BUF_WRITTEN);
 }
 
