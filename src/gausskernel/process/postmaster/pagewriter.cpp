@@ -2631,24 +2631,6 @@ UNLOCK:
     return need_flush_num;
 }
 
-static void show_flush_and_fetch_stat(){
-    ereport(LOG, (errmsg("Dirty[%.2f],BG:[%u],FG:[%u],Stall[%.2f]"
-        , (float)g_instance.ckpt_cxt_ctl->actual_dirty_page_num / (float)(g_instance.attr.attr_storage.NBuffers)
-        , pg_atomic_read_u64(&g_buffer_write_info.bg_flushed)
-        , pg_atomic_read_u64(&g_buffer_write_info.fg_flushed)
-        , (double)pg_atomic_read_u64(&g_buffer_write_info.fg_flushed) / (double)pg_atomic_read_u64(&g_buffer_write_info.total_miss)
-        )));
-    if(ENABLE_LRUC){
-        uint64 total_miss = pg_atomic_read_u64(&g_buffer_write_info.total_miss);
-        uint64 total_trigger = pg_atomic_read_u64(&g_lruc_info.trigger_scan);
-        if(total_miss && total_trigger)
-            ereport(LOG, (errmsg("LRUC ratio:[%.2f]avg scan len:[%.2f]success[%.2f]"
-            , (double)total_trigger / (double)total_miss
-            , (double)pg_atomic_read_u64(&g_lruc_info.scan_total) / (double)total_trigger
-            , (double)pg_atomic_read_u64(&g_lruc_info.got_clean) / (double)total_trigger
-            )));
-    }
-}
 
 static void GetBufferSnapshot(){
     return;

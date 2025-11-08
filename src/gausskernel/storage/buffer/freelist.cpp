@@ -407,15 +407,24 @@ BufferDesc* LRUBufferEvict(BufferAccessStrategy strategy, uint32* buf_state, ten
     uint32 local_buf_state = 0; /* to avoid repeated (de-)referencing */
     pthread_mutex_lock(&buffer_cxt->tenant_buffer_lock);
     BufferDesc* curr = &buffer_cxt->real_dummy_tail;
-    for(;;){        
+    int scan_length = 0;
+    int free_space = 0;
+    for(;;){
+        scan_length++;   
         curr = curr->prev;
         Assert(curr != &buffer_cxt->real_dummy_head);
         if (!retryLockBufHdr(curr, &local_buf_state)) {
             continue;
         }
 
+        if ( !free_space_enough(curr->buf_id) && (local_buf_state & BM_DIRTY)) {
+            free_space++;
+            UnlockBufHdr(curr, local_buf_state);
+            continue;
+        }
+
         if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0 && !(local_buf_state & BM_IS_META) &&
-            (backend_can_flush_dirty_page() || !(local_buf_state & BM_DIRTY))) {
+            (backend_can_flush_dirty_page() || !(local_buf_state & BM_DIRTY)) ) {
             *buf_state = local_buf_state;
             pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
             return curr;
@@ -465,6 +474,9 @@ BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_s
     pthread_mutex_lock(&self->tenant_buffer_lock);
     bool meet_max = self->curr_real_size >= self->max_real_size;
     pthread_mutex_unlock(&self->tenant_buffer_lock);
+    pthread_mutex_lock(&buffer_cxt->tenant_buffer_lock);
+    bool has_free = buffer_cxt->curr_real_size > buffer_cxt->max_real_size;
+    pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
 
     (void)pg_atomic_fetch_add_u32(&t_thrd.storage_cxt.StrategyControl->numBufferAllocs, 1);
     bool take_from_free_list = false;
@@ -491,6 +503,9 @@ BufferDesc* TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_s
         }
     }
 EVICT:
+    if(meet_max || !has_free){
+        buffer_cxt = self;
+    }
     /* Fetch from tenant's buffer pool */
     BufferDesc* ans = LRUBufferEvict(strategy, buf_state, buffer_cxt);
     return ans;

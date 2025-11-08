@@ -1972,9 +1972,6 @@ void XGB_evictor_main(){
     }
 
     memset(shared_ctx, 0, shmm_size);
-    while( g_tenant_info.tenant_free_taken < NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE ){
-        WaitLatch(&t_thrd.proc->procLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, (long)2000); // ms
-    }
     int rc;
     int epoch = 0;
     for (;;) {
@@ -1983,36 +1980,57 @@ void XGB_evictor_main(){
         uint32 partition_cache_size = NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE - min_cache_size;
         uint32 min_cache_size_each = min_cache_size / TENANT_NUM_PARAM;
         uint32 total_alloc = 0;
+        float total_inverse = 0.0;
         int i=0;
         for (i; i < TENANT_NUM_PARAM; ++i){
+            
             tenant_buffer_cxt* buffer_cxt = &g_tenant_info.tenant_buffer_cxt_array[i];
-            // /* Cache size */
-            // shared_ctx->tenant_fetures[i][0] = (float)buffer_cxt->curr_real_size / (float)(NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE);
-            // /* Miss */
-            // shared_ctx->tenant_fetures[i][1] = (float)pg_atomic_read_u32(&buffer_cxt->real_hits) / (float)(
-            //     pg_atomic_read_u32(&buffer_cxt->real_hits) + pg_atomic_read_u32(&buffer_cxt->real_miss)
-            // );
-            /* rehit dist to total */
-            if(buffer_cxt->rehit_traffic > 0){
-                shared_ctx->tenant_fetures[i][0]
-                = (float)pg_atomic_read_u32(&buffer_cxt->rehit_precentil_total) / (float)( 100 * pg_atomic_read_u32(&buffer_cxt->rehit_traffic) );
+            uint32 miss_traffic = pg_atomic_read_u32(&buffer_cxt->miss_traffic);
+            uint32 rehit_traffic = pg_atomic_read_u32(&buffer_cxt->rehit_traffic);
+            buffer_cxt->inverse_ratio = 1.0 / 
+            ((float)pg_atomic_read_u32(&buffer_cxt->miss_traffic) / (float)(pg_atomic_read_u32(&g_tenant_info.miss_traffic) + 0.0001f));
+            total_inverse += buffer_cxt->inverse_ratio;
+
+            /* Cache size */
+            shared_ctx->tenant_fetures[i][0] = (float)buffer_cxt->curr_real_size / (float)(NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE);
+            /* Miss */
+            shared_ctx->tenant_fetures[i][1] = (float)pg_atomic_read_u32(&buffer_cxt->real_hits) / (float)(
+                pg_atomic_read_u32(&buffer_cxt->real_hits) + pg_atomic_read_u32(&buffer_cxt->real_miss)
+            );
+            if(rehit_traffic > 0 && miss_traffic > 0){
+                /* rehit density */
+                shared_ctx->tenant_fetures[i][2]
+                = (float)rehit_traffic / (float)miss_traffic;
                 /* rehit ratio */
-                shared_ctx->tenant_fetures[i][1]
-                = (float)pg_atomic_read_u32(&buffer_cxt->rehit_traffic) / (float)pg_atomic_read_u32(&g_tenant_info.rehit_traffic);
+                shared_ctx->tenant_fetures[i][3]
+                = (float)rehit_traffic / (float)pg_atomic_read_u32(&g_tenant_info.rehit_traffic);
+                /* rehit dirty ratio */
+                shared_ctx->tenant_fetures[i][4] 
+                = (float)pg_atomic_read_u32(&buffer_cxt->rehit_dirty) / (float)(pg_atomic_read_u32(&buffer_cxt->rehit_traffic));
             }else{
-                shared_ctx->tenant_fetures[i][0] = 100.0;
-                shared_ctx->tenant_fetures[i][1] = 0.0;
+                shared_ctx->tenant_fetures[i][2] = 0.0;
+                shared_ctx->tenant_fetures[i][3] = 0.0;
+                shared_ctx->tenant_fetures[i][4] = 0.0;
             }
             /* traffic */
-            shared_ctx->tenant_fetures[i][2] 
+            shared_ctx->tenant_fetures[i][5] 
                 = (float)pg_atomic_read_u32(&buffer_cxt->traffic) / (float)pg_atomic_read_u32(&g_tenant_info.total_traffic);
             /* reset traffic here */
+            pg_atomic_write_u32(&buffer_cxt->hist_insert, 0);
+            pg_atomic_write_u32(&buffer_cxt->miss_traffic, 0);
             pg_atomic_write_u32(&buffer_cxt->traffic, 0);
             pg_atomic_write_u32(&buffer_cxt->rehit_traffic, 0);                
             pg_atomic_write_u32(&buffer_cxt->rehit_precentil_total, 0);
         }
         pg_atomic_write_u32(&g_tenant_info.total_traffic, 0);
-        pg_atomic_write_u32(&g_tenant_info.rehit_traffic, 0);    
+        pg_atomic_write_u32(&g_tenant_info.miss_traffic, 0);
+        pg_atomic_write_u32(&g_tenant_info.rehit_traffic, 0);
+
+        for(i=0; i < TENANT_NUM_PARAM; ++i){
+            tenant_buffer_cxt* buffer_cxt = &g_tenant_info.tenant_buffer_cxt_array[i];
+            buffer_cxt->miss_accept_rate = buffer_cxt->inverse_ratio / total_inverse;
+        }
+
         shared_ctx->rl_ready = 0;
         pg_memory_barrier();
         shared_ctx->db_ready = 1;
@@ -2036,7 +2054,8 @@ void XGB_evictor_main(){
             total_alloc += alloc;
             uint32 pre_size = buffer_cxt->max_real_size;
             uint32 after_size = alloc + min_cache_size_each;
-            ereport(WARNING, (errmsg("T[%u] size: %u -> %u", buffer_cxt->tenant_oid, pre_size, after_size)));
+            ereport(WARNING, 
+                (errmsg("T[%u] size: %u -> %u accept:%.2f", buffer_cxt->tenant_oid, pre_size, after_size, buffer_cxt->miss_accept_rate)));
             pthread_mutex_lock(&buffer_cxt->tenant_buffer_lock);
             has_free = buffer_cxt->max_real_size > (alloc + min_cache_size_each);
             buffer_cxt->max_real_size = alloc + min_cache_size_each;
@@ -2083,7 +2102,6 @@ static Buffer ReadBuffer_common_warp(Relation reln, SMgrRelation smgr, char relp
         }
         bool is_flush = t_thrd.flush;
         bool is_hit = *hit;
-        pg_atomic_add_fetch_u64(&g_buffer_write_info.fg_flushed, is_flush ? 1:0);
         pg_atomic_add_fetch_u64(&g_buffer_write_info.total_miss, is_hit);
         pg_atomic_add_fetch_u32(&g_buffer_write_info.global_timer, 1);
         return buf;
@@ -3052,11 +3070,12 @@ void show_tenant_status(){
     for(uint32 i = 0; i < g_tenant_info.tenant_num; i++){
                 pthread_spin_lock(&g_tenant_info.tenant_buffer_cxt_array[i].hit_stat_lock);
                 tenant_buffer_cxt* temp = &g_tenant_info.tenant_buffer_cxt_array[i];
-                ereport(WARNING, (errmsg("[H/M:%u/%u][%.2f%] Size:[%.2f]", 
+                ereport(WARNING, (errmsg("[H/M:%u/%u][%.2f%] Size:[%.2f]/[%.2f]", 
                     temp->real_hits,
                     temp->real_miss,
                     100.0 * (double)(temp->real_hits) / (double)(temp->real_hits + temp->real_miss),
-                    (double)temp->curr_real_size / (double) (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE)
+                    (double)temp->curr_real_size / (double) (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE),
+                    (double)temp->max_real_size / (double) (NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE)
                     ))
                 );
 
@@ -3072,33 +3091,50 @@ void show_tenant_status(){
                                     )));
 }
 static tenant_buffer_cxt *GetVictim(tenant_buffer_cxt* buffer_cxt){
-    if(pg_atomic_read_u32(&g_tenant_info.adjust_done) == 1 || pg_atomic_read_u32(&buffer_cxt->over_max) == 1)
+    pthread_mutex_lock(&buffer_cxt->tenant_buffer_lock);
+    bool meet_max = buffer_cxt->curr_real_size >= buffer_cxt->max_real_size;
+    pthread_mutex_unlock(&buffer_cxt->tenant_buffer_lock);
+    if( pg_atomic_read_u32(&g_tenant_info.adjust_done) == 1 ||
+        pg_atomic_read_u32(&buffer_cxt->over_max) == 1 || 
+        meet_max)
         return buffer_cxt;
     int i;
     bool found = false;
+    bool has_free = false;
+    int scan_length = 0;
     tenant_buffer_cxt* victim;
-    uint32 max_candidate = pg_atomic_read_u32(&g_tenant_info.candidate_idx);
     uint32 idx;
-    for(i = 0; i < max_candidate; ++i){
-        idx = g_tenant_info.candidate_tenant[i];
-        victim = &g_tenant_info.tenant_buffer_cxt_array[idx];
+    for(i = 0; i < TENANT_NUM_PARAM; ++i){
+        scan_length++;
+        victim = &g_tenant_info.tenant_buffer_cxt_array[i];
         pthread_mutex_lock(&victim->tenant_buffer_lock);
-        found = victim->curr_real_size > victim->max_real_size && victim != buffer_cxt;
+        has_free = victim->curr_real_size > victim->max_real_size;
+        found = has_free && victim != buffer_cxt;
         pthread_mutex_unlock(&victim->tenant_buffer_lock);
         if(found)
             return victim;
-        pg_atomic_write_u32(&victim->over_max, 0);
+        if(!has_free)
+            pg_atomic_write_u32(&victim->over_max, 0);
     }
     pg_atomic_write_u32(&g_tenant_info.adjust_done, 1);
     if(xgb_proc)
         SetLatch(&xgb_proc->procLatch);
     return buffer_cxt;
 }
+static void show_flush_and_fetch_stat(){
+    ereport(LOG, (errmsg("Dirty[%.2f],BG:[%u],FG:[%u],Stall[%.2f]"
+        , (float)g_instance.ckpt_cxt_ctl->actual_dirty_page_num / (float)(g_instance.attr.attr_storage.NBuffers)
+        , pg_atomic_read_u64(&g_buffer_write_info.bg_flushed)
+        , pg_atomic_read_u64(&g_buffer_write_info.fg_flushed)
+        , (double)pg_atomic_read_u64(&g_buffer_write_info.fg_flushed) / (double)pg_atomic_read_u64(&g_buffer_write_info.total_miss)
+        )));
+}
 static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
                                BufferAccessStrategy strategy, bool *found, const XLogPhyBlock *pblk){
     Assert(t_thrd.thrd_tenant_buffer_cxt);
     if(ENABLE_LOG && pg_atomic_add_fetch_u64(&g_tenant_info.update_count, 1) % ((uint64)LOG_INTERVAL) == 0){
         show_tenant_status();
+        show_flush_and_fetch_stat();
     }
     Assert(!IsSegmentPhysicalRelNode(smgr->smgr_rnode.node));
 
@@ -3183,12 +3219,14 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
      */
     LWLockRelease(new_partition_lock);
     pg_atomic_add_fetch_u32(&buffer_cxt->real_miss, 1);
+    pg_atomic_add_fetch_u32(&buffer_cxt->miss_traffic, 1);
+    pg_atomic_add_fetch_u32(&g_tenant_info.miss_traffic, 1);
     victim_buffer_cxt = GetVictim(buffer_cxt);
     BufferMeta hist_hit_meta;
     if(DeletedFromAccessHistory(&new_tag, new_hash, &hist_hit_meta)){
         uint32 reuse_distance = pg_atomic_read_u64(&g_access_history.head_ts) - hist_hit_meta.pre_access_global;
         Assert(hist_hit_meta.tenant_oid < TENANT_NUM_PARAM);
-        tenant_buffer_cxt* rehit_tenant = &g_tenant_info.tenant_buffer_cxt_array[hist_hit_meta.tenant_oid];
+        tenant_buffer_cxt* rehit_tenant = buffer_cxt;
         pg_atomic_add_fetch_u32(&rehit_tenant->rehit_traffic, 1);
         pg_atomic_add_fetch_u32(&rehit_tenant->rehit_dirty, hist_hit_meta.is_dirty ? 1 : 0 );
         pg_atomic_add_fetch_u32(&g_tenant_info.rehit_traffic, 1);
@@ -3245,7 +3283,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
                 needDoFlush = true;
             }
             if (needDoFlush) {
-                pg_atomic_add_fetch_u32(&g_tenant_info.stall_traffic, 1);
+                pg_atomic_add_fetch_u64(&g_buffer_write_info.fg_flushed, 1);
                 if (strategy != NULL) {
                     XLogRecPtr lsn;
 
@@ -3426,6 +3464,7 @@ static BufferDesc *TenantBufferAlloc(SMgrRelation smgr, char relpersistence, For
         buf->extra->meta.id = buf->buf_id;
         buf->extra->meta.hashcode = old_hash;
         buf->extra->meta.tag = old_tag;
+        pg_atomic_add_fetch_u32(&victim_buffer_cxt->hist_insert, 1);
         InsertToAccessHistory(buf, &pop_meta);
     }
     /* Evict others*/
@@ -3565,6 +3604,9 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
 {
     if (g_instance.attr.attr_storage.nvm_attr.enable_nvm) {
         return NvmBufferAlloc(smgr, relpersistence, fork_num, block_num, strategy, found, pblk);
+    }
+    if(ENABLE_LOG && pg_atomic_add_fetch_u64(&g_tenant_info.update_count, 1) % ((uint64)LOG_INTERVAL) == 0){
+        show_flush_and_fetch_stat();
     }
     Assert(!IsSegmentPhysicalRelNode(smgr->smgr_rnode.node));
     BufferTag new_tag;                 /* identity of requested block */
@@ -3716,7 +3758,7 @@ static BufferDesc *BufferAllocInternal(SMgrRelation smgr, char relpersistence, F
             }
             /* Buffer is dirty and we had pinned it */
             if (needDoFlush) {
-                t_thrd.flush = true;
+                pg_atomic_add_fetch_u64(&g_buffer_write_info.fg_flushed, 1);
                 /*
                  * If using a nondefault strategy, and writing the buffer
                  * would require a WAL flush, let the strategy decide whether

@@ -206,7 +206,7 @@ typedef struct BufferMeta {
 } BufferMeta;
 #define TENANT_NUM 8
 typedef struct ShemmCxt{
-    float tenant_fetures[TENANT_NUM][3];//cache size(float)  hit ratio(float)  traffic(float)
+    float tenant_fetures[TENANT_NUM][6];//cache size(float)  hit ratio(float)  traffic(float)
     int db_ready;
     float tenant_partitions[TENANT_NUM];
     float reward;
@@ -441,7 +441,10 @@ typedef struct tenant_buffer_cxt{
     pg_atomic_uint32 real_miss{0};
     pg_atomic_uint32 traffic{0};
     pg_atomic_uint32 over_max{0};
-    float traffic_radio;
+    pg_atomic_uint32 miss_traffic{0};
+    float inverse_ratio{0.0};
+    float miss_accept_rate{1.0};
+    pg_atomic_uint32 hist_insert{0};
     pg_atomic_uint32 rehit_traffic{0};
     pg_atomic_uint32 rehit_dirty{0};
     pg_atomic_uint32 rehit_precentil_total{0};
@@ -477,6 +480,7 @@ typedef struct tenant_info{
     pg_atomic_uint32 rehit_traffic{0};
     uint32 candidate_tenant[MAX_TENANT];
     pg_atomic_uint64 update_count{0};
+    pg_atomic_uint32 miss_traffic{0};
 } tenant_info;
 
 
