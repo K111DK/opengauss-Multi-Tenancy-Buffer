@@ -249,6 +249,8 @@ typedef struct BufferDesc {
     struct BufferDesc* prev;
     uint32 tenantOid;
     pg_atomic_uint32 flush_state;
+    pg_atomic_uint32 pre_access_time;
+    uint32 slot_id;
 #ifdef USE_ASSERT_CHECKING
     volatile uint64 lsn_dirty;
 #endif
@@ -405,6 +407,8 @@ extern void LocalBufferFlushAllBuffer();
 #define EXTRA_MEM_FACTOR (g_instance.attr.attr_storage.extra_mem_factor)
 #define ENABLE_LOG (g_instance.attr.attr_storage.enable_log)
 #define TENANT_NUM_PARAM (g_instance.attr.attr_storage.max_tenant)
+#define SAMPLE_NUM (g_instance.attr.attr_storage.sample_num)
+#define ENABLE_RANDOM (g_instance.attr.attr_storage.enable_random)
 #define MULTITENANT_RESET_ENABLE 1
 #define HIT_IN_HIST -2
 #define TENANT_NAME_LEN 32
@@ -426,14 +430,23 @@ typedef struct buffer_node {
 typedef struct tenant_buffer_cxt{
     //key
     char tenant_name[TENANT_NAME_LEN];
+
+    int * array_buffer_pool;
+    pg_atomic_uint32 buffer_tail_slot{0};/* last element */
+    pg_atomic_uint32 buffer_evict_slot{0};/* first element */
     
     //real buffer cxt
     pthread_mutex_t tenant_buffer_lock;
     BufferDesc real_dummy_head;
     BufferDesc real_dummy_tail;
     BufferDesc* sweep_hand;
-    uint64 curr_real_size{0};
-    uint64 max_real_size{0};
+    pg_atomic_uint64 curr_real_size{0};
+    pg_atomic_uint64 max_real_size{0};
+
+    pthread_mutex_t victim_lock;
+    BufferDesc victim_head;
+    BufferDesc victim_tail;
+    pg_atomic_uint32 victim_size{0};
 
     //Buffer hit stat lock
     pthread_spinlock_t hit_stat_lock;
@@ -452,7 +465,7 @@ typedef struct tenant_buffer_cxt{
     /* Multi Tenant info */ 
     uint32 tenant_oid;
 } tenant_buffer_cxt;
-typedef struct tenant_info{   
+typedef struct tenant_info{
     /* History list */
     pthread_mutex_t lockArray[NUM_BUFFER_PARTITIONS];
 
@@ -590,6 +603,7 @@ extern tenant_info g_tenant_info;
 extern TWB g_twb_info;
 extern LRUC g_lruc_info;
 extern BufferDesc *TenantStrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt* buffer_cxt);
+extern BufferDesc* GetFreeBuf(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt** victim_buffer_cxt);
 extern void show_tenant_status();
 extern void XGB_evictor_main();
 /* new */

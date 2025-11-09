@@ -214,7 +214,9 @@ typedef struct knl_instance_attr_storage {
     /* Mtrp */
     bool enable_multi_tenant;
     bool enable_mtrp;
+    bool enable_random;
     int max_tenant;
+    int sample_num;
     int flush_max_write_count;
     bool enable_update_weight;
     bool enable_update_struct;

@@ -510,7 +510,9 @@ EVICT:
     BufferDesc* ans = LRUBufferEvict(strategy, buf_state, buffer_cxt);
     return ans;
 }
-
+BufferDesc* GetFreeBuf(BufferAccessStrategy strategy, uint32* buf_state, tenant_buffer_cxt** victim_buffer_cxt){   
+    return GetBufFreeList(strategy, buf_state, NULL);
+}
 /*
  * StrategySyncStart -- tell BufferSync where to start syncing
  *

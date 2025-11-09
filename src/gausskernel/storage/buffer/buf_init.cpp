@@ -127,6 +127,9 @@ void InitAllTenant(bool is_first){
     g_tenant_info.tenant_num = TENANT_NUM_PARAM;
     uint32 i;
     uint32 total_buffer_num = NORMAL_SHARED_BUFFER_NUM - MINIMAL_BUFFER_SIZE;
+    int * array = (int *)CACHELINEALIGN(ShmemInitStruct("Array Buffer Pool",
+    (TENANT_NUM_PARAM + 1) * TOTAL_BUFFER_NUM * sizeof(int),
+    &is_first));
     for(i = 0; i < tenant_num; i++){
         tenant_buffer_cxt* tenant_cxt = &g_tenant_info.tenant_buffer_cxt_array[i];
         tenant_cxt->tenant_oid = i;
@@ -136,12 +139,17 @@ void InitAllTenant(bool is_first){
         tenant_cxt->real_dummy_head.prev = NULL;
         tenant_cxt->real_dummy_tail.prev = &tenant_cxt->real_dummy_head;
         tenant_cxt->real_dummy_tail.next = NULL;
+        tenant_cxt->victim_head.next = &tenant_cxt->victim_tail;
+        tenant_cxt->victim_tail.prev = &tenant_cxt->victim_head;
         /* Tenant 's mutex */
+        pthread_mutex_init(&tenant_cxt->victim_lock, NULL);
         pthread_mutex_init(&tenant_cxt->tenant_buffer_lock, NULL);
         pthread_spin_init(&tenant_cxt->hit_stat_lock, NULL);
+        tenant_cxt->array_buffer_pool = &array[0 + i * TOTAL_BUFFER_NUM];
     }
 
     /* Non tenant */
+    g_tenant_info.non_tenant_buffer_cxt.array_buffer_pool = &array[ i * TOTAL_BUFFER_NUM ];
     g_tenant_info.non_tenant_buffer_cxt.max_real_size = MINIMAL_BUFFER_SIZE;
     g_tenant_info.non_tenant_buffer_cxt.curr_real_size = 0;
     g_tenant_info.non_tenant_buffer_cxt.real_dummy_head.next = &g_tenant_info.non_tenant_buffer_cxt.real_dummy_tail;
@@ -450,6 +458,8 @@ Size BufferShmemSize(void)
     size = add_size(size, mul_size(EXTRA_MEM_FACTOR * TOTAL_BUFFER_NUM + TWB_SIZE, sizeof(buffer_node)));
 
     size = add_size(size, mul_size(2 * TOTAL_BUFFER_NUM, sizeof(BufferMeta)));
+
+    size = add_size(size, mul_size(TOTAL_BUFFER_NUM * ( TENANT_NUM_PARAM + 1 ), sizeof(int)));
 
     size = add_size(size, hash_estimate_size(2 * TOTAL_BUFFER_NUM, sizeof(BufferMeta)));
 
